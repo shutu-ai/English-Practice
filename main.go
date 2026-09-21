@@ -176,7 +176,33 @@ func responseShape(body []byte) string {
 		for k := range x {
 			keys = append(keys, k)
 		}
-		return strings.Join(keys, ",")
+		shape := strings.Join(keys, ",")
+		if choices, ok := x["choices"].([]any); ok && len(choices) > 0 {
+			if choice, ok := choices[0].(map[string]any); ok {
+				choiceKeys := make([]string, 0, len(choice))
+				for k := range choice {
+					choiceKeys = append(choiceKeys, k)
+				}
+				shape += "|choice:" + strings.Join(choiceKeys, ",")
+				if finish, exists := choice["finish_reason"]; exists {
+					shape += "|finish_reason:" + fmt.Sprint(finish)
+				}
+				if message, ok := choice["message"].(map[string]any); ok {
+					messageKeys := make([]string, 0, len(message))
+					for k := range message {
+						messageKeys = append(messageKeys, k)
+					}
+					shape += "|message:" + strings.Join(messageKeys, ",")
+					if content, exists := message["content"]; exists {
+						shape += "|content_type:" + fmt.Sprintf("%T", content)
+						if text, ok := content.(string); ok {
+							shape += fmt.Sprintf("|content_length:%d", len(text))
+						}
+					}
+				}
+			}
+		}
+		return shape
 	default:
 		return fmt.Sprintf("%T", x)
 	}
@@ -829,7 +855,30 @@ func normalizeVerdict(value string) (string, error) {
 
 func normalizeErrorType(value string) (string, error) {
 	v := normalizeEnum(value)
-	if v == "targetpatternmissing" {
+	switch v {
+	case "meaning_mismatch", "meaning_error":
+		v = "meaning"
+	case "task_mismatch":
+		v = "meaning"
+	case "tense_error", "verb_tense":
+		v = "tense"
+	case "article_error":
+		v = "article"
+	case "preposition_error":
+		v = "preposition"
+	case "word_order_error":
+		v = "word_order"
+	case "modal_error":
+		v = "modal"
+	case "condition_error", "conditional_error":
+		v = "condition"
+	case "agreement_error", "subject_verb_agreement":
+		v = "agreement"
+	case "word_choice_error":
+		v = "word_choice"
+	case "unnatural", "unnatural_error":
+		v = "unnatural_expression"
+	case "targetpatternmissing", "target_pattern_error":
 		v = "target_pattern_missing"
 	}
 	if canonical, ok := evaluationErrorTypes[v]; ok {
@@ -840,6 +889,14 @@ func normalizeErrorType(value string) (string, error) {
 
 func normalizeSeverity(value string) (string, error) {
 	v := normalizeEnum(value)
+	switch v {
+	case "low":
+		v = "minor"
+	case "medium", "mid":
+		v = "moderate"
+	case "high":
+		v = "major"
+	}
 	if v == "minor" || v == "moderate" || v == "major" {
 		return v, nil
 	}
@@ -1165,7 +1222,7 @@ func (s *Server) evaluate(ctx context.Context, prompt, pattern, answer string) (
 		diagnostics.Success = true
 		return heuristicEval(prompt, pattern, answer), "local", "heuristic", diagnostics, nil
 	}
-	baseMessages := []ChatMessage{{Role: "system", Content: "Evaluate an English learner answer. Return exactly one JSON object with verdict, meaning_score, grammar_score, naturalness_score, pattern_score, errors, suggested_answer, explanation_zh. Scores must be numbers from 0 to 1. errors must be an array, including [] when there are no errors."}, {Role: "user", Content: fmt.Sprintf("Prompt: %s\nTarget pattern: %s\nAnswer: %s", prompt, pattern, answer)}}
+	baseMessages := []ChatMessage{{Role: "system", Content: "Evaluate an English learner answer. Return exactly one JSON object in the assistant content; do not include reasoning or prose. The object must have verdict, meaning_score, grammar_score, naturalness_score, pattern_score, errors, suggested_answer, explanation_zh. Scores must be numbers from 0 to 1. errors must be an array, including [] when there are no errors. Each error type must be one of meaning, tense, article, preposition, word_order, modal, condition, agreement, word_choice, missing_information, extra_information, unnatural_expression, target_pattern_missing, register, other. Each severity must be minor, moderate, or major."}, {Role: "user", Content: fmt.Sprintf("Prompt: %s\nTarget pattern: %s\nAnswer: %s", prompt, pattern, answer)}}
 	jsonMode := true
 	for attempt := 0; attempt < 2; attempt++ {
 		messages := baseMessages
@@ -1175,7 +1232,14 @@ func (s *Server) evaluate(ctx context.Context, prompt, pattern, answer string) (
 		if !jsonMode {
 			messages = append(messages, ChatMessage{Role: "system", Content: "This provider does not support native JSON response mode. Return only the JSON object in the assistant content."})
 		}
-		resp, err := s.llm.Client(c).Chat(ctx, ChatRequest{Messages: messages, Temperature: c.Temperature, MaxTokens: c.MaxTokens, JSONMode: jsonMode, RequestID: diagnostics.RequestID})
+		maxTokens := c.MaxTokens
+		if attempt == 1 && maxTokens > 0 {
+			maxTokens *= 2
+			if maxTokens < 1200 {
+				maxTokens = 1200
+			}
+		}
+		resp, err := s.llm.Client(c).Chat(ctx, ChatRequest{Messages: messages, Temperature: c.Temperature, MaxTokens: maxTokens, JSONMode: jsonMode, RequestID: diagnostics.RequestID})
 		diagnostics.RetryCount = attempt
 		if err != nil {
 			var pe *ProviderError
@@ -1185,7 +1249,7 @@ func (s *Server) evaluate(ctx context.Context, prompt, pattern, answer string) (
 				diagnostics.HTTPStatus = pe.HTTPStatus
 				diagnostics.LatencyMS = pe.Latency.Milliseconds()
 				diagnostics.ResponseShape = pe.ResponseShape
-				if jsonMode && attempt == 0 && (pe.HTTPStatus == http.StatusBadRequest || pe.HTTPStatus == http.StatusUnprocessableEntity) {
+				if attempt == 0 && (pe.Category == "invalid_provider_envelope" || (jsonMode && (pe.HTTPStatus == http.StatusBadRequest || pe.HTTPStatus == http.StatusUnprocessableEntity))) {
 					jsonMode = false
 					continue
 				}

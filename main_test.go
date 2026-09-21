@@ -168,6 +168,10 @@ func TestStructuredOutputNormalization(t *testing.T) {
 	if _, err := normalizeEvalContent(`{"verdict":"correct","meaning_score":.8,"grammar_score":.8,"naturalness_score":.8,"pattern_score":.8,"errors":[{"type":"unknown","severity":"minor","explanation":"x"}],"suggested_answer":"x","explanation_zh":"x"}`); err == nil {
 		t.Fatal("unknown error type accepted")
 	}
+	aliased, err := normalizeEvalContent(`{"verdict":"correct","meaning_score":0.8,"grammar_score":0.8,"naturalness_score":0.8,"pattern_score":0.8,"errors":[{"type":"meaning_mismatch","severity":"low","explanation":"x"}],"suggested_answer":"x","explanation_zh":"x"}`)
+	if err != nil || len(aliased.Errors) != 1 || aliased.Errors[0]["type"] != "meaning" || aliased.Errors[0]["severity"] != "minor" {
+		t.Fatalf("known provider aliases were not normalized: %#v err=%v", aliased, err)
+	}
 	if _, err := normalizeEvalContent(`{"verdict":"correct","meaning_score":.8,"grammar_score":.8,"naturalness_score":.8,"pattern_score":.8,"errors":[],"suggested_answer":"x"}`); err == nil {
 		t.Fatal("missing explanation accepted")
 	}
