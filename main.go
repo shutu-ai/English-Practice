@@ -490,6 +490,15 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		if c.Temperature == 0 {
 			c.Temperature = .2
 		}
+		// The API never returns a stored key. An empty key on an update means
+		// "keep the existing secret", so preserve it in the runtime registry too.
+		if c.APIKey == "" {
+			s.llm.mu.RLock()
+			if existing, ok := s.llm.configs[c.ID]; ok {
+				c.APIKey = existing.APIKey
+			}
+			s.llm.mu.RUnlock()
+		}
 		_, err := s.db.Exec(`INSERT INTO llm_providers(id,name,type,base_url,api_key,model,timeout,temperature,max_tokens,enabled) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,type=excluded.type,base_url=excluded.base_url,api_key=CASE WHEN excluded.api_key='' THEN llm_providers.api_key ELSE excluded.api_key END,model=excluded.model,timeout=excluded.timeout,temperature=excluded.temperature,max_tokens=excluded.max_tokens,enabled=excluded.enabled`, c.ID, c.Name, c.Type, c.BaseURL, c.APIKey, c.Model, c.Timeout, c.Temperature, c.MaxTokens, boolInt(c.Enabled))
 		if err != nil {
 			jsonResp(w, 500, map[string]string{"error": err.Error()})
@@ -498,14 +507,22 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		s.llm.mu.Lock()
 		s.llm.configs[c.ID] = c
 		s.llm.mu.Unlock()
-		c.APIKey = ""
-		jsonResp(w, 200, c)
+		response := c
+		response.APIKey = ""
+		jsonResp(w, 200, response)
 	})
 	mux.HandleFunc("/api/providers/test", func(w http.ResponseWriter, r *http.Request) {
 		var c ProviderConfig
 		if err := decode(r, &c); err != nil {
 			jsonResp(w, 400, map[string]string{"error": "invalid request"})
 			return
+		}
+		if c.APIKey == "" && c.ID != "" {
+			s.llm.mu.RLock()
+			if existing, ok := s.llm.configs[c.ID]; ok {
+				c.APIKey = existing.APIKey
+			}
+			s.llm.mu.RUnlock()
 		}
 		start := time.Now()
 		_, err := s.llm.Client(c).Chat(r.Context(), ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "Reply with OK"}}, MaxTokens: 8})

@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -81,6 +83,39 @@ func TestProviderHTTPFailuresAreReturnedWithoutLearningMutation(t *testing.T) {
 				t.Fatalf("result=%#v", result)
 			}
 		})
+	}
+}
+
+func TestProviderTestReusesStoredAPIKeyWithoutReturningIt(t *testing.T) {
+	s := testServer(t)
+	var receivedAuth string
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"OK"}}]}`))
+	}))
+	defer mock.Close()
+	mux := http.NewServeMux()
+	registerRoutes(mux, s, http.NotFoundHandler())
+	save := httptest.NewRecorder()
+	saveReq := httptest.NewRequest(http.MethodPost, "/api/providers", strings.NewReader(fmt.Sprintf(`{"id":"mock","name":"Mock","type":"openai-compatible","base_url":%q,"api_key":"unit-test-key","model":"mock","enabled":true}`, mock.URL)))
+	saveReq.Header.Set("Content-Type", "application/json")
+	mux.ServeHTTP(save, saveReq)
+	if save.Code != http.StatusOK {
+		t.Fatalf("save status=%d body=%s", save.Code, save.Body.String())
+	}
+	if strings.Contains(save.Body.String(), "unit-test-key") {
+		t.Fatal("provider response exposed API key")
+	}
+	testReq := httptest.NewRequest(http.MethodPost, "/api/providers/test", strings.NewReader(fmt.Sprintf(`{"id":"mock","type":"openai-compatible","base_url":%q,"model":"mock"}`, mock.URL)))
+	testReq.Header.Set("Content-Type", "application/json")
+	testResp := httptest.NewRecorder()
+	mux.ServeHTTP(testResp, testReq)
+	if testResp.Code != http.StatusOK || !strings.Contains(testResp.Body.String(), `"ok":true`) {
+		t.Fatalf("test response status=%d body=%s", testResp.Code, testResp.Body.String())
+	}
+	if receivedAuth != "Bearer unit-test-key" {
+		t.Fatalf("stored key was not reused: %q", receivedAuth)
 	}
 }
 

@@ -32,12 +32,12 @@ function providerPayload() {
   return { id: providerId, name: $('#provider-name').value, type: $('#provider-type').value, base_url: $('#provider-url').value, api_key: $('#provider-key').value, model: $('#provider-model').value, timeout: Number($('#provider-timeout').value || 45), temperature: Number($('#provider-temperature').value || .2), max_tokens: Number($('#provider-tokens').value || 800), enabled: $('#provider-enabled').checked }
 }
 
-function fillProvider(provider) {
+function fillProvider(provider, preserveKey = false) {
   providerId = provider.id || ''
   $('#provider-name').value = provider.name || ''
   $('#provider-type').value = provider.type || 'openai-compatible'
   $('#provider-url').value = provider.base_url || ''
-  $('#provider-key').value = ''
+  if (!preserveKey) $('#provider-key').value = ''
   $('#provider-model').value = provider.model || ''
   $('#provider-timeout').value = provider.timeout || 45
   $('#provider-temperature').value = provider.temperature ?? .2
@@ -51,8 +51,10 @@ async function loadProvider() {
 }
 
 async function saveProvider() {
+  const enteredKey = $('#provider-key').value
   const saved = await api('/api/providers', { method: 'POST', body: JSON.stringify(providerPayload()) })
-  fillProvider(saved)
+  fillProvider(saved, true)
+  $('#provider-key').value = enteredKey
   $('#provider-message').textContent = 'Provider saved. An empty API key keeps the existing key.'
 }
 
