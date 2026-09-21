@@ -1232,12 +1232,12 @@ func (s *Server) evaluate(ctx context.Context, prompt, pattern, answer string) (
 		diagnostics.Success = true
 		return heuristicEval(prompt, pattern, answer), "local", "heuristic", diagnostics, nil
 	}
-	baseMessages := []ChatMessage{{Role: "system", Content: "Evaluate an English learner answer. Return exactly one JSON object in the assistant content; do not include reasoning or prose. The object must have verdict, meaning_score, grammar_score, naturalness_score, pattern_score, errors, suggested_answer, explanation_zh. Scores must be numbers from 0 to 1. errors must be an array, including [] when there are no errors. Each error type must be one of meaning, tense, article, preposition, word_order, modal, condition, agreement, word_choice, missing_information, extra_information, unnatural_expression, target_pattern_missing, register, other. Each severity must be minor, moderate, or major."}, {Role: "user", Content: fmt.Sprintf("Prompt: %s\nTarget pattern: %s\nAnswer: %s", prompt, pattern, answer)}}
+	baseMessages := []ChatMessage{{Role: "system", Content: "Evaluate an English learner answer. Return exactly one JSON object in the assistant content; do not include reasoning or prose. The object must have verdict (string), meaning_score (number), grammar_score (number), naturalness_score (number), pattern_score (number), errors (array), suggested_answer (string), and explanation_zh (string). Scores must be numbers from 0 to 1. Use errors:[] when there are no errors. Every error object must contain all three string fields: type, severity, and explanation. Each error type must be one of meaning, tense, article, preposition, word_order, modal, condition, agreement, word_choice, missing_information, extra_information, unnatural_expression, target_pattern_missing, register, other. Each severity must be minor, moderate, or major."}, {Role: "user", Content: fmt.Sprintf("Prompt: %s\nTarget pattern: %s\nAnswer: %s", prompt, pattern, answer)}}
 	jsonMode := true
 	for attempt := 0; attempt < 2; attempt++ {
 		messages := baseMessages
 		if attempt == 1 {
-			messages = append(append([]ChatMessage{}, baseMessages...), ChatMessage{Role: "system", Content: "Repair instruction: Return only one valid JSON object matching the required schema. No markdown. No explanation outside JSON."})
+			messages = append(append([]ChatMessage{}, baseMessages...), ChatMessage{Role: "system", Content: "Repair instruction: Return only one valid JSON object matching the required schema. No markdown and no explanation outside JSON. Do not omit any required field. Every errors item must include type, severity, and explanation; use errors:[] if there are no errors."})
 		}
 		if !jsonMode {
 			messages = append(messages, ChatMessage{Role: "system", Content: "This provider does not support native JSON response mode. Return only the JSON object in the assistant content."})
