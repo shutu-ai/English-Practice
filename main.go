@@ -843,7 +843,7 @@ func normalizeVerdict(value string) (string, error) {
 	switch v {
 	case "correct":
 		return "correct", nil
-	case "mostly_correct", "mostlycorrect":
+	case "mostly_correct", "mostlycorrect", "partially_correct", "partiallycorrect":
 		return "mostly_correct", nil
 	case "needs_improvement", "needsimprovement":
 		return "needs_improvement", nil

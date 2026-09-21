@@ -162,6 +162,9 @@ func TestStructuredOutputNormalization(t *testing.T) {
 	if eval.Verdict != "mostly_correct" || eval.MeaningScore != .85 || eval.GrammarScore != .8 || eval.NaturalnessScore != .72 || len(eval.Errors) != 0 {
 		t.Fatalf("normalization failed: %#v", eval)
 	}
+	if eval, err := normalizeEvalContent(strings.Replace(validEvaluationJSON(), `"verdict":"correct"`, `"verdict":"partially_correct"`, 1)); err != nil || eval.Verdict != "mostly_correct" {
+		t.Fatalf("provider verdict alias was not normalized: %#v err=%v", eval, err)
+	}
 	if _, err := normalizeEvalContent(`{"verdict":"correct","meaning_score":1.5,"grammar_score":.8,"naturalness_score":.8,"pattern_score":.8,"errors":[],"suggested_answer":"x","explanation_zh":"x"}`); err == nil {
 		t.Fatal("ambiguous score accepted")
 	}
