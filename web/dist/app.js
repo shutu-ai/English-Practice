@@ -1,6 +1,79 @@
-const $=s=>document.querySelector(s), api=(u,o)=>fetch(u,{headers:{'Content-Type':'application/json'},...o}).then(r=>r.json());let current=null;
-function renderExercise(){if(!current)return;$('#prompt').textContent=current.chinese_prompt;$('#pattern').textContent=current.target_pattern;$('#difficulty').textContent='难度 '+Number(current.difficulty).toFixed(1)+' / 8';$('#answer').value='';$('#feedback').classList.add('hidden')}
-async function next(){current=await api('/api/practice/next',{method:'POST',body:JSON.stringify({mode:'adaptive'})});renderExercise()}
-async function submit(){if(!current||!$('#answer').value.trim())return;const x=await api('/api/attempts',{method:'POST',body:JSON.stringify({exercise_id:current.exercise_id,answer:$('#answer').value})});const f=$('#feedback');f.classList.remove('hidden');if(x.evaluation){const e=x.evaluation;f.innerHTML='<b>'+({correct:'表达正确',mostly_correct:'基本正确',needs_improvement:'需要改进',incorrect:'需要重写'}[e.verdict]||e.verdict)+'</b><button class="next">下一题 →</button><p>'+e.explanation_zh+'</p><p><strong>更自然的表达：</strong> '+e.suggested_answer+'</p><div class="score">Meaning <b>'+Math.round(e.meaning_score*100)+'%</b></div><div class="score">Grammar <b>'+Math.round(e.grammar_score*100)+'%</b></div><div class="score">Naturalness <b>'+Math.round(e.naturalness_score*100)+'%</b></div><div class="score">Pattern <b>'+Math.round(e.pattern_score*100)+'%</b></div>';f.querySelector('.next').onclick=next}else f.textContent=x.error||'AI 评估失败，本次不会更新掌握度。'}
-async function show(page){document.querySelectorAll('main>section').forEach(s=>s.classList.add('hidden'));$('#'+page).classList.remove('hidden');document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.page===page));if(page==='progress'){const p=await api('/api/progress');$('#progress').innerHTML='<div class="panel"><div class="row"><span>近期练习</span><b>'+p.recent_attempts+'</b></div><div class="row"><span>近期成功率</span><b>'+Math.round(p.recent_success_rate*100)+'%</b></div><div class="row"><span>Global Difficulty</span><b>'+Number(p.global_difficulty).toFixed(1)+'</b></div><h2>需要更多练习的句型</h2>'+p.weak_patterns.map(x=>'<div class="row"><span>'+x.pattern+'</span><span class="pill">'+Math.round(x.mastery*100)+'%</span></div>').join('')+'</div>'}if(page==='history'){const h=await api('/api/history');$('#history').innerHTML='<div class="panel">'+(h.length?h.map(x=>'<div class="row"><span>'+x.prompt+'</span><span>'+x.answer+'</span><span class="pill">'+x.verdict+'</span></div>').join(''):'<p>还没有练习记录。</p>')+'</div>'}if(page==='review'){const r=await api('/api/reviews');$('#review').innerHTML='<div class="panel"><h2>待复习句型</h2>'+r.map(x=>'<div class="row"><span>'+x.pattern+'</span><span class="pill">'+new Date(x.due_at).toLocaleString()+'</span></div>').join('')+'</div>'}if(page==='scenes'){$('#scenes').innerHTML='<div class="panel"><h2>真实场景</h2><p>在 Practice 中选择场景后继续练习。</p></div>'}if(page==='settings'){$('#settings').innerHTML='<div class="panel"><h2>LLM Provider</h2><p>使用 /api/providers 配置 OpenAI、OpenAI-Compatible 或 Ollama。</p></div>'}}
-document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>show(b.dataset.page));$('#submit').onclick=submit;next();
+﻿const $ = (selector) => document.querySelector(selector)
+const api = (url, options) => fetch(url, { headers: { 'Content-Type': 'application/json' }, ...options }).then(async response => { const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Request failed'); return data })
+let current = null
+let providerId = ''
+
+function renderExercise() {
+  if (!current) return
+  $('#prompt').textContent = current.chinese_prompt
+  $('#pattern').textContent = current.target_pattern
+  $('#difficulty').textContent = `Difficulty ${Number(current.difficulty).toFixed(1)} / 8`
+  $('#answer').value = ''
+  $('#feedback').classList.add('hidden')
+}
+
+async function next() {
+  current = await api('/api/practice/next', { method: 'POST', body: JSON.stringify({ mode: 'adaptive' }) })
+  renderExercise()
+}
+
+async function submit() {
+  if (!current || !$('#answer').value.trim()) return
+  const result = await api('/api/attempts', { method: 'POST', body: JSON.stringify({ exercise_id: current.exercise_id, answer: $('#answer').value }) })
+  const feedback = $('#feedback')
+  feedback.classList.remove('hidden')
+  if (!result.evaluation) { feedback.textContent = result.error || 'Evaluation failed; mastery was not updated.'; return }
+  const evaluation = result.evaluation
+  feedback.innerHTML = `<b>${({ correct: 'Correct', mostly_correct: 'Mostly correct', needs_improvement: 'Needs improvement', incorrect: 'Try again' })[evaluation.verdict] || evaluation.verdict}</b><button class="next">Next →</button><p>${evaluation.explanation_zh}</p><p><strong>More natural:</strong> ${evaluation.suggested_answer}</p><div class="score">Meaning <b>${Math.round(evaluation.meaning_score * 100)}%</b></div><div class="score">Grammar <b>${Math.round(evaluation.grammar_score * 100)}%</b></div><div class="score">Naturalness <b>${Math.round(evaluation.naturalness_score * 100)}%</b></div><div class="score">Pattern <b>${Math.round(evaluation.pattern_score * 100)}%</b></div>`
+  feedback.querySelector('.next').onclick = next
+}
+
+function providerPayload() {
+  return { id: providerId, name: $('#provider-name').value, type: $('#provider-type').value, base_url: $('#provider-url').value, api_key: $('#provider-key').value, model: $('#provider-model').value, timeout: Number($('#provider-timeout').value || 45), temperature: Number($('#provider-temperature').value || .2), max_tokens: Number($('#provider-tokens').value || 800), enabled: $('#provider-enabled').checked }
+}
+
+function fillProvider(provider) {
+  providerId = provider.id || ''
+  $('#provider-name').value = provider.name || ''
+  $('#provider-type').value = provider.type || 'openai-compatible'
+  $('#provider-url').value = provider.base_url || ''
+  $('#provider-key').value = ''
+  $('#provider-model').value = provider.model || ''
+  $('#provider-timeout').value = provider.timeout || 45
+  $('#provider-temperature').value = provider.temperature ?? .2
+  $('#provider-tokens').value = provider.max_tokens || 800
+  $('#provider-enabled').checked = !!provider.enabled
+}
+
+async function loadProvider() {
+  const providers = await api('/api/providers')
+  if (providers.length) fillProvider(providers[0])
+}
+
+async function saveProvider() {
+  const saved = await api('/api/providers', { method: 'POST', body: JSON.stringify(providerPayload()) })
+  fillProvider(saved)
+  $('#provider-message').textContent = 'Provider saved. An empty API key keeps the existing key.'
+}
+
+async function testProvider() {
+  const result = await api('/api/providers/test', { method: 'POST', body: JSON.stringify(providerPayload()) })
+  $('#provider-message').textContent = result.ok ? `Connection successful (${result.latency_ms} ms).` : `Connection failed: ${result.error || 'unknown error'}`
+}
+
+async function show(page) {
+  document.querySelectorAll('main > section').forEach(section => section.classList.add('hidden'))
+  $(`#${page}`).classList.remove('hidden')
+  document.querySelectorAll('nav button').forEach(button => button.classList.toggle('active', button.dataset.page === page))
+  if (page === 'progress') { const p = await api('/api/progress'); $('#progress').innerHTML = `<div class="panel"><div class="row"><span>Recent practice</span><b>${p.recent_attempts}</b></div><div class="row"><span>Success rate</span><b>${Math.round(p.recent_success_rate * 100)}%</b></div><div class="row"><span>Global Difficulty</span><b>${Number(p.global_difficulty).toFixed(1)}</b></div><h2>Patterns to practice</h2>${p.weak_patterns.map(x => `<div class="row"><span>${x.pattern}</span><span class="pill">${Math.round(x.mastery * 100)}%</span></div>`).join('')}</div>` }
+  if (page === 'history') { const history = await api('/api/history'); $('#history').innerHTML = `<div class="panel">${history.length ? history.map(x => `<div class="row"><span>${x.prompt}</span><span>${x.answer}</span><span class="pill">${x.verdict}</span></div>`).join('') : '<p>No practice history yet.</p>'}</div>` }
+  if (page === 'review') { const reviews = await api('/api/reviews'); $('#review').innerHTML = `<div class="panel"><h2>Due reviews</h2>${reviews.map(x => `<div class="row"><span>${x.pattern}</span><span class="pill">${new Date(x.due_at).toLocaleString()}</span></div>`).join('')}</div>` }
+  if (page === 'scenes') $('#scenes').innerHTML = '<div class="panel"><h2>Scenes</h2><p>Select a scene from the Vue interface or use the practice API.</p></div>'
+  if (page === 'settings') await loadProvider()
+}
+
+document.querySelectorAll('nav button').forEach(button => { button.onclick = () => show(button.dataset.page) })
+$('#submit').onclick = submit
+$('#provider-save').onclick = saveProvider
+$('#provider-test').onclick = testProvider
+next().catch(error => { $('#prompt').textContent = error.message })
