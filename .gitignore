@@ -8,3 +8,4 @@ data/*.db
 *.log
 .runtime-data*/
 .acceptance-data*/
+.port-check-data*/
