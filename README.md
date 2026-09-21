@@ -8,7 +8,7 @@ Requires Go 1.25+. The default data file is `data/english-practice.db`; set `ENG
 
 ```powershell
 go run -mod=mod .
-# open http://localhost:8080
+# open http://localhost:8081
 ```
 
 The repository contains a ready-to-serve fallback bundle in `web/dist`. The Vue 3 + TypeScript source is in `src`; with network access, run `npm install` and `npm run build` to regenerate the bundle.
