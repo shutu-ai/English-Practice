@@ -64,6 +64,7 @@ func TestProviderHTTPFailuresAreReturnedWithoutLearningMutation(t *testing.T) {
 		timeout int
 	}{
 		{name: "4xx", handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusBadRequest) }), timeout: 2},
+		{name: "429", handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusTooManyRequests) }), timeout: 2},
 		{name: "5xx", handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusInternalServerError) }), timeout: 2},
 		{name: "timeout", handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { time.Sleep(1200 * time.Millisecond) }), timeout: 1},
 	} {
@@ -166,6 +167,12 @@ func TestStructuredOutputNormalization(t *testing.T) {
 	}
 	if _, err := normalizeEvalContent(`{"verdict":"correct","meaning_score":.8,"grammar_score":.8,"naturalness_score":.8,"pattern_score":.8,"errors":[{"type":"unknown","severity":"minor","explanation":"x"}],"suggested_answer":"x","explanation_zh":"x"}`); err == nil {
 		t.Fatal("unknown error type accepted")
+	}
+	if _, err := normalizeEvalContent(`{"verdict":"correct","meaning_score":.8,"grammar_score":.8,"naturalness_score":.8,"pattern_score":.8,"errors":[],"suggested_answer":"x"}`); err == nil {
+		t.Fatal("missing explanation accepted")
+	}
+	if _, err := normalizeEvalContent(`{"verdict":"correct","meaning_score":.8,"grammar_score":.8,"naturalness_score":.8,"pattern_score":.8,"errors":[{"type":"meaning","severity":"minor","explanation":"x",}],"suggested_answer":"x","explanation_zh":"x"}`); err == nil {
+		t.Fatal("trailing comma accepted")
 	}
 	if _, err := normalizeEvalContent("Here is the JSON:\n" + validEvaluationJSON()); err == nil {
 		t.Fatal("prose outside JSON accepted")
@@ -293,6 +300,38 @@ func TestFailedAttemptReevaluationUpdatesMasteryExactlyOnce(t *testing.T) {
 	}
 	if attempts != 1 {
 		t.Fatalf("reevaluation mutated mastery more than once: %d", attempts)
+	}
+}
+
+func TestFailedReevaluationDoesNotWriteEvaluationOrMastery(t *testing.T) {
+	s := testServer(t)
+	ex, err := s.generateExercise(context.Background(), 3, "adaptive", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"still invalid"}}]}`))
+	}))
+	defer mock.Close()
+	s.llm.configs["mock"] = ProviderConfig{ID: "mock", Type: "openai-compatible", BaseURL: mock.URL, Model: "mock", Enabled: true, Timeout: 2}
+	first, err := s.submitAttempt(context.Background(), "failed-reeval-session", ex["exercise_id"].(string), "I didn't go because I didn't feel well.")
+	if err != nil || first["evaluation_status"] != "failed" {
+		t.Fatalf("expected failed initial evaluation: result=%#v err=%v", first, err)
+	}
+	second, err := s.reevaluateAttempt(context.Background(), first["attempt_id"].(string))
+	if err != nil || second["evaluation_status"] != "failed" {
+		t.Fatalf("expected failed re-evaluation: result=%#v err=%v", second, err)
+	}
+	var evaluations, attempts int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM evaluations").Scan(&evaluations); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow("SELECT attempts FROM pattern_mastery WHERE pattern_id=?", ex["pattern_id"]).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if evaluations != 0 || attempts != 0 {
+		t.Fatalf("failed re-evaluation mutated state: evaluations=%d attempts=%d", evaluations, attempts)
 	}
 }
 
