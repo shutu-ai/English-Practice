@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,7 +21,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 type Server struct {
 	db     *sql.DB
@@ -42,13 +43,33 @@ type ChatRequest struct {
 	Temperature float64       `json:"temperature,omitempty"`
 	MaxTokens   int           `json:"max_tokens,omitempty"`
 	JSONMode    bool          `json:"json_mode,omitempty"`
+	RequestID   string        `json:"-"`
 }
 type ChatResponse struct {
-	Content  string        `json:"content"`
-	Provider string        `json:"provider,omitempty"`
-	Model    string        `json:"model,omitempty"`
-	Latency  time.Duration `json:"-"`
+	Content       string        `json:"content"`
+	Provider      string        `json:"provider,omitempty"`
+	Model         string        `json:"model,omitempty"`
+	Latency       time.Duration `json:"-"`
+	HTTPStatus    int           `json:"-"`
+	ResponseShape string        `json:"-"`
 }
+
+type ProviderError struct {
+	Stage         string
+	Category      string
+	HTTPStatus    int
+	Latency       time.Duration
+	ResponseShape string
+	Err           error
+}
+
+func (e *ProviderError) Error() string {
+	if e.Err == nil {
+		return e.Category
+	}
+	return e.Err.Error()
+}
+func (e *ProviderError) Unwrap() error { return e.Err }
 
 type ProviderConfig struct {
 	ID          string  `json:"id"`
@@ -114,32 +135,107 @@ func (c HTTPChatClient) Chat(ctx context.Context, req ChatRequest) (*ChatRespons
 		return nil, err
 	}
 	request.Header.Set("Content-Type", "application/json")
+	if req.RequestID != "" {
+		request.Header.Set("X-Request-ID", req.RequestID)
+	}
 	if c.cfg.APIKey != "" {
 		request.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
 	}
 	resp, err := http.DefaultClient.Do(request)
 	if err != nil {
-		return nil, err
+		category := "provider_error"
+		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "deadline exceeded") {
+			category = "timeout"
+		}
+		return nil, &ProviderError{Stage: "provider_http", Category: category, Latency: time.Since(start), Err: err}
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("provider returned %s", resp.Status)
+		category := "provider_5xx"
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			category = "provider_4xx"
+		}
+		return nil, &ProviderError{Stage: "provider_http", Category: category, HTTPStatus: resp.StatusCode, Latency: time.Since(start), ResponseShape: responseShape(body), Err: fmt.Errorf("provider returned %s", resp.Status)}
 	}
-	var out struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
+	content, shape, err := extractAssistantContent(body)
+	if err != nil {
+		return nil, &ProviderError{Stage: "content_extraction", Category: "invalid_provider_envelope", HTTPStatus: resp.StatusCode, Latency: time.Since(start), ResponseShape: shape, Err: err}
 	}
-	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, fmt.Errorf("invalid provider response: %w", err)
+	return &ChatResponse{Content: content, Provider: c.cfg.ID, Model: c.cfg.Model, Latency: time.Since(start), HTTPStatus: resp.StatusCode, ResponseShape: shape}, nil
+}
+
+func responseShape(body []byte) string {
+	var v any
+	if json.Unmarshal(body, &v) != nil {
+		return "invalid_json"
 	}
-	if len(out.Choices) == 0 {
-		return nil, errors.New("provider returned no choices")
+	switch x := v.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		return strings.Join(keys, ",")
+	default:
+		return fmt.Sprintf("%T", x)
 	}
-	return &ChatResponse{Content: out.Choices[0].Message.Content, Provider: c.cfg.ID, Model: c.cfg.Model, Latency: time.Since(start)}, nil
+}
+
+func extractAssistantContent(body []byte) (string, string, error) {
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return "", "invalid_json", fmt.Errorf("invalid provider envelope JSON: %w", err)
+	}
+	if v, ok := root["response"].(string); ok && strings.TrimSpace(v) != "" {
+		return v, "response", nil
+	}
+	if v, ok := root["output_text"].(string); ok && strings.TrimSpace(v) != "" {
+		return v, "output_text", nil
+	}
+	if message, ok := root["message"].(map[string]any); ok {
+		if content, ok := contentString(message["content"]); ok {
+			return content, "message.content", nil
+		}
+	}
+	if v, ok := root["content"].(string); ok && strings.TrimSpace(v) != "" {
+		return v, "content", nil
+	}
+	if choices, ok := root["choices"].([]any); ok && len(choices) > 0 {
+		if choice, ok := choices[0].(map[string]any); ok {
+			if msg, ok := choice["message"].(map[string]any); ok {
+				if content, ok := contentString(msg["content"]); ok {
+					return content, "choices.message.content", nil
+				}
+			}
+			if content, ok := contentString(choice["text"]); ok {
+				return content, "choices.text", nil
+			}
+		}
+	}
+	return "", responseShape(body), errors.New("provider response has no assistant content")
+}
+
+func contentString(v any) (string, bool) {
+	if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+		return s, true
+	}
+	parts, ok := v.([]any)
+	if !ok {
+		return "", false
+	}
+	var out strings.Builder
+	for _, part := range parts {
+		if m, ok := part.(map[string]any); ok {
+			if text, ok := m["text"].(string); ok {
+				out.WriteString(text)
+			}
+			if text, ok := m["content"].(string); ok {
+				out.WriteString(text)
+			}
+		}
+	}
+	return out.String(), strings.TrimSpace(out.String()) != ""
 }
 
 func main() {
@@ -197,6 +293,9 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
+	if err := ensureColumn(db, "attempts", "evaluation_diagnostics_json", "TEXT NOT NULL DEFAULT '{}'"); err != nil {
+		return err
+	}
 	var v int
 	if err := db.QueryRow("SELECT COALESCE(MAX(version),0) FROM schema_meta").Scan(&v); err != nil {
 		return err
@@ -206,6 +305,31 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	return nil
+}
+
+func ensureColumn(db *sql.DB, table, column, definition string) error {
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, pk int
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition)
+	return err
 }
 
 func seed(db *sql.DB) error {
@@ -407,6 +531,27 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		result, err := s.submitAttempt(r.Context(), req.SessionID, req.ExerciseID, req.Answer)
 		if err != nil {
 			jsonResp(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		jsonResp(w, 200, result)
+	})
+	mux.HandleFunc("/api/attempts/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/reevaluate") {
+			jsonResp(w, 404, map[string]string{"error": "not found"})
+			return
+		}
+		attemptID := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/api/attempts/"), "/"), "/reevaluate")
+		if attemptID == "" {
+			jsonResp(w, 400, map[string]string{"error": "attempt id is required"})
+			return
+		}
+		result, err := s.reevaluateAttempt(r.Context(), attemptID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				jsonResp(w, 404, map[string]string{"error": "attempt not found"})
+			} else {
+				jsonResp(w, 500, map[string]string{"error": err.Error()})
+			}
 			return
 		}
 		jsonResp(w, 200, result)
@@ -641,6 +786,244 @@ type Eval struct {
 	ExplanationZH    string           `json:"explanation_zh"`
 }
 
+type EvaluationDiagnostics struct {
+	RequestID     string `json:"request_id"`
+	Provider      string `json:"provider"`
+	ProviderType  string `json:"provider_type"`
+	Model         string `json:"model"`
+	HTTPStatus    int    `json:"http_status,omitempty"`
+	LatencyMS     int64  `json:"latency_ms,omitempty"`
+	FailureStage  string `json:"failure_stage,omitempty"`
+	ErrorCategory string `json:"error_category,omitempty"`
+	SchemaError   string `json:"schema_error,omitempty"`
+	ResponseShape string `json:"response_shape,omitempty"`
+	RetryCount    int    `json:"retry_count"`
+	Success       bool   `json:"success"`
+}
+
+var evaluationErrorTypes = map[string]string{
+	"meaning": "meaning", "tense": "tense", "article": "article", "preposition": "preposition", "word_order": "word_order", "modal": "modal", "condition": "condition", "agreement": "agreement", "word_choice": "word_choice", "missing_information": "missing_information", "extra_information": "extra_information", "unnatural_expression": "unnatural_expression", "target_pattern_missing": "target_pattern_missing", "register": "register", "other": "other",
+}
+
+func normalizeEnum(value string) string {
+	v := strings.ToLower(strings.TrimSpace(value))
+	v = strings.ReplaceAll(v, "-", "_")
+	v = strings.Join(strings.Fields(v), "_")
+	return v
+}
+
+func normalizeVerdict(value string) (string, error) {
+	v := normalizeEnum(value)
+	switch v {
+	case "correct":
+		return "correct", nil
+	case "mostly_correct", "mostlycorrect":
+		return "mostly_correct", nil
+	case "needs_improvement", "needsimprovement":
+		return "needs_improvement", nil
+	case "incorrect":
+		return "incorrect", nil
+	}
+	return "", fmt.Errorf("unknown verdict %q", value)
+}
+
+func normalizeErrorType(value string) (string, error) {
+	v := normalizeEnum(value)
+	if v == "targetpatternmissing" {
+		v = "target_pattern_missing"
+	}
+	if canonical, ok := evaluationErrorTypes[v]; ok {
+		return canonical, nil
+	}
+	return "", fmt.Errorf("unknown error type %q", value)
+}
+
+func normalizeSeverity(value string) (string, error) {
+	v := normalizeEnum(value)
+	if v == "minor" || v == "moderate" || v == "major" {
+		return v, nil
+	}
+	return "", fmt.Errorf("unknown severity %q", value)
+}
+
+func lookupField(fields map[string]json.RawMessage, names ...string) (json.RawMessage, bool) {
+	for _, name := range names {
+		if value, ok := fields[name]; ok {
+			return value, true
+		}
+	}
+	return nil, false
+}
+
+func parseRequiredString(fields map[string]json.RawMessage, names ...string) (string, error) {
+	raw, ok := lookupField(fields, names...)
+	if !ok {
+		return "", fmt.Errorf("missing required field %s", names[0])
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil || strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("field %s must be a non-empty string", names[0])
+	}
+	return strings.TrimSpace(value), nil
+}
+
+func parseScore(raw json.RawMessage, name string) (float64, error) {
+	if string(raw) == "null" {
+		return 0, fmt.Errorf("score %s is null", name)
+	}
+	var number float64
+	if err := json.Unmarshal(raw, &number); err == nil {
+		return normalizeScore(number, name)
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err != nil {
+		return 0, fmt.Errorf("score %s must be numeric", name)
+	}
+	text = strings.TrimSpace(strings.TrimSuffix(text, "%"))
+	number, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		return 0, fmt.Errorf("score %s is not numeric", name)
+	}
+	return normalizeScore(number, name)
+}
+
+func normalizeScore(number float64, name string) (float64, error) {
+	if math.IsNaN(number) || math.IsInf(number, 0) || number < 0 || number > 100 {
+		return 0, fmt.Errorf("score %s is out of range", name)
+	}
+	if number > 1 {
+		if number < 2 {
+			return 0, fmt.Errorf("score %s is ambiguous", name)
+		}
+		number /= 100
+	}
+	return number, nil
+}
+
+func stripJSONFence(raw string) (string, error) {
+	text := strings.TrimSpace(raw)
+	if !strings.HasPrefix(text, "```") {
+		if strings.Contains(text, "```") {
+			return "", errors.New("markdown fence appears in prose")
+		}
+		return text, nil
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) < 3 || !strings.HasPrefix(strings.TrimSpace(lines[0]), "```") || strings.TrimSpace(lines[len(lines)-1]) != "```" {
+		return "", errors.New("incomplete markdown JSON fence")
+	}
+	return strings.TrimSpace(strings.Join(lines[1:len(lines)-1], "\n")), nil
+}
+
+func normalizeEvalContent(raw string) (Eval, error) {
+	clean, err := stripJSONFence(raw)
+	if err != nil {
+		return Eval{}, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(clean), &fields); err != nil {
+		return Eval{}, fmt.Errorf("invalid JSON: %w", err)
+	}
+	var out Eval
+	verdictRaw, ok := lookupField(fields, "verdict")
+	if !ok {
+		return out, errors.New("missing required field verdict")
+	}
+	var verdict string
+	if err := json.Unmarshal(verdictRaw, &verdict); err != nil {
+		return out, errors.New("verdict must be a string")
+	}
+	out.Verdict, err = normalizeVerdict(verdict)
+	if err != nil {
+		return out, err
+	}
+	if raw, ok := lookupField(fields, "meaning_score", "meaningScore", "meaning"); ok {
+		out.MeaningScore, err = parseScore(raw, "meaning_score")
+	} else {
+		err = errors.New("missing required field meaning_score")
+	}
+	if err != nil {
+		return out, err
+	}
+	if raw, ok := lookupField(fields, "grammar_score", "grammarScore", "grammar"); ok {
+		out.GrammarScore, err = parseScore(raw, "grammar_score")
+	} else {
+		err = errors.New("missing required field grammar_score")
+	}
+	if err != nil {
+		return out, err
+	}
+	if raw, ok := lookupField(fields, "naturalness_score", "naturalnessScore", "naturalness"); ok {
+		out.NaturalnessScore, err = parseScore(raw, "naturalness_score")
+	} else {
+		err = errors.New("missing required field naturalness_score")
+	}
+	if err != nil {
+		return out, err
+	}
+	if raw, ok := lookupField(fields, "pattern_score", "patternScore", "pattern"); ok {
+		out.PatternScore, err = parseScore(raw, "pattern_score")
+	} else {
+		err = errors.New("missing required field pattern_score")
+	}
+	if err != nil {
+		return out, err
+	}
+	out.SuggestedAnswer, err = parseRequiredString(fields, "suggested_answer", "suggestedAnswer")
+	if err != nil {
+		return out, err
+	}
+	out.ExplanationZH, err = parseRequiredString(fields, "explanation_zh", "explanationZh", "explanation")
+	if err != nil {
+		return out, err
+	}
+	errorsRaw, ok := lookupField(fields, "errors")
+	if !ok {
+		return out, errors.New("missing required field errors")
+	}
+	if string(errorsRaw) == "null" {
+		out.Errors = []map[string]any{}
+	} else {
+		var items []map[string]json.RawMessage
+		if err := json.Unmarshal(errorsRaw, &items); err != nil {
+			return out, errors.New("errors must be an array or null")
+		}
+		out.Errors = make([]map[string]any, 0, len(items))
+		for _, item := range items {
+			typRaw, ok := lookupField(item, "type", "error_type", "errorType")
+			if !ok {
+				return out, errors.New("error is missing type")
+			}
+			var typ string
+			if err := json.Unmarshal(typRaw, &typ); err != nil {
+				return out, errors.New("error type must be a string")
+			}
+			canonicalType, err := normalizeErrorType(typ)
+			if err != nil {
+				return out, err
+			}
+			sevRaw, ok := lookupField(item, "severity")
+			if !ok {
+				return out, errors.New("error is missing severity")
+			}
+			var sev string
+			if err := json.Unmarshal(sevRaw, &sev); err != nil {
+				return out, errors.New("severity must be a string")
+			}
+			canonicalSeverity, err := normalizeSeverity(sev)
+			if err != nil {
+				return out, err
+			}
+			explanation, err := parseRequiredString(item, "explanation", "detail")
+			if err != nil {
+				return out, err
+			}
+			out.Errors = append(out.Errors, map[string]any{"type": canonicalType, "severity": canonicalSeverity, "explanation": explanation})
+		}
+	}
+	return out, validateEval(&out)
+}
+
 func (s *Server) submitAttempt(ctx context.Context, session, exercise, answer string) (map[string]any, error) {
 	if session == "" {
 		session = id("session")
@@ -652,27 +1035,65 @@ func (s *Server) submitAttempt(ctx context.Context, session, exercise, answer st
 		return nil, err
 	}
 	attempt := id("attempt")
-	_, err := s.db.Exec(`INSERT INTO attempts(id,session_id,exercise_id,user_answer,submitted_at,evaluation_status) VALUES(?,?,?,?,?,?)`, attempt, session, exercise, answer, time.Now().UTC().Format(time.RFC3339), "pending")
-	if err != nil {
+	if _, err := s.db.Exec(`INSERT INTO attempts(id,session_id,exercise_id,user_answer,submitted_at,evaluation_status,evaluation_diagnostics_json) VALUES(?,?,?,?,?,?,?)`, attempt, session, exercise, answer, time.Now().UTC().Format(time.RFC3339), "pending", "{}"); err != nil {
 		return nil, err
 	}
-	eval, provider, model, err := s.evaluate(ctx, prompt, pattern, answer)
-	if err != nil {
-		_, _ = s.db.Exec("UPDATE attempts SET evaluation_status='failed' WHERE id=?", attempt)
-		return map[string]any{"attempt_id": attempt, "evaluation_status": "failed", "error": "AI 评估失败，本次不会更新掌握度。", "retryable": true}, nil
+	return s.evaluateAndPersist(ctx, attempt, prompt, pattern, scene, difficulty, answer)
+}
+
+func failureUserMessage(d EvaluationDiagnostics) string {
+	switch d.ErrorCategory {
+	case "timeout":
+		return "AI 评估超时，请稍后重试。"
+	case "provider_4xx":
+		return "Provider 请求被拒绝，请检查设置。"
+	case "provider_5xx", "provider_error":
+		return "Provider 暂时不可用，请稍后重试。"
+	case "invalid_provider_envelope":
+		return "Provider 返回格式无法识别。"
+	case "invalid_structured_output", "schema_validation":
+		return "AI 返回的评估格式无效，请重新评估。"
+	default:
+		return "AI 评估失败，请稍后重试。"
 	}
+}
+
+func (s *Server) evaluateAndPersist(ctx context.Context, attempt, prompt, pattern, scene string, difficulty float64, answer string) (map[string]any, error) {
+	eval, provider, model, diagnostics, err := s.evaluate(ctx, prompt, pattern, answer)
+	if err != nil {
+		diagnostics.Success = false
+		diagJSON, _ := json.Marshal(diagnostics)
+		_, _ = s.db.Exec("UPDATE attempts SET provider=?,model=?,evaluation_status='failed',evaluation_diagnostics_json=? WHERE id=?", provider, model, string(diagJSON), attempt)
+		return map[string]any{"attempt_id": attempt, "evaluation_status": "failed", "error": failureUserMessage(diagnostics), "error_category": diagnostics.ErrorCategory, "diagnostics": diagnostics, "retryable": diagnostics.RetryCount > 0 || diagnostics.ErrorCategory == "invalid_structured_output"}, nil
+	}
+	diagnostics.Success = true
+	return s.saveValidatedAttempt(attempt, prompt, pattern, scene, difficulty, eval, provider, model, diagnostics)
+}
+
+func (s *Server) saveValidatedAttempt(attempt, prompt, pattern, scene string, difficulty float64, eval Eval, provider, model string, diagnostics EvaluationDiagnostics) (map[string]any, error) {
+	diagJSON, _ := json.Marshal(diagnostics)
 	errorsJSON, _ := json.Marshal(eval.Errors)
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	_, err = tx.Exec(`UPDATE attempts SET provider=?,model=?,prompt_version='v1',evaluation_status='validated' WHERE id=?`, provider, model, attempt)
-	if err != nil {
+	var status, session string
+	if err := tx.QueryRow("SELECT evaluation_status,session_id FROM attempts WHERE id=?", attempt).Scan(&status, &session); err != nil {
 		return nil, err
 	}
-	_, err = tx.Exec(`INSERT INTO evaluations(id,attempt_id,verdict,meaning_score,grammar_score,naturalness_score,pattern_score,errors_json,suggested_answer,explanation_zh,validated,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,1,?)`, id("evaluation"), attempt, eval.Verdict, eval.MeaningScore, eval.GrammarScore, eval.NaturalnessScore, eval.PatternScore, string(errorsJSON), eval.SuggestedAnswer, eval.ExplanationZH, time.Now().UTC().Format(time.RFC3339))
-	if err != nil {
+	var existing int
+	if err := tx.QueryRow("SELECT COUNT(*) FROM evaluations WHERE attempt_id=?", attempt).Scan(&existing); err != nil {
+		return nil, err
+	}
+	if status == "validated" || existing > 0 {
+		tx.Rollback()
+		return s.loadAttemptResult(attempt)
+	}
+	if _, err = tx.Exec(`UPDATE attempts SET provider=?,model=?,prompt_version='v1',evaluation_status='validated',evaluation_diagnostics_json=? WHERE id=?`, provider, model, string(diagJSON), attempt); err != nil {
+		return nil, err
+	}
+	if _, err = tx.Exec(`INSERT INTO evaluations(id,attempt_id,verdict,meaning_score,grammar_score,naturalness_score,pattern_score,errors_json,suggested_answer,explanation_zh,validated,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,1,?)`, id("evaluation"), attempt, eval.Verdict, eval.MeaningScore, eval.GrammarScore, eval.NaturalnessScore, eval.PatternScore, string(errorsJSON), eval.SuggestedAnswer, eval.ExplanationZH, time.Now().UTC().Format(time.RFC3339)); err != nil {
 		return nil, err
 	}
 	if err = updateMasteryTx(tx, pattern, scene, difficulty, eval); err != nil {
@@ -687,7 +1108,46 @@ func (s *Server) submitAttempt(ctx context.Context, session, exercise, answer st
 	return map[string]any{"attempt_id": attempt, "evaluation_status": "validated", "evaluation": eval, "session_id": session}, nil
 }
 
-func (s *Server) evaluate(ctx context.Context, prompt, pattern, answer string) (Eval, string, string, error) {
+func (s *Server) loadAttemptResult(attempt string) (map[string]any, error) {
+	var status, session string
+	if err := s.db.QueryRow("SELECT evaluation_status,session_id FROM attempts WHERE id=?", attempt).Scan(&status, &session); err != nil {
+		return nil, err
+	}
+	eval, err := s.loadEvaluation(attempt)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"attempt_id": attempt, "evaluation_status": status, "evaluation": eval, "session_id": session}, nil
+}
+
+func (s *Server) loadEvaluation(attempt string) (Eval, error) {
+	var e Eval
+	var errorsJSON string
+	if err := s.db.QueryRow("SELECT verdict,meaning_score,grammar_score,naturalness_score,pattern_score,errors_json,suggested_answer,explanation_zh FROM evaluations WHERE attempt_id=?", attempt).Scan(&e.Verdict, &e.MeaningScore, &e.GrammarScore, &e.NaturalnessScore, &e.PatternScore, &errorsJSON, &e.SuggestedAnswer, &e.ExplanationZH); err != nil {
+		return e, err
+	}
+	if err := json.Unmarshal([]byte(errorsJSON), &e.Errors); err != nil {
+		return e, err
+	}
+	if e.Errors == nil {
+		e.Errors = []map[string]any{}
+	}
+	return e, nil
+}
+
+func (s *Server) reevaluateAttempt(ctx context.Context, attempt string) (map[string]any, error) {
+	var prompt, pattern, scene, answer, status string
+	var difficulty float64
+	if err := s.db.QueryRow(`SELECT e.chinese_prompt,e.pattern_id,e.scene_id,e.difficulty,a.user_answer,a.evaluation_status FROM attempts a JOIN exercises e ON e.id=a.exercise_id WHERE a.id=?`, attempt).Scan(&prompt, &pattern, &scene, &difficulty, &answer, &status); err != nil {
+		return nil, err
+	}
+	if status == "validated" {
+		return s.loadAttemptResult(attempt)
+	}
+	return s.evaluateAndPersist(ctx, attempt, prompt, pattern, scene, difficulty, answer)
+}
+
+func (s *Server) evaluate(ctx context.Context, prompt, pattern, answer string) (Eval, string, string, EvaluationDiagnostics, error) {
 	s.llm.mu.RLock()
 	var c ProviderConfig
 	for _, x := range s.llm.configs {
@@ -697,30 +1157,62 @@ func (s *Server) evaluate(ctx context.Context, prompt, pattern, answer string) (
 		}
 	}
 	s.llm.mu.RUnlock()
-	if c.ID != "" {
-		req := ChatRequest{Messages: []ChatMessage{{Role: "system", Content: "Evaluate an English learner answer. Return JSON with verdict, meaning_score, grammar_score, naturalness_score, pattern_score, errors, suggested_answer, explanation_zh."}, {Role: "user", Content: fmt.Sprintf("Prompt: %s\nTarget pattern: %s\nAnswer: %s", prompt, pattern, answer)}}, Temperature: c.Temperature, MaxTokens: c.MaxTokens, JSONMode: true}
-		var lastErr error
-		for attempt := 0; attempt < 2; attempt++ {
-			resp, err := s.llm.Client(c).Chat(ctx, req)
-			if err != nil {
-				lastErr = err
-				continue
-			}
-			var ev Eval
-			if err := json.Unmarshal([]byte(resp.Content), &ev); err != nil {
-				lastErr = fmt.Errorf("invalid JSON from provider: %w", err)
-				continue
-			}
-			if err := validateEval(&ev); err != nil {
-				lastErr = fmt.Errorf("evaluation schema validation failed: %w", err)
-				continue
-			}
-			return ev, c.ID, c.Model, nil
-		}
-		return Eval{}, c.ID, c.Model, lastErr
+	diagnostics := EvaluationDiagnostics{RequestID: id("evaluation_request"), Provider: c.ID, ProviderType: c.Type, Model: c.Model}
+	if c.ID == "" {
+		diagnostics.Provider = "local"
+		diagnostics.ProviderType = "local"
+		diagnostics.Model = "heuristic"
+		diagnostics.Success = true
+		return heuristicEval(prompt, pattern, answer), "local", "heuristic", diagnostics, nil
 	}
-	return heuristicEval(prompt, pattern, answer), "local", "heuristic", nil
+	baseMessages := []ChatMessage{{Role: "system", Content: "Evaluate an English learner answer. Return exactly one JSON object with verdict, meaning_score, grammar_score, naturalness_score, pattern_score, errors, suggested_answer, explanation_zh. Scores must be numbers from 0 to 1. errors must be an array, including [] when there are no errors."}, {Role: "user", Content: fmt.Sprintf("Prompt: %s\nTarget pattern: %s\nAnswer: %s", prompt, pattern, answer)}}
+	jsonMode := true
+	for attempt := 0; attempt < 2; attempt++ {
+		messages := baseMessages
+		if attempt == 1 {
+			messages = append(append([]ChatMessage{}, baseMessages...), ChatMessage{Role: "system", Content: "Repair instruction: Return only one valid JSON object matching the required schema. No markdown. No explanation outside JSON."})
+		}
+		if !jsonMode {
+			messages = append(messages, ChatMessage{Role: "system", Content: "This provider does not support native JSON response mode. Return only the JSON object in the assistant content."})
+		}
+		resp, err := s.llm.Client(c).Chat(ctx, ChatRequest{Messages: messages, Temperature: c.Temperature, MaxTokens: c.MaxTokens, JSONMode: jsonMode, RequestID: diagnostics.RequestID})
+		diagnostics.RetryCount = attempt
+		if err != nil {
+			var pe *ProviderError
+			if errors.As(err, &pe) {
+				diagnostics.FailureStage = pe.Stage
+				diagnostics.ErrorCategory = pe.Category
+				diagnostics.HTTPStatus = pe.HTTPStatus
+				diagnostics.LatencyMS = pe.Latency.Milliseconds()
+				diagnostics.ResponseShape = pe.ResponseShape
+				if jsonMode && attempt == 0 && (pe.HTTPStatus == http.StatusBadRequest || pe.HTTPStatus == http.StatusUnprocessableEntity) {
+					jsonMode = false
+					continue
+				}
+			} else {
+				diagnostics.FailureStage = "provider_http"
+				diagnostics.ErrorCategory = "provider_error"
+			}
+			return Eval{}, c.ID, c.Model, diagnostics, err
+		}
+		diagnostics.HTTPStatus = resp.HTTPStatus
+		diagnostics.LatencyMS = resp.Latency.Milliseconds()
+		diagnostics.ResponseShape = resp.ResponseShape
+		ev, parseErr := normalizeEvalContent(resp.Content)
+		if parseErr == nil {
+			diagnostics.Success = true
+			return ev, c.ID, c.Model, diagnostics, nil
+		}
+		diagnostics.FailureStage = "schema_validation"
+		diagnostics.ErrorCategory = "invalid_structured_output"
+		diagnostics.SchemaError = parseErr.Error()
+		if attempt == 1 {
+			return Eval{}, c.ID, c.Model, diagnostics, parseErr
+		}
+	}
+	return Eval{}, c.ID, c.Model, diagnostics, errors.New("evaluation failed")
 }
+
 func validateEval(e *Eval) error {
 	if e.Verdict != "correct" && e.Verdict != "mostly_correct" && e.Verdict != "needs_improvement" && e.Verdict != "incorrect" {
 		return errors.New("invalid verdict")

@@ -17,15 +17,26 @@ async function next() {
   renderExercise()
 }
 
-async function submit() {
-  if (!current || !$('#answer').value.trim()) return
-  const result = await api('/api/attempts', { method: 'POST', body: JSON.stringify({ exercise_id: current.exercise_id, answer: $('#answer').value }) })
+function renderEvaluation(result) {
   const feedback = $('#feedback')
   feedback.classList.remove('hidden')
-  if (!result.evaluation) { feedback.textContent = result.error || 'Evaluation failed; mastery was not updated.'; return }
+  if (!result.evaluation) {
+    feedback.innerHTML = `<b>AI evaluation temporarily failed</b><p>${result.error || 'The attempt was saved and mastery was not updated.'}</p><button class="retry">Re-evaluate</button>`
+    feedback.querySelector('.retry').onclick = () => reevaluate(result.attempt_id)
+    return
+  }
   const evaluation = result.evaluation
   feedback.innerHTML = `<b>${({ correct: 'Correct', mostly_correct: 'Mostly correct', needs_improvement: 'Needs improvement', incorrect: 'Try again' })[evaluation.verdict] || evaluation.verdict}</b><button class="next">Next →</button><p>${evaluation.explanation_zh}</p><p><strong>More natural:</strong> ${evaluation.suggested_answer}</p><div class="score">Meaning <b>${Math.round(evaluation.meaning_score * 100)}%</b></div><div class="score">Grammar <b>${Math.round(evaluation.grammar_score * 100)}%</b></div><div class="score">Naturalness <b>${Math.round(evaluation.naturalness_score * 100)}%</b></div><div class="score">Pattern <b>${Math.round(evaluation.pattern_score * 100)}%</b></div>`
   feedback.querySelector('.next').onclick = next
+}
+
+async function submit() {
+  if (!current || !$('#answer').value.trim()) return
+  renderEvaluation(await api('/api/attempts', { method: 'POST', body: JSON.stringify({ exercise_id: current.exercise_id, answer: $('#answer').value }) }))
+}
+
+async function reevaluate(attemptId) {
+  renderEvaluation(await api(`/api/attempts/${attemptId}/reevaluate`, { method: 'POST' }))
 }
 
 function providerPayload() {

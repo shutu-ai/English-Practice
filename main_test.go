@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -86,6 +87,35 @@ func TestProviderHTTPFailuresAreReturnedWithoutLearningMutation(t *testing.T) {
 	}
 }
 
+func TestProvider401PersistsSafeDiagnostics(t *testing.T) {
+	s := testServer(t)
+	ex, err := s.generateExercise(context.Background(), 3, "adaptive", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusUnauthorized) }))
+	defer mock.Close()
+	s.llm.configs["mock"] = ProviderConfig{ID: "mock", Type: "openai-compatible", BaseURL: mock.URL, Model: "mock", Enabled: true, Timeout: 2}
+	result, err := s.submitAttempt(context.Background(), "status-session", ex["exercise_id"].(string), "I didn't go because I didn't feel well.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	diag, ok := result["diagnostics"].(EvaluationDiagnostics)
+	if !ok {
+		t.Fatalf("missing diagnostics: %#v", result)
+	}
+	if diag.HTTPStatus != http.StatusUnauthorized || diag.ErrorCategory != "provider_4xx" || diag.FailureStage != "provider_http" {
+		t.Fatalf("unexpected diagnostics: %#v", diag)
+	}
+	var raw string
+	if err := s.db.QueryRow("SELECT evaluation_diagnostics_json FROM attempts WHERE id=?", result["attempt_id"]).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(raw, "provider_4xx") || strings.Contains(raw, "Authorization") || strings.Contains(raw, "unit-test") {
+		t.Fatalf("unsafe or incomplete diagnostics: %s", raw)
+	}
+}
+
 func TestProviderTestReusesStoredAPIKeyWithoutReturningIt(t *testing.T) {
 	s := testServer(t)
 	var receivedAuth string
@@ -116,6 +146,153 @@ func TestProviderTestReusesStoredAPIKeyWithoutReturningIt(t *testing.T) {
 	}
 	if receivedAuth != "Bearer unit-test-key" {
 		t.Fatalf("stored key was not reused: %q", receivedAuth)
+	}
+}
+
+func validEvaluationJSON() string {
+	return `{"verdict":"correct","meaning_score":0.91,"grammar_score":0.88,"naturalness_score":0.84,"pattern_score":0.72,"errors":[],"suggested_answer":"I didn't go because I didn't feel well.","explanation_zh":"表达自然，意思和语法都正确。"}`
+}
+
+func TestStructuredOutputNormalization(t *testing.T) {
+	eval, err := normalizeEvalContent("```json\n{\"verdict\":\"Mostly Correct\",\"meaning_score\":85,\"grammarScore\":\"0.8\",\"naturalness_score\":\"72%\",\"pattern_score\":0.65,\"errors\":null,\"suggestedAnswer\":\"I didn't go because I didn't feel well.\",\"explanationZh\":\"可以理解。\"}\n```")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eval.Verdict != "mostly_correct" || eval.MeaningScore != .85 || eval.GrammarScore != .8 || eval.NaturalnessScore != .72 || len(eval.Errors) != 0 {
+		t.Fatalf("normalization failed: %#v", eval)
+	}
+	if _, err := normalizeEvalContent(`{"verdict":"correct","meaning_score":1.5,"grammar_score":.8,"naturalness_score":.8,"pattern_score":.8,"errors":[],"suggested_answer":"x","explanation_zh":"x"}`); err == nil {
+		t.Fatal("ambiguous score accepted")
+	}
+	if _, err := normalizeEvalContent(`{"verdict":"correct","meaning_score":.8,"grammar_score":.8,"naturalness_score":.8,"pattern_score":.8,"errors":[{"type":"unknown","severity":"minor","explanation":"x"}],"suggested_answer":"x","explanation_zh":"x"}`); err == nil {
+		t.Fatal("unknown error type accepted")
+	}
+	if _, err := normalizeEvalContent("Here is the JSON:\n" + validEvaluationJSON()); err == nil {
+		t.Fatal("prose outside JSON accepted")
+	}
+}
+
+func TestInvalidStructuredOutputRetriesWithRepairInstruction(t *testing.T) {
+	s := testServer(t)
+	ex, err := s.generateExercise(context.Background(), 3, "adaptive", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	repairSeen := false
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), "Repair instruction") {
+			repairSeen = true
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"not json"}}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"choices":[{"message":{"content":%q}}]}`, validEvaluationJSON())))
+	}))
+	defer mock.Close()
+	s.llm.configs["mock"] = ProviderConfig{ID: "mock", Type: "openai-compatible", BaseURL: mock.URL, Model: "mock", Enabled: true, Timeout: 2}
+	result, err := s.submitAttempt(context.Background(), "retry-session", ex["exercise_id"].(string), "I didn't go because I didn't feel well.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["evaluation_status"] != "validated" || calls != 2 || !repairSeen {
+		t.Fatalf("retry failed: result=%#v calls=%d repair=%v", result, calls, repairSeen)
+	}
+	var attempts int
+	if err := s.db.QueryRow("SELECT attempts FROM pattern_mastery WHERE pattern_id=?", ex["pattern_id"]).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 1 {
+		t.Fatalf("mastery attempts=%d", attempts)
+	}
+}
+
+func TestProviderWithoutJSONModeFallsBackToPromptEnforcedJSON(t *testing.T) {
+	s := testServer(t)
+	ex, err := s.generateExercise(context.Background(), 3, "adaptive", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	jsonModeSeen := false
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), `"response_format"`) {
+			jsonModeSeen = true
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"choices":[{"message":{"content":%q}}]}`, validEvaluationJSON())))
+	}))
+	defer mock.Close()
+	s.llm.configs["mock"] = ProviderConfig{ID: "mock", Type: "openai-compatible", BaseURL: mock.URL, Model: "mock", Enabled: true, Timeout: 2}
+	result, err := s.submitAttempt(context.Background(), "json-fallback-session", ex["exercise_id"].(string), "I didn't go because I didn't feel well.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["evaluation_status"] != "validated" || calls != 2 || !jsonModeSeen {
+		t.Fatalf("JSON capability fallback failed: result=%#v calls=%d json_mode=%v", result, calls, jsonModeSeen)
+	}
+}
+
+func TestFailedAttemptReevaluationUpdatesMasteryExactlyOnce(t *testing.T) {
+	s := testServer(t)
+	ex, err := s.generateExercise(context.Background(), 3, "adaptive", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls <= 2 {
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"bad"}}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"choices":[{"message":{"content":%q}}]}`, validEvaluationJSON())))
+	}))
+	defer mock.Close()
+	s.llm.configs["mock"] = ProviderConfig{ID: "mock", Type: "openai-compatible", BaseURL: mock.URL, Model: "mock", Enabled: true, Timeout: 2}
+	first, err := s.submitAttempt(context.Background(), "reeval-session", ex["exercise_id"].(string), "I didn't go because I didn't feel well.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first["evaluation_status"] != "failed" {
+		t.Fatalf("expected failed: %#v", first)
+	}
+	attemptID := first["attempt_id"].(string)
+	var attempts int
+	if err := s.db.QueryRow("SELECT attempts FROM pattern_mastery WHERE pattern_id=?", ex["pattern_id"]).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 0 {
+		t.Fatalf("failed evaluation mutated mastery: %d", attempts)
+	}
+	second, err := s.reevaluateAttempt(context.Background(), attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second["evaluation_status"] != "validated" {
+		t.Fatalf("reevaluation failed: %#v", second)
+	}
+	third, err := s.reevaluateAttempt(context.Background(), attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third["evaluation_status"] != "validated" {
+		t.Fatalf("idempotent reevaluation failed: %#v", third)
+	}
+	if err := s.db.QueryRow("SELECT attempts FROM pattern_mastery WHERE pattern_id=?", ex["pattern_id"]).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 1 {
+		t.Fatalf("reevaluation mutated mastery more than once: %d", attempts)
 	}
 }
 
