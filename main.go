@@ -237,6 +237,12 @@ func extractAssistantContent(body []byte) (string, string, error) {
 				if content, ok := contentString(msg["content"]); ok {
 					return content, "choices.message.content", nil
 				}
+				// Some reasoning providers put the only assistant text in
+				// reasoning_content. It still goes through strict JSON parsing;
+				// prose or incomplete reasoning is rejected by normalizeEvalContent.
+				if content, ok := contentString(msg["reasoning_content"]); ok {
+					return content, "choices.message.reasoning_content", nil
+				}
 			}
 			if content, ok := contentString(choice["text"]); ok {
 				return content, "choices.text", nil
@@ -1237,11 +1243,11 @@ func (s *Server) evaluate(ctx context.Context, prompt, pattern, answer string) (
 			messages = append(messages, ChatMessage{Role: "system", Content: "This provider does not support native JSON response mode. Return only the JSON object in the assistant content."})
 		}
 		maxTokens := c.MaxTokens
-		if attempt == 1 && maxTokens > 0 {
+		if maxTokens < 1200 {
+			maxTokens = 1200
+		}
+		if attempt == 1 {
 			maxTokens *= 2
-			if maxTokens < 1200 {
-				maxTokens = 1200
-			}
 		}
 		resp, err := s.llm.Client(c).Chat(ctx, ChatRequest{Messages: messages, Temperature: c.Temperature, MaxTokens: maxTokens, JSONMode: jsonMode, RequestID: diagnostics.RequestID})
 		diagnostics.RetryCount = attempt
