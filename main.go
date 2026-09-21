@@ -1069,7 +1069,7 @@ func normalizeEvalContent(raw string) (Eval, error) {
 			if err != nil {
 				return out, err
 			}
-			sevRaw, ok := lookupField(item, "severity")
+			sevRaw, ok := lookupField(item, "severity", "level")
 			if !ok {
 				return out, errors.New("error is missing severity")
 			}
@@ -1081,7 +1081,7 @@ func normalizeEvalContent(raw string) (Eval, error) {
 			if err != nil {
 				return out, err
 			}
-			explanation, err := parseRequiredString(item, "explanation", "detail")
+			explanation, err := parseRequiredString(item, "explanation", "detail", "description", "message", "reason")
 			if err != nil {
 				return out, err
 			}
