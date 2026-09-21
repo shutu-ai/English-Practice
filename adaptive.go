@@ -49,6 +49,22 @@ func seedAdaptiveData(db *sql.DB) error {
 		id, n, d string
 		level    int
 	}{
+		{"foundations", "Communication foundations", "Simple identity, possession, and description", 1},
+		{"preferences", "Preferences", "Likes, wants, and personal choices", 1},
+		{"ability", "Ability", "Can and cannot express ability", 1},
+		{"daily_life", "Daily life", "Routines, activities, and everyday needs", 1},
+		{"questions", "Questions", "Ask clear everyday questions", 1},
+		{"advice", "Advice", "Give practical advice", 1},
+		{"obligation", "Obligation", "Express duties and responsibilities", 1},
+		{"experience", "Experience", "Talk about life experience", 2},
+		{"suggestions", "Suggestions", "Make collaborative suggestions", 1},
+		{"comparison", "Comparison", "Compare choices and options", 2},
+		{"contrast", "Contrast", "Connect contrasting ideas", 2},
+		{"reporting", "Reporting", "Report information from other people", 3},
+		{"passive", "Passive voice", "Describe processes and events", 3},
+		{"perfect_modals", "Perfect modals", "Reflect on past possibilities and duties", 3},
+		{"professional", "Professional communication", "Meetings, negotiation, and clarification", 3},
+		{"nuance", "Nuanced opinions", "Hedge and qualify opinions", 4},
 		{"basic_reason", "Basic reason clauses", "because / so explanations", 1},
 		{"because", "Because clauses", "Explain reasons in context", 2},
 		{"conditionals", "Conditionals", "Conditional reasoning", 2},
@@ -63,15 +79,39 @@ func seedAdaptiveData(db *sql.DB) error {
 			return err
 		}
 	}
-	edges := [][4]any{{"basic_reason", "because", "next", 1}, {"because", "conditionals", "related", .7}, {"past_tense", "past_perfect", "next", 1}, {"plans", "conditionals", "related", .5}}
+	edges := [][4]any{
+		{"foundations", "daily_life", "next", 1}, {"daily_life", "questions", "next", 1}, {"daily_life", "preferences", "related", .7},
+		{"questions", "polite_request", "next", 1}, {"preferences", "plans", "related", .6}, {"ability", "obligation", "related", .5},
+		{"basic_reason", "because", "next", 1}, {"because", "conditionals", "related", .7}, {"past_tense", "past_perfect", "next", 1},
+		{"plans", "conditionals", "related", .5}, {"conditionals", "professional", "next", .7}, {"professional", "nuance", "next", 1},
+		{"experience", "professional", "related", .5}, {"contrast", "professional", "related", .5},
+	}
 	for _, e := range edges {
 		if _, err := db.Exec(`INSERT OR IGNORE INTO skill_edges(id,from_skill_id,to_skill_id,relation,weight) VALUES(?,?,?,?,?)`, fmt.Sprintf("%s-%s-%s", e[0], e[1], e[2]), e[0], e[1], e[2], e[3]); err != nil {
 			return err
 		}
 	}
-	mapping := map[string]string{"because": "because", "conditional": "conditionals", "polite-request": "polite_request", "polite-refusal": "polite_refusal", "past-perfect": "past_perfect", "going-to": "plans", "modal-possibility": "plans", "wish-past": "past_perfect"}
-	for p, sk := range mapping {
-		if _, err := db.Exec(`INSERT OR IGNORE INTO pattern_skills(pattern_id,skill_id,weight) VALUES(?,?,1)`, p, sk); err != nil {
+	for _, scene := range catalogScenes() {
+		if _, err := db.Exec(`INSERT OR IGNORE INTO scenes(id,name,description) VALUES(?,?,?)`, scene[0], scene[1], scene[2]); err != nil {
+			return err
+		}
+	}
+	for _, intent := range catalogIntents() {
+		if _, err := db.Exec(`INSERT OR IGNORE INTO communication_intents(id,name) VALUES(?,?)`, intent[0], intent[1]); err != nil {
+			return err
+		}
+	}
+	for _, p := range patternCatalog() {
+		if _, err := db.Exec(`INSERT OR IGNORE INTO sentence_patterns(id,pattern,intent_id,difficulty) VALUES(?,?,?,?)`, p.id, p.expression, p.intent, p.difficulty); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`INSERT OR IGNORE INTO pattern_mastery(pattern_id,attempts,correct,recent_accuracy,long_term_accuracy,consecutive_correct,mastery) VALUES(?,0,0,0,0,0,0.25)`, p.id); err != nil {
+			return err
+		}
+		if len(adaptiveSeeds[p.id]) == 0 && len(p.seeds) > 0 {
+			adaptiveSeeds[p.id] = p.seeds
+		}
+		if _, err := db.Exec(`INSERT OR IGNORE INTO pattern_skills(pattern_id,skill_id,weight) VALUES(?,?,1)`, p.id, p.skill); err != nil {
 			return err
 		}
 	}
@@ -303,7 +343,7 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 	}
 	chosen := allowed[0]
 	if mode == "assessment" {
-		anchors := []string{"going-to", "modal-possibility", "because", "polite-request", "conditional", "polite-refusal", "past-perfect", "wish-past"}
+		anchors := assessmentPatternIDs()
 		var index int
 		_ = s.db.QueryRow(`SELECT COUNT(*) FROM attempts WHERE practice_mode='assessment' AND evaluation_status='validated'`).Scan(&index)
 		anchor := anchors[index%len(anchors)]

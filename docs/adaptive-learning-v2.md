@@ -2,6 +2,8 @@
 
 The application owns learning policy. Providers only generate language and evaluate answers.
 
+The initial curriculum catalog contains 44 spoken-English patterns from child-friendly foundations through adult workplace communication. Each pattern has a difficulty, intent, skill mapping, curated fallback prompts, and prerequisite relationships so the same adaptive selector can expand without hard-coding a fixed eight-pattern course.
+
 ## Closed loop
 
 `attempts -> learner_skill_state -> skill graph + memory + difficulty -> candidate pool -> exercise -> evaluation`.
@@ -23,4 +25,3 @@ Provider failure never enters this transaction, so it cannot mutate learner stat
 ## Configuration
 
 Policy weights, repeat windows, thresholds, and probe ratio live in `adaptive_config` and have safe defaults. They are exposed through `/api/adaptive-config`.
-

@@ -32,6 +32,31 @@ func TestAdaptiveSelectionInterleavesPatterns(t *testing.T) {
 	}
 }
 
+func TestPatternCatalogCoversChildToAdultProgression(t *testing.T) {
+	s := testServer(t)
+	var count int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM sentence_patterns").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count < 40 || count != len(patternCatalog()) {
+		t.Fatalf("pattern catalog count=%d definitions=%d", count, len(patternCatalog()))
+	}
+	var minimum, maximum float64
+	if err := s.db.QueryRow("SELECT MIN(difficulty),MAX(difficulty) FROM sentence_patterns").Scan(&minimum, &maximum); err != nil {
+		t.Fatal(err)
+	}
+	if minimum > 1.1 || maximum < 5.3 {
+		t.Fatalf("difficulty progression is too narrow: %.1f..%.1f", minimum, maximum)
+	}
+	var unmapped int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sentence_patterns p LEFT JOIN pattern_skills ps ON ps.pattern_id=p.id WHERE ps.pattern_id IS NULL`).Scan(&unmapped); err != nil {
+		t.Fatal(err)
+	}
+	if unmapped != 0 {
+		t.Fatalf("patterns without skill mapping=%d", unmapped)
+	}
+}
+
 func TestAssessmentAnchorsAndStateRebuild(t *testing.T) {
 	s := testServer(t)
 	expected := []string{"going-to", "modal-possibility", "because"}
