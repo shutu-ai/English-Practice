@@ -17,7 +17,11 @@ The repository contains a ready-to-serve fallback bundle in `web/dist`. The Vue 
 
 Use `POST /api/providers` or the Settings screen to save an enabled provider. Supported types are `openai`, `openai-compatible`, and `ollama`. OpenAI-compatible settings are `base_url`, `api_key`, `model`, `timeout`, `temperature`, and `max_tokens`. API keys are masked in API responses and never logged. Without an enabled provider, the app uses the deterministic local evaluator so the practice flow remains usable offline.
 
-Provider output must be JSON matching the evaluation schema. Invalid JSON, schema violations, timeouts, and non-2xx responses mark the attempt as failed and do not update mastery; one retry can be performed by the caller.
+Provider output is normalized into one complete evaluation JSON object. Common wrappers (short prose, Markdown fences, double-encoded content, and `evaluation`/`result` envelopes) are tolerated, while ambiguous or incomplete objects still fail validation. Structured-output failures receive up to two automatic repair retries; failed attempts never update mastery.
+
+## Adaptive Learning V2
+
+Practice selection is history-driven. The V2 engine stores learner state, skill graph relationships, acquisition/retention/transfer, pattern and scene difficulty, review schedules, probe flags, and selection reasons in SQLite. Inspection endpoints include `/api/learner-state`, `/api/skill-graph`, and `/api/adaptive-config`; state can be rebuilt with `POST /api/rebuild-learning-state`.
 
 ## Tests
 

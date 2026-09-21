@@ -31,6 +31,58 @@ func testServer(t *testing.T) *Server {
 	return &Server{db: db, llm: &LLMRegistry{configs: map[string]ProviderConfig{}}}
 }
 
+func TestOneHundredAdaptiveQAsWithNoisyProvider(t *testing.T) {
+	s := testServer(t)
+	exercises := make([]string, 0, 100)
+	for i := 0; i < 100; i++ {
+		ex, err := s.generateExercise(context.Background(), 3, "adaptive", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		exercises = append(exercises, ex["exercise_id"].(string))
+	}
+	calls := 0
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		content := validEvaluationJSON()
+		switch {
+		case calls <= 2:
+			content = "not json"
+		case calls%3 == 0:
+			content = "```json\n" + validEvaluationJSON() + "\n```"
+		case calls%3 == 1:
+			content = "Here is the JSON:\n" + validEvaluationJSON() + "\nDone."
+		}
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"choices":[{"message":{"content":%q}}]}`, content)))
+	}))
+	defer provider.Close()
+	s.llm.configs["mock"] = ProviderConfig{ID: "mock", Type: "openai-compatible", BaseURL: provider.URL, Model: "mock", Enabled: true, Timeout: 2}
+
+	for i, exerciseID := range exercises {
+		result, err := s.submitAttempt(context.Background(), "simulation-100", exerciseID, "I may arrive a little late today.")
+		if err != nil {
+			t.Fatalf("question %d returned error: %v", i+1, err)
+		}
+		if result["evaluation_status"] != "validated" {
+			t.Fatalf("question %d was not validated: %#v", i+1, result)
+		}
+	}
+	if calls != 102 {
+		t.Fatalf("expected 100 evaluations plus 2 automatic retries, provider calls=%d", calls)
+	}
+	var validated, failed int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM attempts WHERE evaluation_status='validated'").Scan(&validated); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM attempts WHERE evaluation_status='failed'").Scan(&failed); err != nil {
+		t.Fatal(err)
+	}
+	if validated != 100 || failed != 0 {
+		t.Fatalf("100-question simulation persisted validated=%d failed=%d", validated, failed)
+	}
+}
+
 func TestAssessmentCompletesAfterTwelveResponses(t *testing.T) {
 	s := testServer(t)
 	for i := 0; i < 11; i++ {
@@ -165,6 +217,17 @@ func TestStructuredOutputNormalization(t *testing.T) {
 	if eval, err := normalizeEvalContent(strings.Replace(validEvaluationJSON(), `"verdict":"correct"`, `"verdict":"partially_correct"`, 1)); err != nil || eval.Verdict != "mostly_correct" {
 		t.Fatalf("provider verdict alias was not normalized: %#v err=%v", eval, err)
 	}
+	for _, tc := range []struct {
+		provider, canonical string
+	}{
+		{"good", "correct"}, {"excellent", "correct"}, {"okay", "mostly_correct"}, {"needs work", "needs_improvement"}, {"wrong", "incorrect"},
+	} {
+		input := strings.Replace(validEvaluationJSON(), `"verdict":"correct"`, fmt.Sprintf(`"verdict":%q`, tc.provider), 1)
+		eval, err := normalizeEvalContent(input)
+		if err != nil || eval.Verdict != tc.canonical {
+			t.Fatalf("provider verdict %q was not normalized to %q: %#v err=%v", tc.provider, tc.canonical, eval, err)
+		}
+	}
 	if _, err := normalizeEvalContent(`{"verdict":"correct","meaning_score":1.5,"grammar_score":.8,"naturalness_score":.8,"pattern_score":.8,"errors":[],"suggested_answer":"x","explanation_zh":"x"}`); err == nil {
 		t.Fatal("ambiguous score accepted")
 	}
@@ -184,8 +247,14 @@ func TestStructuredOutputNormalization(t *testing.T) {
 	if _, err := normalizeEvalContent(`{"verdict":"correct","meaning_score":.8,"grammar_score":.8,"naturalness_score":.8,"pattern_score":.8,"errors":[{"type":"meaning","severity":"minor","explanation":"x",}],"suggested_answer":"x","explanation_zh":"x"}`); err == nil {
 		t.Fatal("trailing comma accepted")
 	}
-	if _, err := normalizeEvalContent("Here is the JSON:\n" + validEvaluationJSON()); err == nil {
-		t.Fatal("prose outside JSON accepted")
+	if eval, err := normalizeEvalContent("Here is the JSON:\n" + validEvaluationJSON() + "\nHope this helps."); err != nil || eval.Verdict != "correct" {
+		t.Fatalf("provider prose wrapper was not normalized: %#v err=%v", eval, err)
+	}
+	if eval, err := normalizeEvalContent("```json\n{" + `"evaluation":` + validEvaluationJSON() + "}\n```"); err != nil || eval.Verdict != "correct" {
+		t.Fatalf("provider evaluation wrapper was not normalized: %#v err=%v", eval, err)
+	}
+	if _, err := normalizeEvalContent(validEvaluationJSON() + "\n" + validEvaluationJSON()); err == nil {
+		t.Fatal("multiple JSON objects accepted")
 	}
 }
 
@@ -197,11 +266,19 @@ func TestInvalidStructuredOutputRetriesWithRepairInstruction(t *testing.T) {
 	}
 	calls := 0
 	repairSeen := false
+	targetPatternSeen := false
+	var targetPattern string
+	if err := s.db.QueryRow("SELECT pattern FROM sentence_patterns WHERE id=?", ex["pattern_id"]).Scan(&targetPattern); err != nil {
+		t.Fatal(err)
+	}
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		body, _ := io.ReadAll(r.Body)
 		if strings.Contains(string(body), "Repair instruction") {
 			repairSeen = true
+		}
+		if strings.Contains(string(body), "Target pattern expression: "+targetPattern) {
+			targetPatternSeen = true
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if calls == 1 {
@@ -216,8 +293,8 @@ func TestInvalidStructuredOutputRetriesWithRepairInstruction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result["evaluation_status"] != "validated" || calls != 2 || !repairSeen {
-		t.Fatalf("retry failed: result=%#v calls=%d repair=%v", result, calls, repairSeen)
+	if result["evaluation_status"] != "validated" || calls != 2 || !repairSeen || !targetPatternSeen {
+		t.Fatalf("retry failed: result=%#v calls=%d repair=%v target_pattern=%v", result, calls, repairSeen, targetPatternSeen)
 	}
 	var attempts int
 	if err := s.db.QueryRow("SELECT attempts FROM pattern_mastery WHERE pattern_id=?", ex["pattern_id"]).Scan(&attempts); err != nil {
@@ -268,7 +345,7 @@ func TestFailedAttemptReevaluationUpdatesMasteryExactlyOnce(t *testing.T) {
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		w.Header().Set("Content-Type", "application/json")
-		if calls <= 2 {
+		if calls <= 3 {
 			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"bad"}}]}`))
 			return
 		}

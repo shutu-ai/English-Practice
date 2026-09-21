@@ -2,6 +2,32 @@
 const api = (url, options) => fetch(url, { headers: { 'Content-Type': 'application/json' }, ...options }).then(async response => { const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Request failed'); return data })
 let current = null
 let providerId = ''
+let nextLoading = false
+
+function setNextLoading(loading, message = '') {
+  nextLoading = loading
+  const status = $('#exercise-status')
+  const button = $('#submit')
+  const answer = $('#answer')
+  if (loading) {
+    status.className = 'exercise-status loading-state'
+    status.innerHTML = `${message || 'Loading next question'}<span class="loading-dots">...</span>`
+    status.removeAttribute('hidden')
+    button.disabled = true
+    button.textContent = 'Loading…'
+    answer.disabled = true
+    $('#prompt').classList.add('prompt-loading')
+    $('#feedback').classList.add('hidden')
+    return
+  }
+  status.className = `exercise-status${message ? ' exercise-status-error' : ''}`
+  status.textContent = message
+  if (!message) status.setAttribute('hidden', '')
+  button.disabled = false
+  button.textContent = 'Submit'
+  answer.disabled = false
+  $('#prompt').classList.remove('prompt-loading')
+}
 
 function renderExercise() {
   if (!current) return
@@ -13,8 +39,16 @@ function renderExercise() {
 }
 
 async function next() {
-  current = await api('/api/practice/next', { method: 'POST', body: JSON.stringify({ mode: 'adaptive' }) })
-  renderExercise()
+  if (nextLoading) return
+  setNextLoading(true)
+  try {
+    current = await api('/api/practice/next', { method: 'POST', body: JSON.stringify({ mode: 'adaptive' }) })
+    renderExercise()
+    setNextLoading(false)
+  } catch (error) {
+    setNextLoading(false, error.message || 'Unable to load the next question.')
+    throw error
+  }
 }
 
 function renderEvaluation(result) {
@@ -33,7 +67,7 @@ function renderEvaluation(result) {
 }
 
 async function submit() {
-  if (!current || !$('#answer').value.trim()) return
+  if (nextLoading || !current || !$('#answer').value.trim()) return
   const button = $('#submit')
   const feedback = $('#feedback')
   button.disabled = true
@@ -102,8 +136,8 @@ async function show(page) {
   document.querySelectorAll('main > section').forEach(section => section.classList.add('hidden'))
   $(`#${page}`).classList.remove('hidden')
   document.querySelectorAll('nav button').forEach(button => button.classList.toggle('active', button.dataset.page === page))
-  if (page === 'progress') { const p = await api('/api/progress'); $('#progress').innerHTML = `<div class="panel"><div class="row"><span>Recent practice</span><b>${p.recent_attempts}</b></div><div class="row"><span>Success rate</span><b>${Math.round(p.recent_success_rate * 100)}%</b></div><div class="row"><span>Global Difficulty</span><b>${Number(p.global_difficulty).toFixed(1)}</b></div><h2>Patterns to practice</h2>${p.weak_patterns.map(x => `<div class="row"><span>${x.pattern}</span><span class="pill">${Math.round(x.mastery * 100)}%</span></div>`).join('')}</div>` }
-  if (page === 'history') { const history = await api('/api/history'); $('#history').innerHTML = `<div class="panel">${history.length ? history.map(x => `<div class="row"><span>${x.prompt}</span><span>${x.answer}</span><span class="pill">${x.verdict}</span></div>`).join('') : '<p>No practice history yet.</p>'}</div>` }
+  if (page === 'progress') { const p = await api('/api/progress'); $('#progress').innerHTML = `<div class="panel"><div class="row"><span>Recent practice</span><b>${p.recent_attempts}</b></div><div class="row"><span>Success rate</span><b>${Math.round(p.recent_success_rate * 100)}%</b></div><div class="row"><span>Global Difficulty</span><b>${Number(p.global_difficulty).toFixed(1)}</b></div><div class="row"><span>Due reviews / probes</span><b>${p.due_reviews || 0} / ${p.probe_count || 0}</b></div><h2>Patterns to practice</h2>${p.weak_patterns.map(x => `<div class="row"><span>${x.pattern}<small> retention ${Math.round((x.retention || 0) * 100)}% · transfer ${Math.round((x.transfer || 0) * 100)}%</small></span><span class="pill">${Math.round(x.mastery * 100)}%</span></div>`).join('')}</div>` }
+  if (page === 'history') { const history = await api('/api/history'); $('#history').innerHTML = `<div class="panel">${history.length ? history.map(x => `<div class="row"><span>${x.prompt}<small>${x.pattern_id} · ${x.scene_id} · ${x.intent_id || 'intent'} · D${Number(x.difficulty || 0).toFixed(1)} · ${x.selection_reason || 'current_level'}${x.is_review ? ' · review' : ''}${x.is_probe ? ' · probe' : ''}</small></span><span>${x.answer}</span><span class="pill">${x.verdict}</span></div>`).join('') : '<p>No practice history yet.</p>'}</div>` }
   if (page === 'review') { const reviews = await api('/api/reviews'); $('#review').innerHTML = `<div class="panel"><h2>Due reviews</h2>${reviews.map(x => `<div class="row"><span>${x.pattern}</span><span class="pill">${new Date(x.due_at).toLocaleString()}</span></div>`).join('')}</div>` }
   if (page === 'scenes') $('#scenes').innerHTML = '<div class="panel"><h2>Scenes</h2><p>Select a scene from the Vue interface or use the practice API.</p></div>'
   if (page === 'settings') await loadProvider()
@@ -113,4 +147,4 @@ document.querySelectorAll('nav button').forEach(button => { button.onclick = () 
 $('#submit').onclick = submit
 $('#provider-save').onclick = saveProvider
 $('#provider-test').onclick = testProvider
-next().catch(error => { $('#prompt').textContent = error.message })
+next().catch(error => { $('#prompt').textContent = error.message || 'Unable to load the next question.' })

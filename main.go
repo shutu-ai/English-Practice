@@ -21,7 +21,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 type Server struct {
 	db     *sql.DB
@@ -323,6 +323,12 @@ func migrate(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS user_profile (id TEXT PRIMARY KEY, global_difficulty REAL NOT NULL, assessment_complete INTEGER NOT NULL, assessment_progress TEXT NOT NULL, updated_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS llm_providers (id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL DEFAULT '', model TEXT NOT NULL, timeout INTEGER NOT NULL, temperature REAL NOT NULL, max_tokens INTEGER NOT NULL, enabled INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS llm_task_configs (task_type TEXT PRIMARY KEY, provider_id TEXT NOT NULL, model TEXT NOT NULL, temperature REAL NOT NULL, max_tokens INTEGER NOT NULL, FOREIGN KEY(provider_id) REFERENCES llm_providers(id))`,
+		`CREATE TABLE IF NOT EXISTS skills (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', level INTEGER NOT NULL DEFAULT 1, metadata_json TEXT NOT NULL DEFAULT '{}')`,
+		`CREATE TABLE IF NOT EXISTS skill_edges (id TEXT PRIMARY KEY, from_skill_id TEXT NOT NULL, to_skill_id TEXT NOT NULL, relation TEXT NOT NULL, weight REAL NOT NULL DEFAULT 1, metadata_json TEXT NOT NULL DEFAULT '{}', UNIQUE(from_skill_id,to_skill_id,relation), FOREIGN KEY(from_skill_id) REFERENCES skills(id), FOREIGN KEY(to_skill_id) REFERENCES skills(id))`,
+		`CREATE TABLE IF NOT EXISTS pattern_skills (pattern_id TEXT NOT NULL, skill_id TEXT NOT NULL, weight REAL NOT NULL DEFAULT 1, PRIMARY KEY(pattern_id,skill_id), FOREIGN KEY(pattern_id) REFERENCES sentence_patterns(id), FOREIGN KEY(skill_id) REFERENCES skills(id))`,
+		`CREATE TABLE IF NOT EXISTS learner_skill_state (user_id TEXT NOT NULL, skill_id TEXT NOT NULL DEFAULT '', pattern_id TEXT NOT NULL, mastery REAL NOT NULL DEFAULT 0.25, acquisition REAL NOT NULL DEFAULT 0, retention REAL NOT NULL DEFAULT 0, transfer REAL NOT NULL DEFAULT 0, attempt_count INTEGER NOT NULL DEFAULT 0, success_count INTEGER NOT NULL DEFAULT 0, failure_count INTEGER NOT NULL DEFAULT 0, recent_accuracy REAL NOT NULL DEFAULT 0, long_term_accuracy REAL NOT NULL DEFAULT 0, current_difficulty REAL NOT NULL DEFAULT 1, max_success_difficulty REAL NOT NULL DEFAULT 1, consecutive_success INTEGER NOT NULL DEFAULT 0, consecutive_failure INTEGER NOT NULL DEFAULT 0, last_seen_at TEXT, last_success_at TEXT, last_failure_at TEXT, next_review_at TEXT, scene_coverage TEXT NOT NULL DEFAULT '{}', intent_coverage TEXT NOT NULL DEFAULT '{}', context_diversity REAL NOT NULL DEFAULT 0, memory_strength REAL NOT NULL DEFAULT 0, stability REAL NOT NULL DEFAULT 0, state_version INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL, PRIMARY KEY(user_id,pattern_id))`,
+		`CREATE TABLE IF NOT EXISTS difficulty_state (scope TEXT NOT NULL, entity_id TEXT NOT NULL, difficulty REAL NOT NULL, success_rate REAL NOT NULL DEFAULT 0.5, attempts INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY(scope,entity_id))`,
+		`CREATE TABLE IF NOT EXISTS adaptive_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
 	}
 	for _, q := range stmts {
 		if _, err := db.Exec(q); err != nil {
@@ -331,6 +337,39 @@ func migrate(db *sql.DB) error {
 	}
 	if err := ensureColumn(db, "attempts", "evaluation_diagnostics_json", "TEXT NOT NULL DEFAULT '{}'"); err != nil {
 		return err
+	}
+	for _, c := range []struct{ name, definition string }{
+		{"intent_id", "TEXT NOT NULL DEFAULT ''"},
+		{"exercise_difficulty", "REAL NOT NULL DEFAULT 0"},
+		{"practice_mode", "TEXT NOT NULL DEFAULT 'adaptive'"},
+		{"selection_reason", "TEXT NOT NULL DEFAULT ''"},
+		{"is_review", "INTEGER NOT NULL DEFAULT 0"},
+		{"is_probe", "INTEGER NOT NULL DEFAULT 0"},
+		{"is_new_skill", "INTEGER NOT NULL DEFAULT 0"},
+		{"evaluation_scores_json", "TEXT NOT NULL DEFAULT '{}'"},
+		{"error_types_json", "TEXT NOT NULL DEFAULT '[]'"},
+		{"error_severity", "TEXT NOT NULL DEFAULT ''"},
+		{"generated_by", "TEXT NOT NULL DEFAULT 'fallback'"},
+		{"normalized_chinese_hash", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := ensureColumn(db, "attempts", c.name, c.definition); err != nil {
+			return err
+		}
+	}
+	for _, c := range []struct{ name, definition string }{{"normalized_chinese_hash", "TEXT NOT NULL DEFAULT ''"}, {"generated_by", "TEXT NOT NULL DEFAULT 'fallback'"}} {
+		if err := ensureColumn(db, "exercises", c.name, c.definition); err != nil {
+			return err
+		}
+	}
+	for _, q := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_attempts_submitted ON attempts(submitted_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_attempts_pattern ON attempts(exercise_id,submitted_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_learner_review ON learner_skill_state(next_review_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_exercises_pattern_created ON exercises(pattern_id,created_at DESC)`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			return err
+		}
 	}
 	var v int
 	if err := db.QueryRow("SELECT COALESCE(MAX(version),0) FROM schema_meta").Scan(&v); err != nil {
@@ -374,7 +413,7 @@ func seed(db *sql.DB) error {
 		return err
 	}
 	if count > 0 {
-		return nil
+		return seedAdaptiveData(db)
 	}
 	for _, s := range []struct{ id, n, d string }{{"daily", "Daily Conversation", "Everyday exchanges"}, {"friends", "Friends", "Casual conversations"}, {"work", "Work Meeting", "Workplace communication"}, {"restaurant", "Restaurant", "Ordering and service"}, {"travel", "Travel", "Travel situations"}, {"phone", "Phone Call", "Phone conversations"}, {"problem", "Problem Explanation", "Explaining issues"}, {"refusal", "Polite Refusal", "Declining respectfully"}} {
 		if _, err := db.Exec("INSERT INTO scenes(id,name,description) VALUES(?,?,?)", s.id, s.n, s.d); err != nil {
@@ -399,7 +438,10 @@ func seed(db *sql.DB) error {
 		}
 	}
 	_, err := db.Exec("INSERT INTO user_profile(id,global_difficulty,assessment_complete,assessment_progress,updated_at) VALUES('default',3.0,0,'[]',?)", time.Now().UTC().Format(time.RFC3339))
-	return err
+	if err != nil {
+		return err
+	}
+	return seedAdaptiveData(db)
 }
 
 func loadProviders(s *Server) error {
@@ -616,7 +658,7 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		jsonResp(w, 200, result)
 	})
 	mux.HandleFunc("/api/history", func(w http.ResponseWriter, r *http.Request) {
-		rows, err := s.db.Query(`SELECT a.id,a.submitted_at,e.chinese_prompt,a.user_answer,v.verdict,v.suggested_answer,v.errors_json,e.pattern_id,e.scene_id FROM attempts a JOIN exercises e ON e.id=a.exercise_id LEFT JOIN evaluations v ON v.attempt_id=a.id ORDER BY a.submitted_at DESC LIMIT 100`)
+		rows, err := s.db.Query(`SELECT a.id,a.submitted_at,e.chinese_prompt,a.user_answer,COALESCE(v.verdict,''),COALESCE(v.suggested_answer,''),COALESCE(v.errors_json,'[]'),e.pattern_id,e.scene_id,a.intent_id,a.exercise_difficulty,a.selection_reason,a.is_review,a.is_probe,a.generated_by FROM attempts a JOIN exercises e ON e.id=a.exercise_id LEFT JOIN evaluations v ON v.attempt_id=a.id ORDER BY a.submitted_at DESC LIMIT 100`)
 		if err != nil {
 			jsonResp(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -624,11 +666,13 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		defer rows.Close()
 		out := []map[string]any{}
 		for rows.Next() {
-			var a, b, c, d, e, f, g, h, i string
-			_ = rows.Scan(&a, &b, &c, &d, &e, &f, &g, &h, &i)
+			var a, b, c, d, e, f, g, h, i, intent, reason, generated string
+			var difficulty float64
+			var review, probe int
+			_ = rows.Scan(&a, &b, &c, &d, &e, &f, &g, &h, &i, &intent, &difficulty, &reason, &review, &probe, &generated)
 			var er any
 			_ = json.Unmarshal([]byte(g), &er)
-			out = append(out, map[string]any{"id": a, "submitted_at": b, "prompt": c, "answer": d, "verdict": e, "suggested_answer": f, "errors": er, "pattern_id": h, "scene_id": i})
+			out = append(out, map[string]any{"id": a, "submitted_at": b, "prompt": c, "answer": d, "verdict": e, "suggested_answer": f, "errors": er, "pattern_id": h, "scene_id": i, "intent_id": intent, "difficulty": difficulty, "selection_reason": reason, "is_review": review == 1, "is_probe": probe == 1, "generated_by": generated})
 		}
 		jsonResp(w, 200, out)
 	})
@@ -649,6 +693,85 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		jsonResp(w, 200, out)
 	})
 	mux.HandleFunc("/api/progress", func(w http.ResponseWriter, r *http.Request) { jsonResp(w, 200, s.progress()) })
+	mux.HandleFunc("/api/learner-state", func(w http.ResponseWriter, r *http.Request) {
+		rows, err := s.db.Query(`SELECT skill_id,pattern_id,mastery,acquisition,retention,transfer,attempt_count,success_count,failure_count,current_difficulty,max_success_difficulty,consecutive_success,consecutive_failure,next_review_at,context_diversity,memory_strength,stability,updated_at FROM learner_skill_state WHERE user_id='default' ORDER BY mastery`)
+		if err != nil {
+			jsonResp(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		defer rows.Close()
+		out := []map[string]any{}
+		for rows.Next() {
+			var skill, pattern, updated string
+			var next sql.NullString
+			var mastery, acq, ret, tr, cur, maxd, div, mem, stab float64
+			var attempts, success, failure, css, cf int
+			if rows.Scan(&skill, &pattern, &mastery, &acq, &ret, &tr, &attempts, &success, &failure, &cur, &maxd, &css, &cf, &next, &div, &mem, &stab, &updated) != nil {
+				continue
+			}
+			out = append(out, map[string]any{"skill_id": skill, "pattern_id": pattern, "mastery": mastery, "acquisition": acq, "retention": ret, "transfer": tr, "attempt_count": attempts, "success_count": success, "failure_count": failure, "current_difficulty": cur, "max_success_difficulty": maxd, "consecutive_success": css, "consecutive_failure": cf, "next_review_at": next.String, "context_diversity": div, "memory_strength": mem, "stability": stab, "updated_at": updated})
+		}
+		jsonResp(w, 200, out)
+	})
+	mux.HandleFunc("/api/skill-graph", func(w http.ResponseWriter, r *http.Request) {
+		cfg := s.adaptiveConfig()
+		rows, err := s.db.Query(`SELECT s.id,s.name,s.description,s.level,COALESCE((SELECT AVG(mastery) FROM learner_skill_state l JOIN pattern_skills ps ON ps.pattern_id=l.pattern_id WHERE ps.skill_id=s.id AND l.user_id='default'),.25) FROM skills s ORDER BY s.level,s.id`)
+		if err != nil {
+			jsonResp(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		defer rows.Close()
+		out := []map[string]any{}
+		for rows.Next() {
+			var id, name, desc string
+			var level int
+			var mastery float64
+			if rows.Scan(&id, &name, &desc, &level, &mastery) != nil {
+				continue
+			}
+			out = append(out, map[string]any{"id": id, "name": name, "description": desc, "level": level, "mastery": mastery, "eligible": mastery >= cfg.MasteryThreshold || level <= 1})
+		}
+		jsonResp(w, 200, out)
+	})
+	mux.HandleFunc("/api/adaptive-config", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			jsonResp(w, 200, s.adaptiveConfig())
+			return
+		}
+		if r.Method != http.MethodPut && r.Method != http.MethodPost {
+			jsonResp(w, 405, nil)
+			return
+		}
+		var vals map[string]any
+		if decode(r, &vals) != nil {
+			jsonResp(w, 400, map[string]string{"error": "invalid config"})
+			return
+		}
+		for k, v := range vals {
+			if k == "recent_pattern_window" || k == "max_pattern_repeats" {
+				if _, ok := v.(float64); !ok {
+					continue
+				}
+			}
+			b, _ := json.Marshal(v)
+			if _, err := s.db.Exec(`INSERT INTO adaptive_config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, k, string(b)); err != nil {
+				jsonResp(w, 500, map[string]string{"error": err.Error()})
+				return
+			}
+		}
+		jsonResp(w, 200, s.adaptiveConfig())
+	})
+	mux.HandleFunc("/api/rebuild-learning-state", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			jsonResp(w, 405, nil)
+			return
+		}
+		if err := s.rebuildLearnerState(); err != nil {
+			jsonResp(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		jsonResp(w, 200, map[string]any{"ok": true, "rebuilt": true})
+	})
 	mux.HandleFunc("/api/providers", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			jsonResp(w, 200, s.providers())
@@ -770,40 +893,6 @@ func (s *Server) providers() []ProviderConfig {
 	return out
 }
 
-func (s *Server) generateExercise(ctx context.Context, diff float64, mode, scene string) (map[string]any, error) {
-	var patternID, pat, intent string
-	var pd float64
-	query := `SELECT p.id,p.pattern,i.name,p.difficulty FROM sentence_patterns p JOIN communication_intents i ON i.id=p.intent_id WHERE p.difficulty BETWEEN ? AND ? AND NOT EXISTS (SELECT 1 FROM exercises recent WHERE recent.pattern_id=p.id AND recent.created_at >= ?) ORDER BY ABS(p.difficulty-?) LIMIT 1`
-	args := []any{math.Max(1, diff-1.4), math.Min(8, diff+1.4), time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339), diff}
-	if mode == "weak" {
-		query = `SELECT p.id,p.pattern,i.name,p.difficulty FROM sentence_patterns p JOIN communication_intents i ON i.id=p.intent_id LEFT JOIN pattern_mastery m ON m.pattern_id=p.id ORDER BY COALESCE(m.mastery,0.25), ABS(p.difficulty-?) LIMIT 1`
-		args = []any{diff}
-	}
-	if mode == "review" {
-		query = `SELECT p.id,p.pattern,i.name,p.difficulty FROM review_schedule r JOIN sentence_patterns p ON p.id=r.pattern_id JOIN communication_intents i ON i.id=p.intent_id ORDER BY r.due_at LIMIT 1`
-		args = nil
-	}
-	err := s.db.QueryRow(query, args...).Scan(&patternID, &pat, &intent, &pd)
-	if err != nil { // The recent-exercise guard is best effort when the range is exhausted.
-		query = `SELECT p.id,p.pattern,i.name,p.difficulty FROM sentence_patterns p JOIN communication_intents i ON i.id=p.intent_id WHERE p.difficulty BETWEEN ? AND ? ORDER BY ABS(p.difficulty-?) LIMIT 1`
-		err = s.db.QueryRow(query, math.Max(1, diff-1.4), math.Min(8, diff+1.4), diff).Scan(&patternID, &pat, &intent, &pd)
-	}
-	if err != nil {
-		return nil, err
-	}
-	prompts := map[string]string{"going-to": "我本来打算昨天给你打电话的。", "modal-possibility": "我今天可能会晚一点到。", "conditional": "如果明天下雨，我们就不去了。", "polite-request": "你能把会议移到下午吗？", "polite-refusal": "恐怕我这周抽不出时间。", "because": "我没有去，因为我感觉不舒服。", "past-perfect": "她到达时，我已经吃过饭了。", "wish-past": "我真希望我当时听了你的建议。"}
-	ch := prompts[patternID]
-	if ch == "" {
-		ch = "请用自然英语表达这句话。"
-	}
-	exID := id("exercise")
-	meta, _ := json.Marshal(map[string]any{"mode": mode, "generated": "seed"})
-	_, err = s.db.Exec(`INSERT INTO exercises(id,chinese_prompt,pattern_id,scene_id,intent_id,difficulty,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?)`, exID, ch, patternID, chooseScene(scene), intent, pd, string(meta), time.Now().UTC().Format(time.RFC3339))
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{"exercise_id": exID, "chinese_prompt": ch, "target_pattern": pat, "pattern_id": patternID, "scene_id": chooseScene(scene), "communication_intent": intent, "difficulty": pd}, nil
-}
 func chooseScene(s string) string {
 	if s != "" {
 		return s
@@ -851,13 +940,13 @@ func normalizeEnum(value string) string {
 func normalizeVerdict(value string) (string, error) {
 	v := normalizeEnum(value)
 	switch v {
-	case "correct":
+	case "correct", "good", "excellent", "great", "perfect", "right", "pass", "passed", "fully_correct", "fullycorrect":
 		return "correct", nil
-	case "mostly_correct", "mostlycorrect", "partially_correct", "partiallycorrect":
+	case "mostly_correct", "mostlycorrect", "partially_correct", "partiallycorrect", "almost_correct", "almostcorrect", "acceptable", "okay", "ok", "fair":
 		return "mostly_correct", nil
-	case "needs_improvement", "needsimprovement":
+	case "needs_improvement", "needsimprovement", "needs_work", "needswork", "weak", "poor":
 		return "needs_improvement", nil
-	case "incorrect":
+	case "incorrect", "wrong", "fail", "failed", "bad":
 		return "incorrect", nil
 	}
 	return "", fmt.Errorf("unknown verdict %q", value)
@@ -967,19 +1056,104 @@ func normalizeScore(number float64, name string) (float64, error) {
 	return number, nil
 }
 
+// stripJSONFence extracts one complete JSON object from a provider response.
+// Providers frequently add a short lead-in, a markdown fence, or a trailing
+// sentence even when they were asked for JSON mode. We tolerate those wrappers
+// but still require exactly one balanced JSON object before schema validation.
 func stripJSONFence(raw string) (string, error) {
 	text := strings.TrimSpace(raw)
-	if !strings.HasPrefix(text, "```") {
-		if strings.Contains(text, "```") {
-			return "", errors.New("markdown fence appears in prose")
+	if text == "" {
+		return "", errors.New("empty provider content")
+	}
+	// A few OpenAI-compatible gateways double-encode assistant content as a
+	// JSON string. Decode one such layer, then apply the same strict extraction.
+	if strings.HasPrefix(text, "\"") {
+		var decoded string
+		if err := json.Unmarshal([]byte(text), &decoded); err == nil && strings.TrimSpace(decoded) != text {
+			text = strings.TrimSpace(decoded)
 		}
-		return text, nil
 	}
-	lines := strings.Split(text, "\n")
-	if len(lines) < 3 || !strings.HasPrefix(strings.TrimSpace(lines[0]), "```") || strings.TrimSpace(lines[len(lines)-1]) != "```" {
-		return "", errors.New("incomplete markdown JSON fence")
+	if fenceStart := strings.Index(text, "```"); fenceStart >= 0 {
+		fenceEndRel := strings.Index(text[fenceStart+3:], "```")
+		if fenceEndRel < 0 {
+			return "", errors.New("incomplete markdown JSON fence")
+		}
+		fenceEnd := fenceStart + 3 + fenceEndRel
+		text = strings.TrimSpace(text[fenceStart+3 : fenceEnd])
+		// Drop an optional language tag such as ```json. The opening marker was
+		// removed above, so the tag is now the first line of the fenced body.
+		if newline := strings.IndexByte(text, '\n'); newline >= 0 {
+			first := strings.TrimSpace(text[:newline])
+			if first == "json" || first == "JSON" {
+				text = strings.TrimSpace(text[newline+1:])
+			}
+		}
 	}
-	return strings.TrimSpace(strings.Join(lines[1:len(lines)-1], "\n")), nil
+	return extractSingleJSONObject(text)
+}
+
+func extractSingleJSONObject(text string) (string, error) {
+	var candidates []string
+	for start := 0; start < len(text); start++ {
+		if text[start] != '{' {
+			continue
+		}
+		end, ok := balancedJSONObjectEnd(text, start)
+		if !ok {
+			continue
+		}
+		candidate := strings.TrimSpace(text[start : end+1])
+		var object map[string]json.RawMessage
+		if json.Unmarshal([]byte(candidate), &object) == nil && object != nil {
+			candidates = append(candidates, candidate)
+			start = end
+		}
+	}
+	if len(candidates) == 0 {
+		return "", errors.New("no complete JSON object found")
+	}
+	if len(candidates) > 1 {
+		return "", errors.New("multiple JSON objects found")
+	}
+	return candidates[0], nil
+}
+
+func balancedJSONObjectEnd(text string, start int) (int, bool) {
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(text); i++ {
+		ch := text[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i, true
+			}
+			if depth < 0 {
+				return 0, false
+			}
+		}
+	}
+	return 0, false
 }
 
 func normalizeEvalContent(raw string) (Eval, error) {
@@ -990,6 +1164,20 @@ func normalizeEvalContent(raw string) (Eval, error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(clean), &fields); err != nil {
 		return Eval{}, fmt.Errorf("invalid JSON: %w", err)
+	}
+	// Some providers wrap the requested object in {"evaluation": {...}} or
+	// {"result": {...}}. Unwrap only when the outer object has no verdict, so
+	// an ambiguous response cannot silently override a valid top-level schema.
+	if _, hasVerdict := lookupField(fields, "verdict"); !hasVerdict {
+		for _, wrapper := range []string{"evaluation", "result", "assessment"} {
+			if nestedRaw, ok := fields[wrapper]; ok {
+				var nested map[string]json.RawMessage
+				if json.Unmarshal(nestedRaw, &nested) == nil && nested != nil {
+					fields = nested
+					break
+				}
+			}
+		}
 	}
 	var out Eval
 	verdictRaw, ok := lookupField(fields, "verdict")
@@ -1105,23 +1293,24 @@ func (s *Server) submitAttempt(ctx context.Context, session, exercise, answer st
 	if _, err := s.db.Exec(`INSERT INTO attempts(id,session_id,exercise_id,user_answer,submitted_at,evaluation_status,evaluation_diagnostics_json) VALUES(?,?,?,?,?,?,?)`, attempt, session, exercise, answer, time.Now().UTC().Format(time.RFC3339), "pending", "{}"); err != nil {
 		return nil, err
 	}
+	_ = s.populateAttemptMetadata(attempt)
 	return s.evaluateAndPersist(ctx, attempt, prompt, pattern, scene, difficulty, answer)
 }
 
 func failureUserMessage(d EvaluationDiagnostics) string {
 	switch d.ErrorCategory {
 	case "timeout":
-		return "AI 评估超时，请稍后重试。"
+		return "AI evaluation timed out; please try again."
 	case "provider_4xx":
-		return "Provider 请求被拒绝，请检查设置。"
+		return "The provider rejected the request; check its settings."
 	case "provider_5xx", "provider_error":
-		return "Provider 暂时不可用，请稍后重试。"
+		return "The provider is temporarily unavailable; please try again."
 	case "invalid_provider_envelope":
-		return "Provider 返回格式无法识别。"
+		return "The provider response format could not be recognized."
 	case "invalid_structured_output", "schema_validation":
-		return "AI 返回的评估格式无效，请重新评估。"
+		return "The AI evaluation format was invalid; please retry."
 	default:
-		return "AI 评估失败，请稍后重试。"
+		return "AI evaluation failed; please try again."
 	}
 }
 
@@ -1163,7 +1352,11 @@ func (s *Server) saveValidatedAttempt(attempt, prompt, pattern, scene string, di
 	if _, err = tx.Exec(`INSERT INTO evaluations(id,attempt_id,verdict,meaning_score,grammar_score,naturalness_score,pattern_score,errors_json,suggested_answer,explanation_zh,validated,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,1,?)`, id("evaluation"), attempt, eval.Verdict, eval.MeaningScore, eval.GrammarScore, eval.NaturalnessScore, eval.PatternScore, string(errorsJSON), eval.SuggestedAnswer, eval.ExplanationZH, time.Now().UTC().Format(time.RFC3339)); err != nil {
 		return nil, err
 	}
-	if err = updateMasteryTx(tx, pattern, scene, difficulty, eval); err != nil {
+	_, _, _, isProbe, _, _, _ := adaptiveAttemptMetadata(tx, attempt)
+	if err = updateMasteryTxMode(tx, pattern, scene, difficulty, eval, isProbe); err != nil {
+		return nil, err
+	}
+	if err = updateAdaptiveStateTx(tx, attempt, pattern, scene, difficulty, eval); err != nil {
 		return nil, err
 	}
 	if err = updateProfileTx(tx, eval, difficulty); err != nil {
@@ -1232,12 +1425,22 @@ func (s *Server) evaluate(ctx context.Context, prompt, pattern, answer string) (
 		diagnostics.Success = true
 		return heuristicEval(prompt, pattern, answer), "local", "heuristic", diagnostics, nil
 	}
-	baseMessages := []ChatMessage{{Role: "system", Content: "Evaluate an English learner answer. Return exactly one JSON object in the assistant content; do not include reasoning or prose. The object must have verdict (string), meaning_score (number), grammar_score (number), naturalness_score (number), pattern_score (number), errors (array), suggested_answer (string), and explanation_zh (string). Scores must be numbers from 0 to 1. Use errors:[] when there are no errors. Every error object must contain all three string fields: type, severity, and explanation. Each error type must be one of meaning, tense, article, preposition, word_order, modal, condition, agreement, word_choice, missing_information, extra_information, unnatural_expression, target_pattern_missing, register, other. Each severity must be minor, moderate, or major."}, {Role: "user", Content: fmt.Sprintf("Prompt: %s\nTarget pattern: %s\nAnswer: %s", prompt, pattern, answer)}}
+	targetPattern := pattern
+	if s.db != nil {
+		var label string
+		if s.db.QueryRow("SELECT pattern FROM sentence_patterns WHERE id=?", pattern).Scan(&label) == nil && strings.TrimSpace(label) != "" {
+			targetPattern = label
+		}
+	}
+	baseMessages := []ChatMessage{{Role: "system", Content: "Evaluate an English learner answer. Return exactly one JSON object in the assistant content; do not include reasoning or prose. The object must have verdict (string), meaning_score (number), grammar_score (number), naturalness_score (number), pattern_score (number), errors (array), suggested_answer (string), and explanation_zh (string). verdict must be exactly one of: correct, mostly_correct, needs_improvement, incorrect. Scores must be numbers from 0 to 1. Use errors:[] when there are no errors. Every error object must contain all three string fields: type, severity, and explanation. Each error type must be one of meaning, tense, article, preposition, word_order, modal, condition, agreement, word_choice, missing_information, extra_information, unnatural_expression, target_pattern_missing, register, other. Each severity must be minor, moderate, or major. The suggested_answer must preserve and demonstrate the target pattern. Do not replace it with a different construction just because another expression sounds more natural; mention optional alternatives only in explanation_zh."}, {Role: "user", Content: fmt.Sprintf("Prompt: %s\nTarget pattern expression: %s\nTarget pattern ID: %s\nAnswer: %s", prompt, targetPattern, pattern, answer)}}
 	jsonMode := true
-	for attempt := 0; attempt < 2; attempt++ {
+	const maxEvaluationAttempts = 3
+	for attempt := 0; attempt < maxEvaluationAttempts; attempt++ {
 		messages := baseMessages
 		if attempt == 1 {
 			messages = append(append([]ChatMessage{}, baseMessages...), ChatMessage{Role: "system", Content: "Repair instruction: Return only one valid JSON object matching the required schema. No markdown and no explanation outside JSON. Do not omit any required field. Every errors item must include type, severity, and explanation; use errors:[] if there are no errors."})
+		} else if attempt > 1 {
+			messages = append(append([]ChatMessage{}, baseMessages...), ChatMessage{Role: "system", Content: "Final repair instruction: Your previous response failed schema validation. Return exactly one complete JSON object now. Do not truncate it, wrap it in prose, or omit fields. Use numeric scores from 0 to 1 and errors:[] when there are no errors."})
 		}
 		if !jsonMode {
 			messages = append(messages, ChatMessage{Role: "system", Content: "This provider does not support native JSON response mode. Return only the JSON object in the assistant content."})
@@ -1246,7 +1449,10 @@ func (s *Server) evaluate(ctx context.Context, prompt, pattern, answer string) (
 		if maxTokens < 1200 {
 			maxTokens = 1200
 		}
-		if attempt == 1 {
+		if attempt > 0 {
+			maxTokens *= 2
+		}
+		if attempt > 1 {
 			maxTokens *= 2
 		}
 		resp, err := s.llm.Client(c).Chat(ctx, ChatRequest{Messages: messages, Temperature: c.Temperature, MaxTokens: maxTokens, JSONMode: jsonMode, RequestID: diagnostics.RequestID})
@@ -1280,7 +1486,7 @@ func (s *Server) evaluate(ctx context.Context, prompt, pattern, answer string) (
 		diagnostics.FailureStage = "schema_validation"
 		diagnostics.ErrorCategory = "invalid_structured_output"
 		diagnostics.SchemaError = parseErr.Error()
-		if attempt == 1 {
+		if attempt+1 >= maxEvaluationAttempts {
 			return Eval{}, c.ID, c.Model, diagnostics, parseErr
 		}
 	}
@@ -1311,7 +1517,7 @@ func validateEval(e *Eval) error {
 func heuristicEval(prompt, pattern, answer string) Eval {
 	a := strings.TrimSpace(answer)
 	lower := strings.ToLower(a)
-	e := Eval{Verdict: "needs_improvement", MeaningScore: .45, GrammarScore: .45, NaturalnessScore: .45, PatternScore: .4, Errors: []map[string]any{}, SuggestedAnswer: a, ExplanationZH: "你的表达可以理解，继续练习这个句型。"}
+	e := Eval{Verdict: "needs_improvement", MeaningScore: .45, GrammarScore: .45, NaturalnessScore: .45, PatternScore: .4, Errors: []map[string]any{}, SuggestedAnswer: a, ExplanationZH: "Keep practicing this sentence pattern."}
 	switch pattern {
 	case "going-to", "was/were going to":
 		e.SuggestedAnswer = "I was going to call you yesterday."
@@ -1322,7 +1528,7 @@ func heuristicEval(prompt, pattern, answer string) Eval {
 			e.NaturalnessScore = .72
 			e.PatternScore = .65
 		} else {
-			e.Errors = append(e.Errors, map[string]any{"type": "target_pattern_missing", "severity": "moderate", "explanation": "没有清楚表达‘本来打算’。"})
+			e.Errors = append(e.Errors, map[string]any{"type": "target_pattern_missing", "severity": "moderate", "explanation": "The answer does not clearly express the target pattern."})
 		}
 	case "modal-possibility", "might / may":
 		e.SuggestedAnswer = "I might be a little late today."
@@ -1333,7 +1539,7 @@ func heuristicEval(prompt, pattern, answer string) Eval {
 			e.NaturalnessScore = .86
 			e.PatternScore = .9
 		} else {
-			e.Errors = append(e.Errors, map[string]any{"type": "modal", "severity": "major", "explanation": "需要使用 might 或 may 表达可能性。"})
+			e.Errors = append(e.Errors, map[string]any{"type": "modal", "severity": "major", "explanation": "Use might or may to express possibility."})
 		}
 	default:
 		if len(a) > 8 {
@@ -1343,13 +1549,17 @@ func heuristicEval(prompt, pattern, answer string) Eval {
 			e.NaturalnessScore = .7
 			e.PatternScore = .6
 		} else {
-			e.Errors = append(e.Errors, map[string]any{"type": "missing_information", "severity": "major", "explanation": "答案信息不足。"})
+			e.Errors = append(e.Errors, map[string]any{"type": "missing_information", "severity": "major", "explanation": "The answer does not contain enough information."})
 		}
 	}
 	return e
 }
 
 func updateMasteryTx(tx *sql.Tx, pattern, scene string, difficulty float64, e Eval) error {
+	return updateMasteryTxMode(tx, pattern, scene, difficulty, e, false)
+}
+
+func updateMasteryTxMode(tx *sql.Tx, pattern, scene string, difficulty float64, e Eval, probe bool) error {
 	var attempts, correct, consec int
 	var recent, long, mastery float64
 	_ = tx.QueryRow("SELECT attempts,correct,recent_accuracy,long_term_accuracy,consecutive_correct,mastery FROM pattern_mastery WHERE pattern_id=?", pattern).Scan(&attempts, &correct, &recent, &long, &consec, &mastery)
@@ -1381,6 +1591,9 @@ func updateMasteryTx(tx *sql.Tx, pattern, scene string, difficulty float64, e Ev
 				severity += .03
 			}
 		}
+	}
+	if probe && !ok {
+		severity *= .25
 	}
 	mastery = clamp(.35*recent+.35*long+.15*math.Min(1, float64(consec)/5)+.15*e.PatternScore-severity, 0, 1)
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -1447,7 +1660,15 @@ func updateProfileTx(tx *sql.Tx, e Eval, exerciseDifficulty float64) error {
 		current -= .10
 	}
 	current = clamp(current, 1, 8)
-	_, err := tx.Exec("UPDATE user_profile SET global_difficulty=?, updated_at=? WHERE id='default'", current, time.Now().UTC().Format(time.RFC3339))
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := tx.Exec("UPDATE user_profile SET global_difficulty=?, updated_at=? WHERE id='default'", current, now); err != nil {
+		return err
+	}
+	successRate := 0.0
+	if success {
+		successRate = 1
+	}
+	_, err := tx.Exec(`INSERT INTO difficulty_state(scope,entity_id,difficulty,success_rate,attempts,updated_at) VALUES('global','default',?,?,1,?) ON CONFLICT(scope,entity_id) DO UPDATE SET difficulty=excluded.difficulty,updated_at=excluded.updated_at`, current, successRate, now)
 	return err
 }
 
@@ -1481,21 +1702,17 @@ func (s *Server) updateAssessment(e Eval) error {
 func (s *Server) progress() map[string]any {
 	var d float64
 	_ = s.db.QueryRow("SELECT global_difficulty FROM user_profile WHERE id='default'").Scan(&d)
-	rows, _ := s.db.Query(`SELECT p.pattern,m.mastery,m.attempts FROM sentence_patterns p JOIN pattern_mastery m ON m.pattern_id=p.id ORDER BY m.mastery LIMIT 10`)
-	defer func() {
-		if rows != nil {
-			rows.Close()
-		}
-	}()
+	rows, _ := s.db.Query(`SELECT p.pattern,COALESCE(ls.mastery,m.mastery,.25),COALESCE(ls.retention,0),COALESCE(ls.transfer,0),COALESCE(ls.next_review_at,''),COALESCE(m.attempts,0) FROM sentence_patterns p LEFT JOIN pattern_mastery m ON m.pattern_id=p.id LEFT JOIN learner_skill_state ls ON ls.pattern_id=p.id AND ls.user_id='default' ORDER BY COALESCE(ls.mastery,m.mastery,.25) LIMIT 10`)
 	weak := []map[string]any{}
 	if rows != nil {
 		for rows.Next() {
-			var p string
-			var m float64
+			var p, next string
+			var m, ret, tr float64
 			var a int
-			_ = rows.Scan(&p, &m, &a)
-			weak = append(weak, map[string]any{"pattern": p, "mastery": m, "attempts": a})
+			_ = rows.Scan(&p, &m, &ret, &tr, &next, &a)
+			weak = append(weak, map[string]any{"pattern": p, "mastery": m, "retention": ret, "transfer": tr, "next_review_at": next, "attempts": a})
 		}
+		rows.Close()
 	}
 	var count int
 	var correct int
@@ -1505,5 +1722,9 @@ func (s *Server) progress() map[string]any {
 	if count > 0 {
 		rate = float64(correct) / float64(count)
 	}
-	return map[string]any{"recent_attempts": count, "recent_success_rate": rate, "global_difficulty": d, "weak_patterns": weak}
+	var due, probes, repeated int
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM learner_skill_state WHERE next_review_at<=?`, time.Now().UTC().Format(time.RFC3339)).Scan(&due)
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM attempts WHERE is_probe=1`).Scan(&probes)
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM attempts a JOIN exercises e ON e.id=a.exercise_id WHERE a.evaluation_status='validated' AND a.normalized_chinese_hash IN (SELECT normalized_chinese_hash FROM attempts WHERE normalized_chinese_hash<>'' GROUP BY normalized_chinese_hash HAVING COUNT(*)>1)`).Scan(&repeated)
+	return map[string]any{"recent_attempts": count, "recent_success_rate": rate, "global_difficulty": d, "weak_patterns": weak, "global_difficulty_trend": d, "due_reviews": due, "probe_count": probes, "exact_repeats": repeated}
 }
