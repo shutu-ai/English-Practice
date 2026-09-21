@@ -23,20 +23,44 @@ function renderEvaluation(result) {
   if (!result.evaluation) {
     feedback.innerHTML = `<b>AI evaluation temporarily failed</b><p>${result.error || 'The attempt was saved and mastery was not updated.'}</p><button class="retry">Re-evaluate</button>`
     feedback.querySelector('.retry').onclick = () => reevaluate(result.attempt_id)
+    feedback.scrollIntoView({ behavior: 'smooth', block: 'start' })
     return
   }
   const evaluation = result.evaluation
   feedback.innerHTML = `<b>${({ correct: 'Correct', mostly_correct: 'Mostly correct', needs_improvement: 'Needs improvement', incorrect: 'Try again' })[evaluation.verdict] || evaluation.verdict}</b><button class="next">Next →</button><p>${evaluation.explanation_zh}</p><p><strong>More natural:</strong> ${evaluation.suggested_answer}</p><div class="score">Meaning <b>${Math.round(evaluation.meaning_score * 100)}%</b></div><div class="score">Grammar <b>${Math.round(evaluation.grammar_score * 100)}%</b></div><div class="score">Naturalness <b>${Math.round(evaluation.naturalness_score * 100)}%</b></div><div class="score">Pattern <b>${Math.round(evaluation.pattern_score * 100)}%</b></div>`
   feedback.querySelector('.next').onclick = next
+  feedback.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
 async function submit() {
   if (!current || !$('#answer').value.trim()) return
-  renderEvaluation(await api('/api/attempts', { method: 'POST', body: JSON.stringify({ exercise_id: current.exercise_id, answer: $('#answer').value }) }))
+  const button = $('#submit')
+  const feedback = $('#feedback')
+  button.disabled = true
+  button.textContent = 'Evaluating…'
+  feedback.classList.remove('hidden')
+  feedback.innerHTML = '<p class="loading-state" aria-live="polite">Evaluating<span class="loading-dots">...</span></p>'
+  feedback.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  try {
+    renderEvaluation(await api('/api/attempts', { method: 'POST', body: JSON.stringify({ exercise_id: current.exercise_id, answer: $('#answer').value }) }))
+  } catch (error) {
+    feedback.innerHTML = `<b>Evaluation failed</b><p>${error.message || 'Please try again.'}</p>`
+    feedback.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  } finally {
+    button.disabled = false
+    button.textContent = 'Submit'
+  }
 }
 
 async function reevaluate(attemptId) {
-  renderEvaluation(await api(`/api/attempts/${attemptId}/reevaluate`, { method: 'POST' }))
+  const feedback = $('#feedback')
+  feedback.innerHTML = '<p class="loading-state" aria-live="polite">Re-evaluating<span class="loading-dots">...</span></p>'
+  feedback.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  try {
+    renderEvaluation(await api(`/api/attempts/${attemptId}/reevaluate`, { method: 'POST' }))
+  } catch (error) {
+    feedback.innerHTML = `<b>Re-evaluation failed</b><p>${error.message || 'Please try again.'}</p>`
+  }
 }
 
 function providerPayload() {
