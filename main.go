@@ -43,6 +43,7 @@ type ChatRequest struct {
 	Temperature float64       `json:"temperature,omitempty"`
 	MaxTokens   int           `json:"max_tokens,omitempty"`
 	JSONMode    bool          `json:"json_mode,omitempty"`
+	AllowEmpty  bool          `json:"-"`
 	RequestID   string        `json:"-"`
 }
 type ChatResponse struct {
@@ -160,6 +161,9 @@ func (c HTTPChatClient) Chat(ctx context.Context, req ChatRequest) (*ChatRespons
 	}
 	content, shape, err := extractAssistantContent(body)
 	if err != nil {
+		if req.AllowEmpty && strings.Contains(err.Error(), "provider response has no assistant content") {
+			return &ChatResponse{Provider: c.cfg.ID, Model: c.cfg.Model, Latency: time.Since(start), HTTPStatus: resp.StatusCode, ResponseShape: shape}, nil
+		}
 		return nil, &ProviderError{Stage: "content_extraction", Category: "invalid_provider_envelope", HTTPStatus: resp.StatusCode, Latency: time.Since(start), ResponseShape: shape, Err: err}
 	}
 	return &ChatResponse{Content: content, Provider: c.cfg.ID, Model: c.cfg.Model, Latency: time.Since(start), HTTPStatus: resp.StatusCode, ResponseShape: shape}, nil
@@ -696,7 +700,7 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 			s.llm.mu.RUnlock()
 		}
 		start := time.Now()
-		_, err := s.llm.Client(c).Chat(r.Context(), ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "Reply with OK"}}, MaxTokens: 8})
+		_, err := s.llm.Client(c).Chat(r.Context(), ChatRequest{Messages: []ChatMessage{{Role: "system", Content: "Connection check. Reply briefly if possible; no reasoning is needed."}, {Role: "user", Content: "Reply with OK"}}, MaxTokens: 128, AllowEmpty: true})
 		if err != nil {
 			jsonResp(w, 200, map[string]any{"ok": false, "error": err.Error(), "latency_ms": time.Since(start).Milliseconds()})
 			return

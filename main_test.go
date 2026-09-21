@@ -123,7 +123,7 @@ func TestProviderTestReusesStoredAPIKeyWithoutReturningIt(t *testing.T) {
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"OK"}}]}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":""}}]}`))
 	}))
 	defer mock.Close()
 	mux := http.NewServeMux()
