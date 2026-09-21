@@ -55,7 +55,7 @@ async function saveProvider() {
   const saved = await api('/api/providers', { method: 'POST', body: JSON.stringify(providerPayload()) })
   fillProvider(saved, true)
   $('#provider-key').value = enteredKey
-  $('#provider-message').textContent = 'Provider saved. An empty API key keeps the existing key.'
+  $('#provider-message').textContent = enteredKey ? 'Provider 已保存。' : 'Provider 已保存，未填写 API Key，已保留已有 Key。'
 }
 
 async function testProvider() {

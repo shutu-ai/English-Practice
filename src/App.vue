@@ -35,7 +35,7 @@ async function loadProgress(){progress.value=await api('/api/progress')}
 async function loadScenes(){scenes.value=await api('/api/scenes')}
 async function loadReviews(){reviews.value=await api<ReviewItem[]>('/api/reviews')}
 async function loadProviders(){providers.value=await api<Provider[]>('/api/providers');if(providers.value[0])provider.value={...provider.value,...providers.value[0]}}
-async function saveProvider(){const saved=await api<Provider>('/api/providers',{method:'POST',body:JSON.stringify(provider.value)});provider.value={...provider.value,...saved};await loadProviders();message.value='Provider saved.'}
+async function saveProvider(){const hadKey=!!provider.value.api_key;const saved=await api<Provider>('/api/providers',{method:'POST',body:JSON.stringify(provider.value)});provider.value={...provider.value,...saved};await loadProviders();message.value=hadKey?'Provider 已保存。':'Provider 已保存，未填写 API Key，已保留已有 Key。'}
 async function testProvider(){const result=await api<{ok:boolean;error?:string}>('/api/providers/test',{method:'POST',body:JSON.stringify(provider.value)});message.value=result.ok?'Connection successful.':(result.error||'Connection failed.')}
 async function changePage(next:string){page.value=next;if(next==='history')await loadHistory();if(next==='progress')await loadProgress();if(next==='review')await loadReviews();if(next==='settings')await loadProviders()}
 const verdictText=computed(()=>({correct:'表达正确',mostly_correct:'基本正确',needs_improvement:'需要改进',incorrect:'需要重写'}[evaluation.value?.verdict||'']||''))
