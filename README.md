@@ -43,12 +43,13 @@ go build -mod=mod ./...
 
 ## CI and real-use calibration
 
-Every push and pull request runs the offline Go quality gates in
+Every push and pull request runs the Go quality gates in
 `.github/workflows/ci.yml`: tests, vet, and a build with a fixed Go 1.25
-toolchain and module caching. CI never needs an LLM API key or a production
-database. Frontend rebuilds are intentionally not a CI gate because this
-repository does not currently commit an npm lockfile; the checked-in
-`web/dist` bundle remains the serving artifact.
+toolchain and module caching. The frontend job runs mocked speech tests,
+static checks, and the Vue build. CI never needs an LLM API key, TTS service,
+or production database. The repository does not currently commit an npm
+lockfile, so the frontend job uses the declared package ranges and the
+checked-in `web/dist` bundle remains the serving artifact.
 
 Calibration inspection is on demand so practice latency is unaffected:
 
@@ -66,6 +67,10 @@ from real-use validation. See `docs/real-use-acceptance.md` and
 Until the protocol has produced 100+ real validated attempts across the
 required sessions and time span, the correct status is `CODE READY,
 REAL-USE DATA PENDING` rather than a real-use PASS.
+
+Pronunciation playback is a local-only browser enhancement documented in
+`docs/pronunciation-playback.md`. It uses native SpeechSynthesis for English
+sentences only and does not affect learning state.
 
 ## Data and backup
 

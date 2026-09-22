@@ -26,3 +26,23 @@ jobs:
         run: go vet ./...
       - name: Build
         run: go build -mod=mod ./...
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+      - name: Install frontend dependencies
+        run: npm install --no-package-lock --ignore-scripts
+      - name: Speech service tests
+        run: npm run test:speech
+      - name: Static frontend checks
+        run: npm run check:frontend
+      - name: Typecheck frontend source
+        run: npm run typecheck
+      - name: Build frontend source
+        run: npm run build

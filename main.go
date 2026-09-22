@@ -21,7 +21,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 5
+const schemaVersion = 6
 
 type Server struct {
 	db     *sql.DB
@@ -321,7 +321,7 @@ func migrate(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS exercises (id TEXT PRIMARY KEY, chinese_prompt TEXT NOT NULL, pattern_id TEXT NOT NULL, scene_id TEXT NOT NULL, intent_id TEXT NOT NULL, difficulty REAL NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, FOREIGN KEY(pattern_id) REFERENCES sentence_patterns(id), FOREIGN KEY(scene_id) REFERENCES scenes(id))`,
 		`CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, mode TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, start_global_difficulty REAL NOT NULL DEFAULT 0, end_global_difficulty REAL NOT NULL DEFAULT 0, patterns_seen TEXT NOT NULL DEFAULT '{}', skills_seen TEXT NOT NULL DEFAULT '{}', reviews_served INTEGER NOT NULL DEFAULT 0, probes_served INTEGER NOT NULL DEFAULT 0, new_skills_served INTEGER NOT NULL DEFAULT 0)`,
 		`CREATE TABLE IF NOT EXISTS attempts (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, exercise_id TEXT NOT NULL, user_answer TEXT NOT NULL, submitted_at TEXT NOT NULL, provider TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', prompt_version TEXT NOT NULL DEFAULT '', evaluation_status TEXT NOT NULL, FOREIGN KEY(session_id) REFERENCES sessions(id), FOREIGN KEY(exercise_id) REFERENCES exercises(id))`,
-		`CREATE TABLE IF NOT EXISTS evaluations (id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL UNIQUE, verdict TEXT NOT NULL, meaning_score REAL NOT NULL, grammar_score REAL NOT NULL, naturalness_score REAL NOT NULL, pattern_score REAL NOT NULL, errors_json TEXT NOT NULL, suggested_answer TEXT NOT NULL, explanation_zh TEXT NOT NULL, validated INTEGER NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY(attempt_id) REFERENCES attempts(id))`,
+		`CREATE TABLE IF NOT EXISTS evaluations (id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL UNIQUE, verdict TEXT NOT NULL, meaning_score REAL NOT NULL, grammar_score REAL NOT NULL, naturalness_score REAL NOT NULL, pattern_score REAL NOT NULL, errors_json TEXT NOT NULL, suggested_answer TEXT NOT NULL, more_natural TEXT NOT NULL DEFAULT '', more_natural_needed INTEGER NOT NULL DEFAULT 0, alternative TEXT NOT NULL DEFAULT '', explanation_zh TEXT NOT NULL, validated INTEGER NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY(attempt_id) REFERENCES attempts(id))`,
 		`CREATE TABLE IF NOT EXISTS pattern_mastery (pattern_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL, correct INTEGER NOT NULL, recent_accuracy REAL NOT NULL, long_term_accuracy REAL NOT NULL, consecutive_correct INTEGER NOT NULL, last_practiced TEXT, mastery REAL NOT NULL, FOREIGN KEY(pattern_id) REFERENCES sentence_patterns(id))`,
 		`CREATE TABLE IF NOT EXISTS scene_mastery (scene_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL, correct INTEGER NOT NULL, mastery REAL NOT NULL, last_practiced TEXT, FOREIGN KEY(scene_id) REFERENCES scenes(id))`,
 		`CREATE TABLE IF NOT EXISTS error_stats (error_type TEXT PRIMARY KEY, count INTEGER NOT NULL, severity_sum REAL NOT NULL, last_seen TEXT NOT NULL)`,
@@ -371,6 +371,9 @@ func migrate(db *sql.DB) error {
 		}
 	}
 	for _, c := range []struct{ table, name, definition string }{
+		{"evaluations", "more_natural", "TEXT NOT NULL DEFAULT ''"},
+		{"evaluations", "more_natural_needed", "INTEGER NOT NULL DEFAULT 0"},
+		{"evaluations", "alternative", "TEXT NOT NULL DEFAULT ''"},
 		{"sentence_patterns", "catalog_difficulty", "REAL NOT NULL DEFAULT 0"},
 		{"learner_skill_state", "evidence_count", "INTEGER NOT NULL DEFAULT 0"},
 		{"learner_skill_state", "state_confidence", "REAL NOT NULL DEFAULT 0"},
@@ -1050,14 +1053,17 @@ func chooseScene(s string) string {
 }
 
 type Eval struct {
-	Verdict          string           `json:"verdict"`
-	MeaningScore     float64          `json:"meaning_score"`
-	GrammarScore     float64          `json:"grammar_score"`
-	NaturalnessScore float64          `json:"naturalness_score"`
-	PatternScore     float64          `json:"pattern_score"`
-	Errors           []map[string]any `json:"errors"`
-	SuggestedAnswer  string           `json:"suggested_answer"`
-	ExplanationZH    string           `json:"explanation_zh"`
+	Verdict           string           `json:"verdict"`
+	MeaningScore      float64          `json:"meaning_score"`
+	GrammarScore      float64          `json:"grammar_score"`
+	NaturalnessScore  float64          `json:"naturalness_score"`
+	PatternScore      float64          `json:"pattern_score"`
+	Errors            []map[string]any `json:"errors"`
+	SuggestedAnswer   string           `json:"suggested_answer"`
+	MoreNatural       string           `json:"more_natural,omitempty"`
+	MoreNaturalNeeded bool             `json:"more_natural_needed,omitempty"`
+	Alternative       string           `json:"alternative,omitempty"`
+	ExplanationZH     string           `json:"explanation_zh"`
 }
 
 type EvaluationDiagnostics struct {
@@ -1377,6 +1383,24 @@ func normalizeEvalContent(raw string) (Eval, error) {
 	if err != nil {
 		return out, err
 	}
+	if raw, ok := lookupField(fields, "more_natural", "moreNatural"); ok && string(raw) != "null" {
+		var value string
+		if json.Unmarshal(raw, &value) == nil {
+			out.MoreNatural = strings.TrimSpace(value)
+		}
+	}
+	if raw, ok := lookupField(fields, "more_natural_needed", "moreNaturalNeeded"); ok {
+		_ = json.Unmarshal(raw, &out.MoreNaturalNeeded)
+	}
+	if out.MoreNatural != "" && !out.MoreNaturalNeeded {
+		out.MoreNaturalNeeded = true
+	}
+	if raw, ok := lookupField(fields, "alternative", "alternative_answer", "alternativeAnswer"); ok && string(raw) != "null" {
+		var value string
+		if json.Unmarshal(raw, &value) == nil {
+			out.Alternative = strings.TrimSpace(value)
+		}
+	}
 	out.ExplanationZH, err = parseRequiredString(fields, "explanation_zh", "explanationZh", "explanation")
 	if err != nil {
 		return out, err
@@ -1500,7 +1524,7 @@ func (s *Server) saveValidatedAttempt(attempt, prompt, pattern, scene string, di
 	if _, err = tx.Exec(`UPDATE attempts SET provider=?,model=?,prompt_version='v1',evaluation_status='validated',evaluation_diagnostics_json=? WHERE id=?`, provider, model, string(diagJSON), attempt); err != nil {
 		return nil, err
 	}
-	if _, err = tx.Exec(`INSERT INTO evaluations(id,attempt_id,verdict,meaning_score,grammar_score,naturalness_score,pattern_score,errors_json,suggested_answer,explanation_zh,validated,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,1,?)`, id("evaluation"), attempt, eval.Verdict, eval.MeaningScore, eval.GrammarScore, eval.NaturalnessScore, eval.PatternScore, string(errorsJSON), eval.SuggestedAnswer, eval.ExplanationZH, time.Now().UTC().Format(time.RFC3339)); err != nil {
+	if _, err = tx.Exec(`INSERT INTO evaluations(id,attempt_id,verdict,meaning_score,grammar_score,naturalness_score,pattern_score,errors_json,suggested_answer,more_natural,more_natural_needed,alternative,explanation_zh,validated,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)`, id("evaluation"), attempt, eval.Verdict, eval.MeaningScore, eval.GrammarScore, eval.NaturalnessScore, eval.PatternScore, string(errorsJSON), eval.SuggestedAnswer, eval.MoreNatural, boolInt(eval.MoreNaturalNeeded), eval.Alternative, eval.ExplanationZH, time.Now().UTC().Format(time.RFC3339)); err != nil {
 		return nil, err
 	}
 	var masteryBefore, difficultyBefore float64
@@ -1548,9 +1572,11 @@ func (s *Server) loadAttemptResult(attempt string) (map[string]any, error) {
 func (s *Server) loadEvaluation(attempt string) (Eval, error) {
 	var e Eval
 	var errorsJSON string
-	if err := s.db.QueryRow("SELECT verdict,meaning_score,grammar_score,naturalness_score,pattern_score,errors_json,suggested_answer,explanation_zh FROM evaluations WHERE attempt_id=?", attempt).Scan(&e.Verdict, &e.MeaningScore, &e.GrammarScore, &e.NaturalnessScore, &e.PatternScore, &errorsJSON, &e.SuggestedAnswer, &e.ExplanationZH); err != nil {
+	var moreNaturalNeeded int
+	if err := s.db.QueryRow("SELECT verdict,meaning_score,grammar_score,naturalness_score,pattern_score,errors_json,suggested_answer,more_natural,more_natural_needed,alternative,explanation_zh FROM evaluations WHERE attempt_id=?", attempt).Scan(&e.Verdict, &e.MeaningScore, &e.GrammarScore, &e.NaturalnessScore, &e.PatternScore, &errorsJSON, &e.SuggestedAnswer, &e.MoreNatural, &moreNaturalNeeded, &e.Alternative, &e.ExplanationZH); err != nil {
 		return e, err
 	}
+	e.MoreNaturalNeeded = moreNaturalNeeded == 1
 	if err := json.Unmarshal([]byte(errorsJSON), &e.Errors); err != nil {
 		return e, err
 	}
@@ -1597,7 +1623,7 @@ func (s *Server) evaluate(ctx context.Context, prompt, pattern, answer string) (
 			targetPattern = label
 		}
 	}
-	baseMessages := []ChatMessage{{Role: "system", Content: "Evaluate an English learner answer. Return exactly one JSON object in the assistant content; do not include reasoning or prose. The object must have verdict (string), meaning_score (number), grammar_score (number), naturalness_score (number), pattern_score (number), errors (array), suggested_answer (string), and explanation_zh (string). verdict must be exactly one of: correct, mostly_correct, needs_improvement, incorrect. Scores must be numbers from 0 to 1. Use errors:[] when there are no errors. Every error object must contain all three string fields: type, severity, and explanation. Each error type must be one of meaning, tense, article, preposition, word_order, modal, condition, agreement, word_choice, missing_information, extra_information, unnatural_expression, target_pattern_missing, register, other. Each severity must be minor, moderate, or major. The suggested_answer must preserve and demonstrate the target pattern. Do not replace it with a different construction just because another expression sounds more natural; mention optional alternatives only in explanation_zh."}, {Role: "user", Content: fmt.Sprintf("Prompt: %s\nTarget pattern expression: %s\nTarget pattern ID: %s\nAnswer: %s", prompt, targetPattern, pattern, answer)}}
+	baseMessages := []ChatMessage{{Role: "system", Content: "Evaluate an English learner answer. Return exactly one JSON object in the assistant content; do not include reasoning or prose. The object must have verdict (string), meaning_score (number), grammar_score (number), naturalness_score (number), pattern_score (number), errors (array), suggested_answer (string), explanation_zh (string), and may include more_natural_needed (boolean), more_natural (string), and alternative (string). verdict must be exactly one of: correct, mostly_correct, needs_improvement, incorrect. Scores must be numbers from 0 to 1. Use errors:[] when there are no errors. Every error object must contain all three string fields: type, severity, and explanation. Each error type must be one of meaning, tense, article, preposition, word_order, modal, condition, agreement, word_choice, missing_information, extra_information, unnatural_expression, target_pattern_missing, register, other. Each severity must be minor, moderate, or major. The suggested_answer must preserve and demonstrate the target pattern. Do not rewrite an already correct and natural answer merely to produce a different sentence: set more_natural_needed=false and more_natural to an empty string. Only provide more_natural when it is a meaningful improvement; use alternative for a useful but not strictly better rephrasing."}, {Role: "user", Content: fmt.Sprintf("Prompt: %s\nTarget pattern expression: %s\nTarget pattern ID: %s\nAnswer: %s", prompt, targetPattern, pattern, answer)}}
 	jsonMode := true
 	const maxEvaluationAttempts = 3
 	for attempt := 0; attempt < maxEvaluationAttempts; attempt++ {

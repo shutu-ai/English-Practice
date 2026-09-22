@@ -11,7 +11,8 @@ The runner uses the Go module cache. Tests use deterministic local evaluators
 or in-process mock HTTP providers; no real API key, provider, user database,
 generated executable, log, or secret is committed or required.
 
-The frontend bundle is checked in and served directly. A frontend CI job is
-currently omitted because there is no committed npm lockfile, so dependency
-resolution would make the core gate network-sensitive. Add a locked frontend
-job when the package manager lockfile is adopted.
+The frontend job runs the mock SpeechSynthesis tests, `node --check` static
+checks, TypeScript typecheck, and `npm run build`. The checked-in `web/dist` bundle is served by the
+Go app. There is no committed npm lockfile yet, so dependency resolution uses
+the declared package ranges; adopt a lockfile when deterministic frontend
+dependency resolution is required.
