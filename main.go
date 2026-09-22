@@ -21,7 +21,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 type Server struct {
 	db     *sql.DB
@@ -311,7 +311,7 @@ func migrate(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS schema_meta (version INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS scenes (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '')`,
 		`CREATE TABLE IF NOT EXISTS communication_intents (id TEXT PRIMARY KEY, name TEXT NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS sentence_patterns (id TEXT PRIMARY KEY, pattern TEXT NOT NULL, intent_id TEXT NOT NULL, difficulty REAL NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}', FOREIGN KEY(intent_id) REFERENCES communication_intents(id))`,
+		`CREATE TABLE IF NOT EXISTS sentence_patterns (id TEXT PRIMARY KEY, pattern TEXT NOT NULL, intent_id TEXT NOT NULL, difficulty REAL NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}', catalog_difficulty REAL NOT NULL DEFAULT 0, FOREIGN KEY(intent_id) REFERENCES communication_intents(id))`,
 		`CREATE TABLE IF NOT EXISTS exercises (id TEXT PRIMARY KEY, chinese_prompt TEXT NOT NULL, pattern_id TEXT NOT NULL, scene_id TEXT NOT NULL, intent_id TEXT NOT NULL, difficulty REAL NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, FOREIGN KEY(pattern_id) REFERENCES sentence_patterns(id), FOREIGN KEY(scene_id) REFERENCES scenes(id))`,
 		`CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, mode TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT)`,
 		`CREATE TABLE IF NOT EXISTS attempts (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, exercise_id TEXT NOT NULL, user_answer TEXT NOT NULL, submitted_at TEXT NOT NULL, provider TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', prompt_version TEXT NOT NULL DEFAULT '', evaluation_status TEXT NOT NULL, FOREIGN KEY(session_id) REFERENCES sessions(id), FOREIGN KEY(exercise_id) REFERENCES exercises(id))`,
@@ -327,7 +327,7 @@ func migrate(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS skill_edges (id TEXT PRIMARY KEY, from_skill_id TEXT NOT NULL, to_skill_id TEXT NOT NULL, relation TEXT NOT NULL, weight REAL NOT NULL DEFAULT 1, metadata_json TEXT NOT NULL DEFAULT '{}', UNIQUE(from_skill_id,to_skill_id,relation), FOREIGN KEY(from_skill_id) REFERENCES skills(id), FOREIGN KEY(to_skill_id) REFERENCES skills(id))`,
 		`CREATE TABLE IF NOT EXISTS pattern_skills (pattern_id TEXT NOT NULL, skill_id TEXT NOT NULL, weight REAL NOT NULL DEFAULT 1, PRIMARY KEY(pattern_id,skill_id), FOREIGN KEY(pattern_id) REFERENCES sentence_patterns(id), FOREIGN KEY(skill_id) REFERENCES skills(id))`,
 		`CREATE TABLE IF NOT EXISTS learner_skill_state (user_id TEXT NOT NULL, skill_id TEXT NOT NULL DEFAULT '', pattern_id TEXT NOT NULL, mastery REAL NOT NULL DEFAULT 0.25, acquisition REAL NOT NULL DEFAULT 0, retention REAL NOT NULL DEFAULT 0, transfer REAL NOT NULL DEFAULT 0, attempt_count INTEGER NOT NULL DEFAULT 0, success_count INTEGER NOT NULL DEFAULT 0, failure_count INTEGER NOT NULL DEFAULT 0, recent_accuracy REAL NOT NULL DEFAULT 0, long_term_accuracy REAL NOT NULL DEFAULT 0, current_difficulty REAL NOT NULL DEFAULT 1, max_success_difficulty REAL NOT NULL DEFAULT 1, consecutive_success INTEGER NOT NULL DEFAULT 0, consecutive_failure INTEGER NOT NULL DEFAULT 0, last_seen_at TEXT, last_success_at TEXT, last_failure_at TEXT, next_review_at TEXT, scene_coverage TEXT NOT NULL DEFAULT '{}', intent_coverage TEXT NOT NULL DEFAULT '{}', context_diversity REAL NOT NULL DEFAULT 0, memory_strength REAL NOT NULL DEFAULT 0, stability REAL NOT NULL DEFAULT 0, state_version INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL, PRIMARY KEY(user_id,pattern_id))`,
-		`CREATE TABLE IF NOT EXISTS difficulty_state (scope TEXT NOT NULL, entity_id TEXT NOT NULL, difficulty REAL NOT NULL, success_rate REAL NOT NULL DEFAULT 0.5, attempts INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY(scope,entity_id))`,
+		`CREATE TABLE IF NOT EXISTS difficulty_state (scope TEXT NOT NULL, entity_id TEXT NOT NULL, difficulty REAL NOT NULL, success_rate REAL NOT NULL DEFAULT 0.5, attempts INTEGER NOT NULL DEFAULT 0, empirical_difficulty REAL NOT NULL DEFAULT 0, confidence REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY(scope,entity_id))`,
 		`CREATE TABLE IF NOT EXISTS adaptive_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
 	}
 	for _, q := range stmts {
@@ -355,6 +355,21 @@ func migrate(db *sql.DB) error {
 		if err := ensureColumn(db, "attempts", c.name, c.definition); err != nil {
 			return err
 		}
+	}
+	for _, c := range []struct{ table, name, definition string }{
+		{"sentence_patterns", "catalog_difficulty", "REAL NOT NULL DEFAULT 0"},
+		{"learner_skill_state", "evidence_count", "INTEGER NOT NULL DEFAULT 0"},
+		{"learner_skill_state", "state_confidence", "REAL NOT NULL DEFAULT 0"},
+		{"learner_skill_state", "state", "TEXT NOT NULL DEFAULT 'UNKNOWN'"},
+		{"difficulty_state", "empirical_difficulty", "REAL NOT NULL DEFAULT 0"},
+		{"difficulty_state", "confidence", "REAL NOT NULL DEFAULT 0"},
+	} {
+		if err := ensureColumn(db, c.table, c.name, c.definition); err != nil {
+			return err
+		}
+	}
+	if _, err := db.Exec(`UPDATE sentence_patterns SET catalog_difficulty=difficulty WHERE catalog_difficulty=0`); err != nil {
+		return err
 	}
 	for _, c := range []struct{ name, definition string }{{"normalized_chinese_hash", "TEXT NOT NULL DEFAULT ''"}, {"generated_by", "TEXT NOT NULL DEFAULT 'fallback'"}} {
 		if err := ensureColumn(db, "exercises", c.name, c.definition); err != nil {
@@ -502,7 +517,7 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		jsonResp(w, 200, out)
 	})
 	mux.HandleFunc("/api/patterns", func(w http.ResponseWriter, r *http.Request) {
-		rows, err := s.db.Query(`SELECT p.id,p.pattern,p.difficulty,COALESCE(m.mastery,.25),COALESCE(m.attempts,0) FROM sentence_patterns p LEFT JOIN pattern_mastery m ON p.id=m.pattern_id ORDER BY p.difficulty`)
+		rows, err := s.db.Query(`SELECT p.id,p.pattern,COALESCE(p.catalog_difficulty,p.difficulty),COALESCE(ls.mastery,COALESCE(m.mastery,.25)),COALESCE(ls.attempt_count,COALESCE(m.attempts,0)),COALESCE(ls.state,'UNKNOWN') FROM sentence_patterns p LEFT JOIN pattern_mastery m ON p.id=m.pattern_id LEFT JOIN learner_skill_state ls ON ls.pattern_id=p.id AND ls.user_id='default' ORDER BY p.difficulty`)
 		if err != nil {
 			jsonResp(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -513,8 +528,9 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 			var id, p string
 			var d, ma float64
 			var a int
-			_ = rows.Scan(&id, &p, &d, &ma, &a)
-			out = append(out, map[string]any{"id": id, "pattern": p, "difficulty": d, "mastery": ma, "attempts": a})
+			var state string
+			_ = rows.Scan(&id, &p, &d, &ma, &a, &state)
+			out = append(out, map[string]any{"id": id, "pattern": p, "difficulty": d, "catalog_difficulty": d, "mastery": ma, "attempts": a, "state": state})
 		}
 		jsonResp(w, 200, out)
 	})
@@ -694,7 +710,7 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 	})
 	mux.HandleFunc("/api/progress", func(w http.ResponseWriter, r *http.Request) { jsonResp(w, 200, s.progress()) })
 	mux.HandleFunc("/api/learner-state", func(w http.ResponseWriter, r *http.Request) {
-		rows, err := s.db.Query(`SELECT skill_id,pattern_id,mastery,acquisition,retention,transfer,attempt_count,success_count,failure_count,current_difficulty,max_success_difficulty,consecutive_success,consecutive_failure,next_review_at,context_diversity,memory_strength,stability,updated_at FROM learner_skill_state WHERE user_id='default' ORDER BY mastery`)
+		rows, err := s.db.Query(`SELECT skill_id,pattern_id,mastery,acquisition,retention,transfer,attempt_count,success_count,failure_count,evidence_count,state_confidence,state,current_difficulty,max_success_difficulty,consecutive_success,consecutive_failure,next_review_at,context_diversity,memory_strength,stability,updated_at FROM learner_skill_state WHERE user_id='default' ORDER BY mastery`)
 		if err != nil {
 			jsonResp(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -704,12 +720,13 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		for rows.Next() {
 			var skill, pattern, updated string
 			var next sql.NullString
-			var mastery, acq, ret, tr, cur, maxd, div, mem, stab float64
-			var attempts, success, failure, css, cf int
-			if rows.Scan(&skill, &pattern, &mastery, &acq, &ret, &tr, &attempts, &success, &failure, &cur, &maxd, &css, &cf, &next, &div, &mem, &stab, &updated) != nil {
+			var mastery, acq, ret, tr, confidence, cur, maxd, div, mem, stab float64
+			var attempts, success, failure, evidence, css, cf int
+			var state string
+			if rows.Scan(&skill, &pattern, &mastery, &acq, &ret, &tr, &attempts, &success, &failure, &evidence, &confidence, &state, &cur, &maxd, &css, &cf, &next, &div, &mem, &stab, &updated) != nil {
 				continue
 			}
-			out = append(out, map[string]any{"skill_id": skill, "pattern_id": pattern, "mastery": mastery, "acquisition": acq, "retention": ret, "transfer": tr, "attempt_count": attempts, "success_count": success, "failure_count": failure, "current_difficulty": cur, "max_success_difficulty": maxd, "consecutive_success": css, "consecutive_failure": cf, "next_review_at": next.String, "context_diversity": div, "memory_strength": mem, "stability": stab, "updated_at": updated})
+			out = append(out, map[string]any{"skill_id": skill, "pattern_id": pattern, "mastery": mastery, "acquisition": acq, "retention": ret, "transfer": tr, "attempt_count": attempts, "success_count": success, "failure_count": failure, "evidence_count": evidence, "state_confidence": confidence, "state": stateFromRow(attempts, success, mastery, state, s.adaptiveConfig()), "current_difficulty": cur, "max_success_difficulty": maxd, "consecutive_success": css, "consecutive_failure": cf, "next_review_at": next.String, "context_diversity": div, "memory_strength": mem, "stability": stab, "updated_at": updated})
 		}
 		jsonResp(w, 200, out)
 	})
@@ -732,6 +749,30 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 			out = append(out, map[string]any{"id": id, "name": name, "description": desc, "level": level, "mastery": mastery, "eligible": mastery >= cfg.MasteryThreshold || level <= 1})
 		}
 		jsonResp(w, 200, out)
+	})
+	mux.HandleFunc("/api/calibration/catalog", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			jsonResp(w, 405, nil)
+			return
+		}
+		report, err := s.curriculumCalibrationReport()
+		if err != nil {
+			jsonResp(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		jsonResp(w, 200, report)
+	})
+	mux.HandleFunc("/api/calibration/report", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			jsonResp(w, 405, nil)
+			return
+		}
+		report, err := s.curriculumCalibrationReport()
+		if err != nil {
+			jsonResp(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		jsonResp(w, 200, report)
 	})
 	mux.HandleFunc("/api/adaptive-config", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
@@ -1702,15 +1743,18 @@ func (s *Server) updateAssessment(e Eval) error {
 func (s *Server) progress() map[string]any {
 	var d float64
 	_ = s.db.QueryRow("SELECT global_difficulty FROM user_profile WHERE id='default'").Scan(&d)
-	rows, _ := s.db.Query(`SELECT p.pattern,COALESCE(ls.mastery,m.mastery,.25),COALESCE(ls.retention,0),COALESCE(ls.transfer,0),COALESCE(ls.next_review_at,''),COALESCE(m.attempts,0) FROM sentence_patterns p LEFT JOIN pattern_mastery m ON m.pattern_id=p.id LEFT JOIN learner_skill_state ls ON ls.pattern_id=p.id AND ls.user_id='default' ORDER BY COALESCE(ls.mastery,m.mastery,.25) LIMIT 10`)
+	rows, _ := s.db.Query(`SELECT p.pattern,COALESCE(ls.mastery,m.mastery,.25),COALESCE(ls.retention,0),COALESCE(ls.transfer,0),COALESCE(ls.next_review_at,''),COALESCE(ls.attempt_count,m.attempts,0),COALESCE(ls.state,'') FROM sentence_patterns p LEFT JOIN pattern_mastery m ON m.pattern_id=p.id LEFT JOIN learner_skill_state ls ON ls.pattern_id=p.id AND ls.user_id='default' WHERE COALESCE(ls.attempt_count,m.attempts,0)>0 ORDER BY COALESCE(ls.mastery,m.mastery,.25) LIMIT 10`)
 	weak := []map[string]any{}
 	if rows != nil {
 		for rows.Next() {
 			var p, next string
 			var m, ret, tr float64
 			var a int
-			_ = rows.Scan(&p, &m, &ret, &tr, &next, &a)
-			weak = append(weak, map[string]any{"pattern": p, "mastery": m, "retention": ret, "transfer": tr, "next_review_at": next, "attempts": a})
+			var state string
+			_ = rows.Scan(&p, &m, &ret, &tr, &next, &a, &state)
+			if stateFromRow(a, 0, m, state, s.adaptiveConfig()) == stateWeak {
+				weak = append(weak, map[string]any{"pattern": p, "mastery": m, "retention": ret, "transfer": tr, "next_review_at": next, "attempts": a, "state": stateWeak})
+			}
 		}
 		rows.Close()
 	}
@@ -1726,5 +1770,6 @@ func (s *Server) progress() map[string]any {
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM learner_skill_state WHERE next_review_at<=?`, time.Now().UTC().Format(time.RFC3339)).Scan(&due)
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM attempts WHERE is_probe=1`).Scan(&probes)
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM attempts a JOIN exercises e ON e.id=a.exercise_id WHERE a.evaluation_status='validated' AND a.normalized_chinese_hash IN (SELECT normalized_chinese_hash FROM attempts WHERE normalized_chinese_hash<>'' GROUP BY normalized_chinese_hash HAVING COUNT(*)>1)`).Scan(&repeated)
-	return map[string]any{"recent_attempts": count, "recent_success_rate": rate, "global_difficulty": d, "weak_patterns": weak, "global_difficulty_trend": d, "due_reviews": due, "probe_count": probes, "exact_repeats": repeated}
+	unknown, weakCount := s.unknownAndWeakCounts()
+	return map[string]any{"recent_attempts": count, "recent_success_rate": rate, "global_difficulty": d, "weak_patterns": weak, "weak_pattern_count": weakCount, "unknown_pattern_count": unknown, "global_difficulty_trend": d, "due_reviews": due, "probe_count": probes, "exact_repeats": repeated}
 }

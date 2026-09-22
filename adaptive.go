@@ -28,6 +28,7 @@ type AdaptiveConfig struct {
 	TargetSuccessMin    float64 `json:"target_success_min"`
 	TargetSuccessMax    float64 `json:"target_success_max"`
 	ProbeRatio          float64 `json:"probe_ratio"`
+	NewSkillRatio       float64 `json:"new_skill_ratio"`
 	WeakSkillThreshold  float64 `json:"weak_skill_threshold"`
 	MasteryThreshold    float64 `json:"mastery_threshold"`
 	RetentionThreshold  float64 `json:"retention_threshold"`
@@ -41,7 +42,7 @@ type AdaptiveConfig struct {
 }
 
 func defaultAdaptiveConfig() AdaptiveConfig {
-	return AdaptiveConfig{CurrentZoneWeight: .40, WeakWeight: .25, ReviewWeight: .15, MaintenanceWeight: .10, ProbeWeight: .10, RecentPatternWindow: 5, MaxPatternRepeats: 2, TargetSuccessMin: .70, TargetSuccessMax: .85, ProbeRatio: .10, WeakSkillThreshold: .55, MasteryThreshold: .75, RetentionThreshold: .65, FailureShortMinutes: 10, FailureRepeatHours: 2, SuccessFirstDays: 1, SuccessTwoDays: 3, SuccessThreeDays: 7, SuccessFiveDays: 14, SuccessLongDays: 30}
+	return AdaptiveConfig{CurrentZoneWeight: .40, WeakWeight: .25, ReviewWeight: .15, MaintenanceWeight: .10, ProbeWeight: .10, RecentPatternWindow: 5, MaxPatternRepeats: 2, TargetSuccessMin: .70, TargetSuccessMax: .85, ProbeRatio: .10, NewSkillRatio: .15, WeakSkillThreshold: .55, MasteryThreshold: .75, RetentionThreshold: .65, FailureShortMinutes: 10, FailureRepeatHours: 2, SuccessFirstDays: 1, SuccessTwoDays: 3, SuccessThreeDays: 7, SuccessFiveDays: 14, SuccessLongDays: 30}
 }
 
 func seedAdaptiveData(db *sql.DB) error {
@@ -80,11 +81,13 @@ func seedAdaptiveData(db *sql.DB) error {
 		}
 	}
 	edges := [][4]any{
-		{"foundations", "daily_life", "next", 1}, {"daily_life", "questions", "next", 1}, {"daily_life", "preferences", "related", .7},
-		{"questions", "polite_request", "next", 1}, {"preferences", "plans", "related", .6}, {"ability", "obligation", "related", .5},
-		{"basic_reason", "because", "next", 1}, {"because", "conditionals", "related", .7}, {"past_tense", "past_perfect", "next", 1},
-		{"plans", "conditionals", "related", .5}, {"conditionals", "professional", "next", .7}, {"professional", "nuance", "next", 1},
-		{"experience", "professional", "related", .5}, {"contrast", "professional", "related", .5},
+		{"foundations", "daily_life", "next", 1}, {"foundations", "preferences", "next", .9}, {"foundations", "ability", "next", .8}, {"foundations", "basic_reason", "next", .8}, {"foundations", "past_tense", "next", .7},
+		{"daily_life", "questions", "next", 1}, {"daily_life", "advice", "next", .7}, {"daily_life", "obligation", "next", .7}, {"daily_life", "preferences", "related", .7},
+		{"questions", "polite_request", "next", 1}, {"preferences", "plans", "next", .8}, {"preferences", "suggestions", "next", .7}, {"ability", "obligation", "related", .5},
+		{"basic_reason", "because", "next", 1}, {"because", "conditionals", "next", .7}, {"past_tense", "past_perfect", "next", 1}, {"past_tense", "experience", "next", .7},
+		{"suggestions", "comparison", "next", .7}, {"comparison", "contrast", "next", .7}, {"conditionals", "perfect_modals", "next", .8}, {"conditionals", "professional", "next", .7},
+		{"experience", "reporting", "next", .6}, {"contrast", "professional", "next", .7}, {"reporting", "passive", "next", .7}, {"polite_request", "polite_refusal", "next", .6},
+		{"professional", "nuance", "next", 1}, {"experience", "professional", "related", .5}, {"contrast", "professional", "related", .5},
 	}
 	for _, e := range edges {
 		if _, err := db.Exec(`INSERT OR IGNORE INTO skill_edges(id,from_skill_id,to_skill_id,relation,weight) VALUES(?,?,?,?,?)`, fmt.Sprintf("%s-%s-%s", e[0], e[1], e[2]), e[0], e[1], e[2], e[3]); err != nil {
@@ -102,7 +105,10 @@ func seedAdaptiveData(db *sql.DB) error {
 		}
 	}
 	for _, p := range patternCatalog() {
-		if _, err := db.Exec(`INSERT OR IGNORE INTO sentence_patterns(id,pattern,intent_id,difficulty) VALUES(?,?,?,?)`, p.id, p.expression, p.intent, p.difficulty); err != nil {
+		if _, err := db.Exec(`INSERT OR IGNORE INTO sentence_patterns(id,pattern,intent_id,difficulty,catalog_difficulty) VALUES(?,?,?,?,?)`, p.id, p.expression, p.intent, p.difficulty, p.difficulty); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`UPDATE sentence_patterns SET catalog_difficulty=difficulty WHERE id=? AND catalog_difficulty=0`, p.id); err != nil {
 			return err
 		}
 		if _, err := db.Exec(`INSERT OR IGNORE INTO pattern_mastery(pattern_id,attempts,correct,recent_accuracy,long_term_accuracy,consecutive_correct,mastery) VALUES(?,0,0,0,0,0,0.25)`, p.id); err != nil {
@@ -113,6 +119,13 @@ func seedAdaptiveData(db *sql.DB) error {
 		}
 		if _, err := db.Exec(`INSERT OR IGNORE INTO pattern_skills(pattern_id,skill_id,weight) VALUES(?,?,1)`, p.id, p.skill); err != nil {
 			return err
+		}
+		if p.id == "because" {
+			// Keep the catalog item visible in both the foundational reason
+			// route and the more specific because family.
+			if _, err := db.Exec(`INSERT OR IGNORE INTO pattern_skills(pattern_id,skill_id,weight) VALUES(?,?,?)`, p.id, "basic_reason", .8); err != nil {
+				return err
+			}
 		}
 	}
 	cfg := defaultAdaptiveConfig()
@@ -129,15 +142,16 @@ func seedAdaptiveData(db *sql.DB) error {
 	type backfill struct {
 		pattern, skill      string
 		mastery, difficulty float64
+		attempts, correct   int
 	}
-	rows, err := db.Query(`SELECT p.id,COALESCE(ps.skill_id,''),COALESCE(m.mastery,.25),COALESCE(p.difficulty,1) FROM sentence_patterns p LEFT JOIN pattern_skills ps ON ps.pattern_id=p.id LEFT JOIN pattern_mastery m ON m.pattern_id=p.id`)
+	rows, err := db.Query(`SELECT p.id,COALESCE(ps.skill_id,''),COALESCE(m.mastery,.25),COALESCE(p.difficulty,1),COALESCE(m.attempts,0),COALESCE(m.correct,0) FROM sentence_patterns p LEFT JOIN pattern_skills ps ON ps.pattern_id=p.id LEFT JOIN pattern_mastery m ON m.pattern_id=p.id`)
 	if err != nil {
 		return err
 	}
 	var pending []backfill
 	for rows.Next() {
 		var x backfill
-		if err := rows.Scan(&x.pattern, &x.skill, &x.mastery, &x.difficulty); err != nil {
+		if err := rows.Scan(&x.pattern, &x.skill, &x.mastery, &x.difficulty, &x.attempts, &x.correct); err != nil {
 			rows.Close()
 			return err
 		}
@@ -147,10 +161,41 @@ func seedAdaptiveData(db *sql.DB) error {
 		return err
 	}
 	for _, x := range pending {
-		if _, err := db.Exec(`INSERT OR IGNORE INTO learner_skill_state(user_id,skill_id,pattern_id,mastery,current_difficulty,max_success_difficulty,updated_at) VALUES('default',?,?,?,?,?,?)`, x.skill, x.pattern, x.mastery, x.difficulty, x.difficulty, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		state, confidence := learnerStateFromEvidence(x.attempts, x.mastery, x.correct, defaultAdaptiveConfig())
+		if _, err := db.Exec(`INSERT OR IGNORE INTO learner_skill_state(user_id,skill_id,pattern_id,mastery,current_difficulty,max_success_difficulty,attempt_count,success_count,evidence_count,state_confidence,state,updated_at) VALUES('default',?,?,?,?,?,?,?,?,?,?,?)`, x.skill, x.pattern, x.mastery, x.difficulty, x.difficulty, x.attempts, x.correct, x.attempts, confidence, state, time.Now().UTC().Format(time.RFC3339)); err != nil {
 			return err
 		}
-		if _, err := db.Exec(`INSERT OR IGNORE INTO difficulty_state(scope,entity_id,difficulty,updated_at) VALUES('pattern',?,?,?)`, x.pattern, x.difficulty, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		if _, err := db.Exec(`INSERT OR IGNORE INTO difficulty_state(scope,entity_id,difficulty,empirical_difficulty,confidence,updated_at) VALUES('pattern',?,?,?,?,?)`, x.pattern, x.difficulty, x.difficulty, minConfidence(x.attempts), time.Now().UTC().Format(time.RFC3339)); err != nil {
+			return err
+		}
+	}
+	// Older V2 databases may already have learner rows but not the calibration
+	// columns. Reclassify from stored evidence without changing any mastery or
+	// attempt history; zero-evidence rows remain UNKNOWN.
+	legacyRows, err := db.Query(`SELECT pattern_id,attempt_count,success_count,mastery,state FROM learner_skill_state WHERE user_id='default'`)
+	if err != nil {
+		return err
+	}
+	type legacyState struct {
+		pattern, stored   string
+		attempts, correct int
+		mastery           float64
+	}
+	var legacy []legacyState
+	for legacyRows.Next() {
+		var x legacyState
+		if err := legacyRows.Scan(&x.pattern, &x.attempts, &x.correct, &x.mastery, &x.stored); err != nil {
+			legacyRows.Close()
+			return err
+		}
+		legacy = append(legacy, x)
+	}
+	if err := legacyRows.Close(); err != nil {
+		return err
+	}
+	for _, x := range legacy {
+		state, confidence := learnerStateFromEvidence(x.attempts, x.mastery, x.correct, defaultAdaptiveConfig())
+		if _, err := db.Exec(`UPDATE learner_skill_state SET evidence_count=?,state_confidence=?,state=? WHERE user_id='default' AND pattern_id=?`, x.attempts, confidence, state, x.pattern); err != nil {
 			return err
 		}
 	}
@@ -207,6 +252,8 @@ func (s *Server) adaptiveConfig() AdaptiveConfig {
 				c.TargetSuccessMax = n
 			case "probe_ratio":
 				c.ProbeRatio = n
+			case "new_skill_ratio":
+				c.NewSkillRatio = n
 			case "weak_skill_threshold":
 				c.WeakSkillThreshold = n
 			case "mastery_threshold":
@@ -232,6 +279,8 @@ func (s *Server) adaptiveConfig() AdaptiveConfig {
 type adaptiveCandidate struct {
 	ID, Pattern, Intent, Skill            string
 	Difficulty, Mastery, Retention, Score float64
+	Attempts, Correct                     int
+	State                                 string
 	Reason                                string
 	Review, Probe, New                    bool
 }
@@ -265,7 +314,7 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 		dr.Close()
 	}
 	lockedSkills := map[string]bool{}
-	pr, _ := s.db.Query(`SELECT e.to_skill_id, COALESCE(MAX(ls.mastery),1) FROM skill_edges e LEFT JOIN pattern_skills ps ON ps.skill_id=e.from_skill_id LEFT JOIN learner_skill_state ls ON ls.pattern_id=ps.pattern_id AND ls.user_id='default' WHERE e.relation='next' GROUP BY e.to_skill_id`)
+	pr, _ := s.db.Query(`SELECT e.to_skill_id, COALESCE(MAX(CASE WHEN ls.attempt_count>0 THEN ls.mastery ELSE 0 END),0) FROM skill_edges e JOIN skills target ON target.id=e.to_skill_id LEFT JOIN pattern_skills ps ON ps.skill_id=e.from_skill_id LEFT JOIN learner_skill_state ls ON ls.pattern_id=ps.pattern_id AND ls.user_id='default' WHERE e.relation='next' AND target.level>2 GROUP BY e.to_skill_id`)
 	if pr != nil {
 		for pr.Next() {
 			var skill string
@@ -276,7 +325,9 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 		}
 		pr.Close()
 	}
-	rows, err := s.db.Query(`SELECT p.id,p.pattern,i.id,COALESCE(ps.skill_id,''),p.difficulty,COALESCE(ls.mastery,COALESCE(pm.mastery,.25)),COALESCE(ls.retention,0),COALESCE(ds.difficulty,p.difficulty) FROM sentence_patterns p JOIN communication_intents i ON i.id=p.intent_id LEFT JOIN pattern_skills ps ON ps.pattern_id=p.id LEFT JOIN learner_skill_state ls ON ls.pattern_id=p.id AND ls.user_id='default' LEFT JOIN pattern_mastery pm ON pm.pattern_id=p.id LEFT JOIN difficulty_state ds ON ds.scope='pattern' AND ds.entity_id=p.id`)
+	var observedPatterns int
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM learner_skill_state WHERE user_id='default' AND attempt_count>0`).Scan(&observedPatterns)
+	rows, err := s.db.Query(`SELECT p.id,p.pattern,i.id,COALESCE(ps.skill_id,''),COALESCE(p.catalog_difficulty,p.difficulty),COALESCE(ls.mastery,COALESCE(pm.mastery,.25)),COALESCE(ls.retention,0),COALESCE(ds.difficulty,COALESCE(p.catalog_difficulty,p.difficulty)),COALESCE(ls.attempt_count,0),COALESCE(ls.success_count,0),COALESCE(ls.state,'') FROM sentence_patterns p JOIN communication_intents i ON i.id=p.intent_id LEFT JOIN (SELECT pattern_id,MIN(skill_id) AS skill_id FROM pattern_skills GROUP BY pattern_id) ps ON ps.pattern_id=p.id LEFT JOIN learner_skill_state ls ON ls.pattern_id=p.id AND ls.user_id='default' LEFT JOIN pattern_mastery pm ON pm.pattern_id=p.id LEFT JOIN difficulty_state ds ON ds.scope='pattern' AND ds.entity_id=p.id`)
 	if err != nil {
 		return adaptiveCandidate{}, err
 	}
@@ -285,11 +336,18 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 	for rows.Next() {
 		var x adaptiveCandidate
 		var entityDifficulty float64
-		if err := rows.Scan(&x.ID, &x.Pattern, &x.Intent, &x.Skill, &x.Difficulty, &x.Mastery, &x.Retention, &entityDifficulty); err != nil {
+		if err := rows.Scan(&x.ID, &x.Pattern, &x.Intent, &x.Skill, &x.Difficulty, &x.Mastery, &x.Retention, &entityDifficulty, &x.Attempts, &x.Correct, &x.State); err != nil {
 			return adaptiveCandidate{}, err
 		}
+		x.State = stateFromRow(x.Attempts, x.Correct, x.Mastery, x.State, cfg)
 		if entityDifficulty > 0 {
 			x.Difficulty = entityDifficulty
+		}
+		if x.Attempts == 0 && mode == "adaptive" && observedPatterns > 0 && diff-x.Difficulty > 1.0 {
+			continue
+		}
+		if x.Attempts == 0 && mode == "adaptive" && diff < 4 && x.Difficulty > diff+1.6 {
+			continue
 		}
 		if len(recent) > 0 && recent[0] == x.ID {
 			continue
@@ -297,8 +355,15 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 		if lockedSkills[x.Skill] && mode != "assessment" && mode != "probe" {
 			continue
 		}
+		if (mode == "weak" || mode == "review") && x.Attempts == 0 {
+			continue
+		}
 		fit := 1 - math.Min(1, math.Abs(x.Difficulty-diff)/4)
 		weak := 1 - x.Mastery
+		if x.Attempts == 0 {
+			weak = 0 // UNKNOWN is not Weak, regardless of its initial mastery prior.
+			x.New = true
+		}
 		urgency := due[x.ID]
 		div := 0.0
 		if len(recent) == 0 || recent[0] != x.ID {
@@ -307,6 +372,9 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 		if mode == "weak" {
 			x.Reason = "weak_skill"
 		}
+		if x.Attempts == 0 && x.Reason == "" {
+			x.Reason = "probe_eligibility"
+		}
 		if mode == "review" && urgency > 0 {
 			x.Reason = "scheduled_review"
 		}
@@ -314,6 +382,15 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 			x.Reason = "current_level"
 		}
 		x.Score = cfg.CurrentZoneWeight*fit + cfg.WeakWeight*weak + cfg.ReviewWeight*urgency + div - 0.25*float64(counts[x.ID])
+		if x.Attempts == 0 {
+			// New curriculum is explored deliberately. A strong learner can
+			// still reach a new high-level pattern, while an unknown low-level
+			// item does not crowd out productive work.
+			x.Score += cfg.ProbeWeight + cfg.NewSkillRatio*3 - .2
+			if diff-x.Difficulty > 1.2 && len(recent) > 0 {
+				x.Score -= .5
+			}
+		}
 		if mode == "review" {
 			x.Score += urgency
 		}
@@ -343,14 +420,13 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 	}
 	chosen := allowed[0]
 	if mode == "assessment" {
-		anchors := assessmentPatternIDs()
 		var index int
 		_ = s.db.QueryRow(`SELECT COUNT(*) FROM attempts WHERE practice_mode='assessment' AND evaluation_status='validated'`).Scan(&index)
-		anchor := anchors[index%len(anchors)]
+		anchor, anchorReason := adaptiveAssessmentAnchor(s.db, index)
 		for _, candidate := range allowed {
 			if candidate.ID == anchor {
 				chosen = candidate
-				chosen.Reason = "assessment_anchor"
+				chosen.Reason = anchorReason
 				break
 			}
 		}
@@ -382,7 +458,7 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 			chosen.Difficulty = .7*chosen.Difficulty + .3*sd
 		}
 	}
-	if chosen.Mastery <= .25 && attempts < 3 {
+	if chosen.Attempts == 0 {
 		chosen.New = true
 		if chosen.Reason == "current_level" {
 			chosen.Reason = "new_skill"
@@ -423,6 +499,29 @@ var adaptiveFallbackVariants = map[string][]string{
 func (s *Server) unusedFallbackVariant(pattern, base string, recent []string) string {
 	baseHash := normalizeChineseHash(base)
 	for _, candidate := range adaptiveFallbackVariants[pattern] {
+		if normalizeChineseHash(candidate) == baseHash {
+			continue
+		}
+		seen := false
+		for _, prompt := range recent {
+			if normalizeChineseHash(prompt) == normalizeChineseHash(candidate) {
+				seen = true
+				break
+			}
+		}
+		if seen {
+			continue
+		}
+		var count int
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM exercises WHERE normalized_chinese_hash=? AND created_at>=?`, normalizeChineseHash(candidate), time.Now().UTC().Add(-30*24*time.Hour).Format(time.RFC3339)).Scan(&count)
+		if count == 0 {
+			return candidate
+		}
+	}
+	var expression string
+	_ = s.db.QueryRow(`SELECT pattern FROM sentence_patterns WHERE id=?`, pattern).Scan(&expression)
+	for _, context := range []string{"早上在咖啡店安排今天的事", "和同事讨论一个工作安排", "为周末出行或家庭事务做计划", "在服务柜台解决一个实际问题", "和朋友讨论一个日常选择"} {
+		candidate := fmt.Sprintf("请在%s中自然表达这个意思，使用句型“%s”。", context, expression)
 		if normalizeChineseHash(candidate) == baseHash {
 			continue
 		}
@@ -496,8 +595,12 @@ func maxInt(a, b int) int {
 }
 
 func (s *Server) generateExercise(ctx context.Context, diff float64, mode, scene string) (map[string]any, error) {
+	ensureCatalogFallbackSeeds()
 	c, err := s.adaptiveSelect(diff, mode, scene)
 	if err != nil {
+		if mode == "weak" || mode == "review" {
+			return nil, err
+		}
 		return s.generateExerciseEmergency(diff, mode, scene)
 	}
 	chosenScene := chooseScene(scene)
@@ -570,7 +673,11 @@ func (s *Server) generateExercise(ctx context.Context, diff float64, mode, scene
 	var same int
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM exercises WHERE normalized_chinese_hash=? AND created_at>=?`, hash, time.Now().UTC().Add(-30*24*time.Hour).Format(time.RFC3339)).Scan(&same)
 	if same > 0 {
-		if pool := adaptiveSeeds[c.ID]; len(pool) > 1 {
+		if variant := s.unusedFallbackVariant(c.ID, seed.Prompt, recent); variant != "" {
+			seed.Prompt = variant
+			hash = normalizeChineseHash(seed.Prompt)
+			generatedBy = "fallback"
+		} else if pool := adaptiveSeeds[c.ID]; len(pool) > 1 {
 			for _, p := range pool {
 				if normalizeChineseHash(p.Prompt) != hash {
 					seed = p
@@ -820,13 +927,27 @@ func updateAdaptiveStateTx(tx *sql.Tx, attempt, pattern, scene string, difficult
 	if _, err = tx.Exec(`INSERT INTO learner_skill_state(user_id,skill_id,pattern_id,mastery,acquisition,retention,transfer,attempt_count,success_count,failure_count,recent_accuracy,long_term_accuracy,current_difficulty,max_success_difficulty,consecutive_success,consecutive_failure,last_seen_at,last_success_at,last_failure_at,next_review_at,scene_coverage,intent_coverage,context_diversity,memory_strength,stability,state_version,updated_at) VALUES('default',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,pattern_id) DO UPDATE SET skill_id=excluded.skill_id,mastery=excluded.mastery,acquisition=excluded.acquisition,retention=excluded.retention,transfer=excluded.transfer,attempt_count=excluded.attempt_count,success_count=excluded.success_count,failure_count=excluded.failure_count,recent_accuracy=excluded.recent_accuracy,long_term_accuracy=excluded.long_term_accuracy,current_difficulty=excluded.current_difficulty,max_success_difficulty=excluded.max_success_difficulty,consecutive_success=excluded.consecutive_success,consecutive_failure=excluded.consecutive_failure,last_seen_at=excluded.last_seen_at,last_success_at=excluded.last_success_at,last_failure_at=excluded.last_failure_at,next_review_at=excluded.next_review_at,scene_coverage=excluded.scene_coverage,intent_coverage=excluded.intent_coverage,context_diversity=excluded.context_diversity,memory_strength=excluded.memory_strength,stability=excluded.stability,state_version=excluded.state_version,updated_at=excluded.updated_at`, skill, pattern, mastery, acq, ret, tr, a, su, fa, score, score, cur, maxd, css, cf, now.Format(time.RFC3339), nullableTime(ok, now), nullableTime(!ok, now), nextAt.Format(time.RFC3339), string(scJSON), string(inJSON), div, mem, stab, 2, now.Format(time.RFC3339)); err != nil {
 		return err
 	}
+	state, confidence := learnerStateFromEvidence(a, mastery, su, defaultAdaptiveConfig())
+	if _, err = tx.Exec(`UPDATE learner_skill_state SET evidence_count=?,state_confidence=?,state=? WHERE user_id='default' AND pattern_id=?`, a, confidence, state, pattern); err != nil {
+		return err
+	}
 	if _, err = tx.Exec(`UPDATE attempts SET intent_id=?,exercise_difficulty=?,practice_mode=?,selection_reason=?,is_review=?,is_probe=?,is_new_skill=?,evaluation_scores_json=?,error_types_json=?,error_severity=?,generated_by=?,normalized_chinese_hash=? WHERE id=?`, intent, difficulty, mode, reason, boolInt(review), boolInt(probe), boolInt(newSkill), mustJSON(map[string]float64{"meaning": e.MeaningScore, "grammar": e.GrammarScore, "naturalness": e.NaturalnessScore, "pattern": e.PatternScore}), mustJSON(errorTypes(e.Errors)), maxErrorSeverity(e.Errors), generatedByFromMeta(tx, attempt), hash, attempt); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(`INSERT INTO review_schedule(id,pattern_id,due_at,priority,reason,last_practiced) VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET due_at=excluded.due_at,priority=excluded.priority,reason=excluded.reason,last_practiced=excluded.last_practiced`, "review_"+pattern, pattern, nextAt.Format(time.RFC3339), 1-mastery, reason, now.Format(time.RFC3339)); err != nil {
 		return err
 	}
-	_, err = tx.Exec(`INSERT INTO difficulty_state(scope,entity_id,difficulty,success_rate,attempts,updated_at) VALUES('pattern',?,?,?,1,?) ON CONFLICT(scope,entity_id) DO UPDATE SET difficulty=excluded.difficulty,success_rate=(difficulty_state.success_rate*difficulty_state.attempts+excluded.success_rate)/(difficulty_state.attempts+1),attempts=difficulty_state.attempts+1,updated_at=excluded.updated_at`, pattern, difficulty, score, now.Format(time.RFC3339))
+	var priorAttempts int
+	_ = tx.QueryRow(`SELECT COALESCE(attempts,0) FROM difficulty_state WHERE scope='pattern' AND entity_id=?`, pattern).Scan(&priorAttempts)
+	catalog := difficulty
+	_ = tx.QueryRow(`SELECT COALESCE(catalog_difficulty,difficulty) FROM sentence_patterns WHERE id=?`, pattern).Scan(&catalog)
+	successRate := 0.0
+	if ok {
+		successRate = 1
+	}
+	observed := empiricalDifficulty(catalog, successRate, score, 1)
+	effective := (catalog*5 + observed*float64(priorAttempts)) / float64(5+priorAttempts)
+	_, err = tx.Exec(`INSERT INTO difficulty_state(scope,entity_id,difficulty,success_rate,attempts,empirical_difficulty,confidence,updated_at) VALUES('pattern',?,?,?,?,?,?,?) ON CONFLICT(scope,entity_id) DO UPDATE SET difficulty=excluded.difficulty,success_rate=(difficulty_state.success_rate*difficulty_state.attempts+excluded.success_rate)/(difficulty_state.attempts+1),attempts=difficulty_state.attempts+1,empirical_difficulty=excluded.empirical_difficulty,confidence=excluded.confidence,updated_at=excluded.updated_at`, pattern, effective, successRate, 1, observed, minConfidence(priorAttempts+1), now.Format(time.RFC3339))
 	if err != nil {
 		return err
 	}
@@ -955,6 +1076,9 @@ func (s *Server) rebuildLearnerState() error {
 		if _, err = tx.Exec(q); err != nil {
 			return err
 		}
+	}
+	if _, err = tx.Exec(`INSERT OR IGNORE INTO learner_skill_state(user_id,skill_id,pattern_id,mastery,current_difficulty,max_success_difficulty,evidence_count,state_confidence,state,updated_at) SELECT 'default',COALESCE(ps.skill_id,''),p.id,.25,COALESCE(p.catalog_difficulty,p.difficulty),COALESCE(p.catalog_difficulty,p.difficulty),0,0,'UNKNOWN',? FROM sentence_patterns p LEFT JOIN pattern_skills ps ON ps.pattern_id=p.id`, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		return err
 	}
 	if _, err = tx.Exec(`UPDATE user_profile SET global_difficulty=3,updated_at=? WHERE id='default'`, time.Now().UTC().Format(time.RFC3339)); err != nil {
 		return err

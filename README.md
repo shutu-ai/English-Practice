@@ -23,9 +23,15 @@ Provider output is normalized into one complete evaluation JSON object. Common w
 
 Practice selection is history-driven. The V2 engine stores learner state, skill graph relationships, acquisition/retention/transfer, pattern and scene difficulty, review schedules, probe flags, and selection reasons in SQLite. Inspection endpoints include `/api/learner-state`, `/api/skill-graph`, and `/api/adaptive-config`; state can be rebuilt with `POST /api/rebuild-learning-state`.
 
+Curriculum calibration is available at `GET /api/calibration/report` (with
+`/api/calibration/catalog` as a catalog-focused alias). The report audits the
+44-pattern catalog, assessment anchors, graph reachability, unknown-versus-weak
+state handling, catalog/empirical difficulty, curriculum exposure, generator
+coverage, and fallback coverage.
+
 ## Pattern curriculum
 
-The built-in catalog contains 44 spoken-English patterns across a gradual difficulty range. It starts with child-friendly foundations such as `I am ...`, `I like ...`, and `Can I ...?`, then moves through daily conversation, school, family, travel, health, shopping, and workplace patterns such as `Would it be possible to ...?` and `I see your point, but ...`, ending with advanced adult patterns such as `Having said that, ...` and `I'm not entirely convinced that ...`. Skill prerequisites and learner performance decide when harder patterns appear; the catalog is data-driven and can be extended without changing the selector.
+The built-in catalog contains 44 spoken-English patterns across a gradual difficulty range. It starts with low-language-difficulty foundations such as `I am ...`, `I like ...`, and `Can I ...?`, then moves through daily conversation and workplace patterns such as `Would it be possible to ...?` and `I see your point, but ...`, ending with advanced adult patterns such as `Having said that, ...` and `I'm not entirely convinced that ...`. Foundation difficulty does not imply child audience: fallback prompts use neutral/adult daily communication by default. Skill prerequisites and learner performance decide when harder patterns appear; the catalog is data-driven and can be extended without changing the selector.
 
 ## Tests
 

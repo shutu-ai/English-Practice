@@ -169,5 +169,9 @@ func catalogIntents() [][2]string {
 }
 
 func assessmentPatternIDs() []string {
-	return []string{"going-to", "modal-possibility", "because", "polite-request", "conditional", "polite-refusal", "past-perfect", "wish-past", "be-basic", "like", "simple-past", "professional-suggestion"}
+	// This is a deliberately non-catalog-order route: stable early anchors
+	// establish a baseline, then probes span daily, intermediate, professional,
+	// and nuance bands. The selector can confirm the boundary without replaying
+	// every one of the 44 patterns.
+	return []string{"going-to", "modal-possibility", "because", "simple-past", "present-perfect", "if-first", "reported-speech", "professional-suggestion", "negotiate", "having-said-that", "formal-opinion", "mixed-conditional"}
 }
