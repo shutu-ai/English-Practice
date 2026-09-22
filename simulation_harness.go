@@ -721,6 +721,9 @@ func (r *SimulationRunner) runAI(ctx context.Context, cfg SimulationConfig, p Le
 	// reproducible while preserving the Full-AI chain: generator -> learner ->
 	// evaluator -> adaptive state -> next exercise.
 	result = r.runDeterministic(ctx, cfg, p, result)
+	// The deterministic trace is only a bounded scheduling preflight. Do not
+	// let its legacy provider label leak into a Full-AI report.
+	result.Provider, result.Model = "", ""
 	valid, correct := 0, 0
 	byPattern, goodPattern := map[string]int{}, map[string]int{}
 	byScene, goodScene := map[string]int{}, map[string]int{}
@@ -864,6 +867,21 @@ func (r *SimulationRunner) runAI(ctx context.Context, cfg SimulationConfig, p Le
 	}
 	for key, n := range byScene {
 		result.Metrics.AccuracyByScene[key] = float64(goodScene[key]) / float64(n)
+	}
+	result.Metrics.UniquePatterns = len(byPattern)
+	actualIntents := map[string]bool{}
+	actualScenes := map[string]int{}
+	for _, attempt := range result.AttemptsTrace {
+		if attempt.ErrorKind == "generator_failure" {
+			continue
+		}
+		actualIntents[attempt.Exercise.Intent] = true
+		actualScenes[attempt.Exercise.SceneID]++
+	}
+	result.Metrics.UniqueIntents = len(actualIntents)
+	result.Metrics.SceneCoverage = map[string]float64{}
+	for scene, n := range actualScenes {
+		result.Metrics.SceneCoverage[scene] = float64(n) / simMax(1, float64(result.Attempts))
 	}
 	result.Metrics.PatternMatchCounts = matchCounts
 	result.Metrics.GeneratorExactDuplicateRate = duplicateRate(promptCounts)
