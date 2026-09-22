@@ -15,11 +15,12 @@ import (
 	"time"
 )
 
-const calibrationVersion = "v2.2-difficulty-stabilization-1"
+const calibrationVersion = "v2.3-adaptive-scenes-1"
 
 var allowedFeedbackTypes = map[string]bool{
 	"too_easy": true, "too_hard": true, "unnatural": true,
 	"evaluation_inaccurate": true, "repetitive": true,
+	"scene_mismatch": true,
 }
 
 type FeedbackRequest struct {
@@ -865,11 +866,12 @@ func (s *Server) recordFeedback(req FeedbackRequest) error {
 		}
 	}
 	if req.ExerciseID != "" {
-		var pattern, scene string
+		var pattern, scene, subscene string
 		var difficulty float64
-		if s.db.QueryRow(`SELECT pattern_id,scene_id,difficulty FROM exercises WHERE id=?`, req.ExerciseID).Scan(&pattern, &scene, &difficulty) == nil {
+		if s.db.QueryRow(`SELECT pattern_id,scene_id,COALESCE(subscene_id,''),difficulty FROM exercises WHERE id=?`, req.ExerciseID).Scan(&pattern, &scene, &subscene, &difficulty) == nil {
 			req.Details["pattern_id"] = pattern
 			req.Details["scene_id"] = scene
+			req.Details["subscene_id"] = subscene
 			req.Details["difficulty"] = difficulty
 		}
 	}

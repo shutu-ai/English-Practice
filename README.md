@@ -68,6 +68,15 @@ Until the protocol has produced 100+ real validated attempts across the
 required sessions and time span, the correct status is `CODE READY,
 REAL-USE DATA PENDING` rather than a real-use PASS.
 
+## Adaptive Scenes V2.3
+
+Scenes are a first-class context constraint on the existing adaptive engine,
+not a separate question bank. The app provides root scenes, subscenes, scene
+mastery/progress, scene-aware practice, cross-scene transfer, scope-relaxation
+traces, scene diagnostics, and scene-filtered history. See
+[`docs/adaptive-scenes.md`](docs/adaptive-scenes.md) for the data model,
+selection behavior, APIs, and known scope.
+
 Pronunciation playback is a local-only browser enhancement documented in
 `docs/pronunciation-playback.md`. It uses native SpeechSynthesis for English
 sentences only and does not affect learning state.

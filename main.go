@@ -21,7 +21,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 7
+const schemaVersion = 8
 
 type Server struct {
 	db     *sql.DB
@@ -291,6 +291,11 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if _, err = db.Exec(`PRAGMA busy_timeout=5000`); err != nil {
+		log.Fatal(err)
+	}
 	if err = migrate(db); err != nil {
 		log.Fatal(err)
 	}
@@ -338,6 +343,10 @@ func migrate(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS feedback (id TEXT PRIMARY KEY, exercise_id TEXT NOT NULL DEFAULT '', attempt_id TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', feedback_type TEXT NOT NULL, details_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS skill_unlock_events (id TEXT PRIMARY KEY, skill_id TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', unlocked_at TEXT NOT NULL, prerequisite_evidence TEXT NOT NULL DEFAULT '{}', prerequisite_mastery REAL NOT NULL DEFAULT 0, retention REAL NOT NULL DEFAULT 0, probe_evidence TEXT NOT NULL DEFAULT '{}', unlock_reason TEXT NOT NULL DEFAULT '')`,
 		`CREATE TABLE IF NOT EXISTS difficulty_validation_events (id TEXT PRIMARY KEY, exercise_id TEXT NOT NULL DEFAULT '', target_difficulty REAL NOT NULL DEFAULT 0, realized_difficulty REAL NOT NULL DEFAULT 0, difficulty_delta REAL NOT NULL DEFAULT 0, status TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', retry_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS scene_pattern_map (scene_id TEXT NOT NULL, pattern_id TEXT NOT NULL, weight REAL NOT NULL DEFAULT 1, PRIMARY KEY(scene_id,pattern_id), FOREIGN KEY(scene_id) REFERENCES scenes(id), FOREIGN KEY(pattern_id) REFERENCES sentence_patterns(id))`,
+		`CREATE TABLE IF NOT EXISTS scene_intent_map (scene_id TEXT NOT NULL, intent_id TEXT NOT NULL, weight REAL NOT NULL DEFAULT 1, PRIMARY KEY(scene_id,intent_id), FOREIGN KEY(scene_id) REFERENCES scenes(id), FOREIGN KEY(intent_id) REFERENCES communication_intents(id))`,
+		`CREATE TABLE IF NOT EXISTS scene_skill_map (scene_id TEXT NOT NULL, skill_id TEXT NOT NULL, weight REAL NOT NULL DEFAULT 1, PRIMARY KEY(scene_id,skill_id), FOREIGN KEY(scene_id) REFERENCES scenes(id), FOREIGN KEY(skill_id) REFERENCES skills(id))`,
+		`CREATE TABLE IF NOT EXISTS scene_transfer_events (id TEXT PRIMARY KEY, pattern_id TEXT NOT NULL, previous_scene_count INTEGER NOT NULL, new_scene_id TEXT NOT NULL, transfer_before REAL NOT NULL, transfer_after REAL NOT NULL, intent_count INTEGER NOT NULL, created_at TEXT NOT NULL)`,
 	}
 	for _, q := range stmts {
 		if _, err := db.Exec(q); err != nil {
@@ -404,6 +413,23 @@ func migrate(db *sql.DB) error {
 		{"sessions", "session_band_upper", "REAL NOT NULL DEFAULT 0"},
 		{"sessions", "session_center_confidence", "REAL NOT NULL DEFAULT 0"},
 		{"sessions", "session_evidence_count", "INTEGER NOT NULL DEFAULT 0"},
+		{"sessions", "scene_id", "TEXT NOT NULL DEFAULT ''"},
+		{"sessions", "subscene_id", "TEXT NOT NULL DEFAULT ''"},
+		{"sessions", "practice_scope", "TEXT NOT NULL DEFAULT 'global'"},
+		{"scenes", "parent_id", "TEXT NOT NULL DEFAULT ''"},
+		{"scenes", "category", "TEXT NOT NULL DEFAULT ''"},
+		{"scenes", "difficulty_min", "REAL NOT NULL DEFAULT 1"},
+		{"scenes", "difficulty_max", "REAL NOT NULL DEFAULT 8"},
+		{"scenes", "enabled", "INTEGER NOT NULL DEFAULT 1"},
+		{"scenes", "sort_order", "INTEGER NOT NULL DEFAULT 0"},
+		{"scene_mastery", "recent_accuracy", "REAL NOT NULL DEFAULT 0"},
+		{"scene_mastery", "effective_difficulty", "REAL NOT NULL DEFAULT 0"},
+		{"scene_mastery", "evidence_count", "INTEGER NOT NULL DEFAULT 0"},
+		{"scene_mastery", "confidence", "REAL NOT NULL DEFAULT 0"},
+		{"scene_mastery", "pattern_coverage", "REAL NOT NULL DEFAULT 0"},
+		{"scene_mastery", "intent_coverage", "REAL NOT NULL DEFAULT 0"},
+		{"scene_mastery", "transfer", "REAL NOT NULL DEFAULT 0"},
+		{"scene_mastery", "state", "TEXT NOT NULL DEFAULT 'UNKNOWN'"},
 	} {
 		if err := ensureColumn(db, c.table, c.name, c.definition); err != nil {
 			return err
@@ -416,6 +442,9 @@ func migrate(db *sql.DB) error {
 		if err := ensureColumn(db, "exercises", c.name, c.definition); err != nil {
 			return err
 		}
+	}
+	if err := ensureColumn(db, "exercises", "subscene_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
 	}
 	if err := ensureColumn(db, "exercises", "decision_trace_json", "TEXT NOT NULL DEFAULT '{}' "); err != nil {
 		return err
@@ -440,6 +469,10 @@ func migrate(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_feedback_session ON feedback(session_id,created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_feedback_pattern ON feedback(exercise_id,created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_unlock_events_skill ON skill_unlock_events(skill_id,unlocked_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_scene_pattern_map_pattern ON scene_pattern_map(pattern_id,scene_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_scene_intent_map_intent ON scene_intent_map(intent_id,scene_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_scenes_parent ON scenes(parent_id,sort_order)`,
+		`CREATE INDEX IF NOT EXISTS idx_scene_transfer_pattern ON scene_transfer_events(pattern_id,created_at DESC)`,
 	} {
 		if _, err := db.Exec(q); err != nil {
 			return err
@@ -561,19 +594,47 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		jsonResp(w, 200, map[string]any{"status": "ok", "schema_version": schemaVersion})
 	})
 	mux.HandleFunc("/api/scenes", func(w http.ResponseWriter, r *http.Request) {
-		rows, err := s.db.Query("SELECT id,name,description FROM scenes ORDER BY name")
+		rows, err := s.db.Query("SELECT id FROM scenes WHERE parent_id='' AND enabled=1 ORDER BY sort_order,name")
 		if err != nil {
 			jsonResp(w, 500, map[string]string{"error": err.Error()})
 			return
 		}
-		defer rows.Close()
-		out := []map[string]string{}
+		var sceneIDs []string
 		for rows.Next() {
-			var a, b, c string
-			_ = rows.Scan(&a, &b, &c)
-			out = append(out, map[string]string{"id": a, "name": b, "description": c})
+			var sceneID string
+			if rows.Scan(&sceneID) == nil {
+				sceneIDs = append(sceneIDs, sceneID)
+			}
+		}
+		rows.Close()
+		out := []map[string]any{}
+		for _, sceneID := range sceneIDs {
+			if detail, detailErr := s.sceneDetail(sceneID); detailErr == nil {
+				out = append(out, detail)
+			}
 		}
 		jsonResp(w, 200, out)
+	})
+	mux.HandleFunc("/api/scenes/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			jsonResp(w, 405, nil)
+			return
+		}
+		parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/scenes/"), "/"), "/")
+		if len(parts) == 0 || parts[0] == "" {
+			jsonResp(w, 400, map[string]string{"error": "scene id is required"})
+			return
+		}
+		detail, err := s.sceneDetail(parts[0])
+		if err != nil {
+			jsonResp(w, 404, map[string]string{"error": "scene not found"})
+			return
+		}
+		if len(parts) == 2 && parts[1] == "progress" {
+			jsonResp(w, 200, map[string]any{"scene_id": parts[0], "progress": detail["mastery"], "subscenes": detail["subscenes"]})
+			return
+		}
+		jsonResp(w, 200, detail)
 	})
 	mux.HandleFunc("/api/patterns", func(w http.ResponseWriter, r *http.Request) {
 		rows, err := s.db.Query(`SELECT p.id,p.pattern,COALESCE(p.catalog_difficulty,p.difficulty),COALESCE(ls.mastery,COALESCE(m.mastery,.25)),COALESCE(ls.attempt_count,COALESCE(m.attempts,0)),COALESCE(ls.state,'UNKNOWN') FROM sentence_patterns p LEFT JOIN pattern_mastery m ON p.id=m.pattern_id LEFT JOIN learner_skill_state ls ON ls.pattern_id=p.id AND ls.user_id='default' ORDER BY p.difficulty`)
@@ -618,9 +679,10 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 	})
 	mux.HandleFunc("/api/practice/next", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Mode      string `json:"mode"`
-			SceneID   string `json:"scene_id"`
-			SessionID string `json:"session_id"`
+			Mode       string `json:"mode"`
+			SceneID    string `json:"scene_id"`
+			SubsceneID string `json:"subscene_id"`
+			SessionID  string `json:"session_id"`
 		}
 		if r.Method == http.MethodPost {
 			_ = decode(r, &req)
@@ -632,7 +694,7 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 				diff = state.Center
 			}
 		}
-		ex, err := s.generateExerciseForSession(r.Context(), diff, req.Mode, req.SceneID, req.SessionID)
+		ex, err := s.generateExerciseForScene(r.Context(), diff, req.Mode, req.SceneID, req.SubsceneID, req.SessionID)
 		if err != nil {
 			jsonResp(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -642,26 +704,37 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 	mux.HandleFunc("/api/sessions", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			var req struct {
-				Mode string `json:"mode"`
+				Mode          string `json:"mode"`
+				SceneID       string `json:"scene_id"`
+				SubsceneID    string `json:"subscene_id"`
+				PracticeScope string `json:"practice_scope"`
 			}
 			_ = decode(r, &req)
 			if req.Mode == "" {
 				req.Mode = "adaptive"
+			}
+			if req.PracticeScope == "" {
+				req.PracticeScope = "global"
+				if req.SubsceneID != "" {
+					req.PracticeScope = "subscene"
+				} else if req.SceneID != "" {
+					req.PracticeScope = "scene"
+				}
 			}
 			session := id("session")
 			var difficulty float64
 			_ = s.db.QueryRow("SELECT global_difficulty FROM user_profile WHERE id='default'").Scan(&difficulty)
 			cfg := difficultyConfig(s.adaptiveConfig())
 			lower, upper := sessionBand(difficulty, cfg)
-			_, err := s.db.Exec("INSERT INTO sessions(id,mode,started_at,start_global_difficulty,end_global_difficulty,session_difficulty_center,session_band_lower,session_band_upper,session_center_confidence,session_evidence_count) VALUES(?,?,?,?,?,?,?,?,?,0)", session, req.Mode, time.Now().UTC().Format(time.RFC3339), difficulty, difficulty, difficulty, lower, upper, 0)
+			_, err := s.db.Exec("INSERT INTO sessions(id,mode,started_at,start_global_difficulty,end_global_difficulty,session_difficulty_center,session_band_lower,session_band_upper,session_center_confidence,session_evidence_count,scene_id,subscene_id,practice_scope) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?)", session, req.Mode, time.Now().UTC().Format(time.RFC3339), difficulty, difficulty, difficulty, lower, upper, 0, req.SceneID, req.SubsceneID, req.PracticeScope)
 			if err != nil {
 				jsonResp(w, 500, map[string]string{"error": err.Error()})
 				return
 			}
-			jsonResp(w, 201, map[string]any{"session_id": session, "mode": req.Mode})
+			jsonResp(w, 201, map[string]any{"session_id": session, "mode": req.Mode, "scene_id": req.SceneID, "subscene_id": req.SubsceneID, "practice_scope": req.PracticeScope})
 			return
 		}
-		rows, err := s.db.Query("SELECT id,mode,started_at,ended_at,attempt_count,start_global_difficulty,end_global_difficulty,patterns_seen,skills_seen,reviews_served,probes_served,new_skills_served,session_difficulty_center,session_band_lower,session_band_upper,session_center_confidence,session_evidence_count FROM sessions ORDER BY started_at DESC LIMIT 50")
+		rows, err := s.db.Query("SELECT id,mode,started_at,ended_at,attempt_count,start_global_difficulty,end_global_difficulty,patterns_seen,skills_seen,reviews_served,probes_served,new_skills_served,session_difficulty_center,session_band_lower,session_band_upper,session_center_confidence,session_evidence_count,scene_id,subscene_id,practice_scope FROM sessions ORDER BY started_at DESC LIMIT 50")
 		if err != nil {
 			jsonResp(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -669,13 +742,13 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		defer rows.Close()
 		out := []map[string]any{}
 		for rows.Next() {
-			var idv, mode, start, patterns, skills string
+			var idv, mode, start, patterns, skills, sceneID, subsceneID, practiceScope string
 			var end sql.NullString
 			var count, reviews, probes, newSkills int
 			var startDifficulty, endDifficulty, center, lower, upper, confidence float64
 			var evidence int
-			_ = rows.Scan(&idv, &mode, &start, &end, &count, &startDifficulty, &endDifficulty, &patterns, &skills, &reviews, &probes, &newSkills, &center, &lower, &upper, &confidence, &evidence)
-			out = append(out, map[string]any{"session_id": idv, "mode": mode, "started_at": start, "ended_at": end.String, "attempt_count": count, "start_global_difficulty": startDifficulty, "end_global_difficulty": endDifficulty, "session_difficulty_center": center, "session_band_lower": lower, "session_band_upper": upper, "session_center_confidence": confidence, "session_evidence_count": evidence, "patterns_seen": decodeJSONMap(patterns), "skills_seen": decodeJSONMap(skills), "reviews_served": reviews, "probes_served": probes, "new_skills_served": newSkills})
+			_ = rows.Scan(&idv, &mode, &start, &end, &count, &startDifficulty, &endDifficulty, &patterns, &skills, &reviews, &probes, &newSkills, &center, &lower, &upper, &confidence, &evidence, &sceneID, &subsceneID, &practiceScope)
+			out = append(out, map[string]any{"session_id": idv, "mode": mode, "started_at": start, "ended_at": end.String, "attempt_count": count, "start_global_difficulty": startDifficulty, "end_global_difficulty": endDifficulty, "session_difficulty_center": center, "session_band_lower": lower, "session_band_upper": upper, "session_center_confidence": confidence, "session_evidence_count": evidence, "scene_id": sceneID, "subscene_id": subsceneID, "practice_scope": practiceScope, "patterns_seen": decodeJSONMap(patterns), "skills_seen": decodeJSONMap(skills), "reviews_served": reviews, "probes_served": probes, "new_skills_served": newSkills})
 		}
 		jsonResp(w, 200, out)
 	})
@@ -746,7 +819,23 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		jsonResp(w, 200, result)
 	})
 	mux.HandleFunc("/api/history", func(w http.ResponseWriter, r *http.Request) {
-		rows, err := s.db.Query(`SELECT a.id,a.submitted_at,e.chinese_prompt,a.user_answer,COALESCE(v.verdict,''),COALESCE(v.suggested_answer,''),COALESCE(v.errors_json,'[]'),e.pattern_id,e.scene_id,a.intent_id,a.exercise_difficulty,COALESCE(NULLIF(a.target_difficulty,0),NULLIF(e.target_difficulty,0),e.difficulty),COALESCE(NULLIF(a.realized_difficulty,0),NULLIF(e.realized_difficulty,0),e.difficulty),COALESCE(NULLIF(a.difficulty_delta,0),ABS(COALESCE(NULLIF(e.realized_difficulty,0),e.difficulty)-COALESCE(NULLIF(e.target_difficulty,0),e.difficulty))),a.selection_reason,a.is_review,a.is_probe,a.generated_by,COALESCE(NULLIF(a.difficulty_validation_status,'unknown'),NULLIF(e.difficulty_validation_status,'unknown'),'unknown') FROM attempts a JOIN exercises e ON e.id=a.exercise_id LEFT JOIN evaluations v ON v.attempt_id=a.id ORDER BY a.submitted_at DESC LIMIT 100`)
+		query := `SELECT a.id,a.submitted_at,e.chinese_prompt,a.user_answer,COALESCE(v.verdict,''),COALESCE(v.suggested_answer,''),COALESCE(v.errors_json,'[]'),e.pattern_id,e.scene_id,COALESCE(e.subscene_id,''),a.intent_id,a.exercise_difficulty,COALESCE(NULLIF(a.target_difficulty,0),NULLIF(e.target_difficulty,0),e.difficulty),COALESCE(NULLIF(a.realized_difficulty,0),NULLIF(e.realized_difficulty,0),e.difficulty),COALESCE(NULLIF(a.difficulty_delta,0),ABS(COALESCE(NULLIF(e.realized_difficulty,0),e.difficulty)-COALESCE(NULLIF(e.target_difficulty,0),e.difficulty))),a.selection_reason,a.is_review,a.is_probe,a.generated_by,COALESCE(NULLIF(a.difficulty_validation_status,'unknown'),NULLIF(e.difficulty_validation_status,'unknown'),'unknown') FROM attempts a JOIN exercises e ON e.id=a.exercise_id LEFT JOIN evaluations v ON v.attempt_id=a.id`
+		args := []any{}
+		if sceneID := r.URL.Query().Get("scene_id"); sceneID != "" {
+			query += " WHERE e.scene_id=?"
+			args = append(args, sceneID)
+		}
+		if subsceneID := r.URL.Query().Get("subscene_id"); subsceneID != "" {
+			if len(args) == 0 {
+				query += " WHERE "
+			} else {
+				query += " AND "
+			}
+			query += "e.subscene_id=?"
+			args = append(args, subsceneID)
+		}
+		query += " ORDER BY a.submitted_at DESC LIMIT 100"
+		rows, err := s.db.Query(query, args...)
 		if err != nil {
 			jsonResp(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -754,13 +843,13 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		defer rows.Close()
 		out := []map[string]any{}
 		for rows.Next() {
-			var a, b, c, d, e, f, g, h, i, intent, reason, generated, validationStatus string
+			var a, b, c, d, e, f, g, h, i, subscene, intent, reason, generated, validationStatus string
 			var difficulty, targetDifficulty, realizedDifficulty, difficultyDelta float64
 			var review, probe int
-			_ = rows.Scan(&a, &b, &c, &d, &e, &f, &g, &h, &i, &intent, &difficulty, &targetDifficulty, &realizedDifficulty, &difficultyDelta, &reason, &review, &probe, &generated, &validationStatus)
+			_ = rows.Scan(&a, &b, &c, &d, &e, &f, &g, &h, &i, &subscene, &intent, &difficulty, &targetDifficulty, &realizedDifficulty, &difficultyDelta, &reason, &review, &probe, &generated, &validationStatus)
 			var er any
 			_ = json.Unmarshal([]byte(g), &er)
-			out = append(out, map[string]any{"id": a, "submitted_at": b, "prompt": c, "answer": d, "verdict": e, "suggested_answer": f, "errors": er, "pattern_id": h, "scene_id": i, "intent_id": intent, "difficulty": difficulty, "target_difficulty": targetDifficulty, "realized_difficulty": realizedDifficulty, "difficulty_delta": difficultyDelta, "difficulty_validation_status": validationStatus, "selection_reason": reason, "is_review": review == 1, "is_probe": probe == 1, "generated_by": generated})
+			out = append(out, map[string]any{"id": a, "submitted_at": b, "prompt": c, "answer": d, "verdict": e, "suggested_answer": f, "errors": er, "pattern_id": h, "scene_id": i, "subscene_id": subscene, "intent_id": intent, "difficulty": difficulty, "target_difficulty": targetDifficulty, "realized_difficulty": realizedDifficulty, "difficulty_delta": difficultyDelta, "difficulty_validation_status": validationStatus, "selection_reason": reason, "is_review": review == 1, "is_probe": probe == 1, "generated_by": generated})
 		}
 		jsonResp(w, 200, out)
 	})
@@ -844,7 +933,23 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 			jsonResp(w, 500, map[string]string{"error": err.Error()})
 			return
 		}
+		report["scene_coverage"] = s.sceneCalibrationReport()
+		if scenes, sceneErr := s.sceneDiagnostics(); sceneErr == nil {
+			report["scene_mastery_distribution"] = scenes
+		}
 		jsonResp(w, 200, report)
+	})
+	mux.HandleFunc("/api/calibration/scenes", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			jsonResp(w, 405, nil)
+			return
+		}
+		out, err := s.sceneDiagnostics()
+		if err != nil {
+			jsonResp(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		jsonResp(w, 200, out)
 	})
 	mux.HandleFunc("/api/calibration/difficulty-trace", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -1078,6 +1183,7 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		}
 		jsonResp(w, 200, cfg)
 	})
+	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	mux.Handle("/", static)
 }
 
@@ -1910,20 +2016,8 @@ func updateMasteryTxMode(tx *sql.Tx, pattern, scene string, difficulty float64, 
 	if _, err := tx.Exec(`INSERT INTO pattern_mastery(pattern_id,attempts,correct,recent_accuracy,long_term_accuracy,consecutive_correct,last_practiced,mastery) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(pattern_id) DO UPDATE SET attempts=excluded.attempts,correct=excluded.correct,recent_accuracy=excluded.recent_accuracy,long_term_accuracy=excluded.long_term_accuracy,consecutive_correct=excluded.consecutive_correct,last_practiced=excluded.last_practiced,mastery=excluded.mastery`, pattern, attempts, correct, recent, long, consec, now, mastery); err != nil {
 		return err
 	}
-	var sa, sc int
-	var sm float64
-	_ = tx.QueryRow("SELECT attempts,correct,mastery FROM scene_mastery WHERE scene_id=?", scene).Scan(&sa, &sc, &sm)
-	sa++
-	if ok {
-		sc++
-	}
-	sm = .7*sm + .3*e.MeaningScore
-	if sa == 1 {
-		sm = e.MeaningScore
-	}
-	if _, err := tx.Exec(`INSERT INTO scene_mastery(scene_id,attempts,correct,mastery,last_practiced) VALUES(?,?,?,?,?) ON CONFLICT(scene_id) DO UPDATE SET attempts=excluded.attempts,correct=excluded.correct,mastery=excluded.mastery,last_practiced=excluded.last_practiced`, scene, sa, sc, sm, now); err != nil {
-		return err
-	}
+	// Scene mastery is maintained by the adaptive scene updater below. Keeping
+	// this legacy pattern updater scene-neutral avoids counting one attempt twice.
 	for _, er := range e.Errors {
 		typ, _ := er["type"].(string)
 		sev, _ := er["severity"].(string)
@@ -2023,5 +2117,6 @@ func (s *Server) progress() map[string]any {
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM attempts WHERE is_probe=1`).Scan(&probes)
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM attempts a JOIN exercises e ON e.id=a.exercise_id WHERE a.evaluation_status='validated' AND a.normalized_chinese_hash IN (SELECT normalized_chinese_hash FROM attempts WHERE normalized_chinese_hash<>'' GROUP BY normalized_chinese_hash HAVING COUNT(*)>1)`).Scan(&repeated)
 	unknown, weakCount := s.unknownAndWeakCounts()
-	return map[string]any{"recent_attempts": count, "recent_success_rate": rate, "global_difficulty": d, "weak_patterns": weak, "weak_pattern_count": weakCount, "unknown_pattern_count": unknown, "global_difficulty_trend": d, "due_reviews": due, "probe_count": probes, "exact_repeats": repeated}
+	scenes, _ := s.sceneDiagnostics()
+	return map[string]any{"recent_attempts": count, "recent_success_rate": rate, "global_difficulty": d, "weak_patterns": weak, "weak_pattern_count": weakCount, "unknown_pattern_count": unknown, "global_difficulty_trend": d, "due_reviews": due, "probe_count": probes, "exact_repeats": repeated, "scene_progress": scenes}
 }

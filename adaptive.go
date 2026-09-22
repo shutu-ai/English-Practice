@@ -226,7 +226,7 @@ func seedAdaptiveData(db *sql.DB) error {
 		}
 	}
 	_, _ = db.Exec(`INSERT OR IGNORE INTO difficulty_state(scope,entity_id,difficulty,success_rate,updated_at) VALUES('global','default',3,.5,?)`, time.Now().UTC().Format(time.RFC3339))
-	return nil
+	return seedSceneHierarchy(db)
 }
 
 func (s *Server) adaptiveConfig() AdaptiveConfig {
@@ -353,11 +353,18 @@ type adaptiveCandidate struct {
 	ReviewTiming                                                             string
 	Review, Probe, New                                                       bool
 	DecisionTrace                                                            map[string]any
+	SceneID, SubsceneID                                                      string
+	ScopeRelaxed                                                             bool
+	RelaxationReason                                                         string
 }
 
 func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandidate, error) {
 	cfg := s.adaptiveConfig()
 	now := time.Now().UTC()
+	constraint, err := s.sceneConstraint(scene)
+	if err != nil {
+		return adaptiveCandidate{}, err
+	}
 	var recent []string
 	rr, _ := s.db.Query(`SELECT e.pattern_id FROM attempts a JOIN exercises e ON e.id=a.exercise_id WHERE a.evaluation_status='validated' ORDER BY a.submitted_at DESC,a.id DESC LIMIT ?`, cfg.RecentPatternWindow)
 	if rr != nil {
@@ -412,6 +419,9 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 		if err := rows.Scan(&x.ID, &x.Pattern, &x.Intent, &x.Skill, &x.CatalogDifficulty, &x.Mastery, &x.Retention, &entityDifficulty, &x.PatternAbility, &x.Attempts, &x.Correct, &x.State); err != nil {
 			return adaptiveCandidate{}, err
 		}
+		if len(constraint.PatternIDs) > 0 && !constraint.PatternIDs[x.ID] {
+			continue
+		}
 		x.Difficulty = x.CatalogDifficulty
 		x.State = stateFromRow(x.Attempts, x.Correct, x.Mastery, x.State, cfg)
 		if entityDifficulty > 0 {
@@ -426,7 +436,7 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 		if len(recent) > 0 && recent[0] == x.ID {
 			continue
 		}
-		if lockedSkills[x.Skill] && mode != "assessment" && mode != "probe" {
+		if lockedSkills[x.Skill] && scene == "" && mode != "assessment" && mode != "probe" {
 			continue
 		}
 		if (mode == "weak" || mode == "review") && x.Attempts == 0 {
@@ -572,6 +582,15 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 			chosen.Reason = "new_skill"
 		}
 	}
+	chosen.SceneID, chosen.SubsceneID = constraint.RootID, constraint.SubsceneID
+	chosen.ScopeRelaxed, chosen.RelaxationReason = constraint.ScopeRelaxed, constraint.RelaxationReason
+	if scene != "" {
+		chosen.DecisionTrace["selected_scene"] = constraint.RootID
+		chosen.DecisionTrace["selected_subscene"] = constraint.SubsceneID
+		chosen.DecisionTrace["scene_constraint"] = scene
+		chosen.DecisionTrace["scope_relaxed"] = constraint.ScopeRelaxed
+		chosen.DecisionTrace["relaxation_reason"] = constraint.RelaxationReason
+	}
 	return chosen, nil
 }
 
@@ -708,6 +727,10 @@ func (s *Server) generateExercise(ctx context.Context, diff float64, mode, scene
 }
 
 func (s *Server) generateExerciseForSession(ctx context.Context, diff float64, mode, scene, sessionID string) (map[string]any, error) {
+	return s.generateExerciseForScene(ctx, diff, mode, scene, "", sessionID)
+}
+
+func (s *Server) generateExerciseForScene(ctx context.Context, diff float64, mode, scene, subscene, sessionID string) (map[string]any, error) {
 	ensureCatalogFallbackSeeds()
 	cfg := difficultyConfig(s.adaptiveConfig())
 	var sessionState sessionDifficultyState
@@ -724,15 +747,45 @@ func (s *Server) generateExerciseForSession(ctx context.Context, diff float64, m
 		sessionState = sessionDifficultyState{ID: sessionID, Center: diff}
 		sessionState.Lower, sessionState.Upper = sessionBand(diff, cfg)
 	}
-	c, err := s.adaptiveSelect(diff, mode, scene)
+	selected := scene
+	if subscene != "" {
+		selected = subscene
+	}
+	c, err := s.adaptiveSelect(diff, mode, selected)
 	if err != nil {
 		if mode == "weak" || mode == "review" {
 			return nil, err
 		}
-		return s.generateExerciseEmergency(diff, mode, scene)
+		// A subscene can be exhausted by recent-repeat and learner-state
+		// gates even when its mapping is valid. Re-run the normal selector at
+		// the parent scene before using emergency recovery, preserving the
+		// requested subscene in the trace.
+		if subscene != "" {
+			if parentCandidate, parentErr := s.adaptiveSelect(diff, mode, scene); parentErr == nil {
+				c = parentCandidate
+				c.SubsceneID = subscene
+				c.ScopeRelaxed = true
+				c.RelaxationReason = "subscene_candidate_shortage_parent_scene"
+				if c.DecisionTrace == nil {
+					c.DecisionTrace = map[string]any{}
+				}
+				c.DecisionTrace["selected_subscene"] = subscene
+				c.DecisionTrace["scope_relaxed"] = true
+				c.DecisionTrace["relaxation_reason"] = c.RelaxationReason
+				err = nil
+			}
+		}
+		if err == nil { /* parent recovery selected a normal candidate */
+		} else {
+			return s.generateExerciseEmergency(diff, mode, scene)
+		}
 	}
-	chosenScene := chooseScene(scene)
-	if scene == "" {
+	chosenScene := c.SceneID
+	chosenSubscene := c.SubsceneID
+	if chosenScene == "" && scene != "" {
+		chosenScene = chooseScene(scene)
+	}
+	if chosenScene == "" {
 		chosenScene = s.adaptiveChooseScene(c.ID)
 	}
 	var recent []string
@@ -801,6 +854,9 @@ func (s *Server) generateExerciseForSession(ctx context.Context, diff float64, m
 			}
 		}
 		seed = pool[start]
+		if chosenScene != "" {
+			seed.Context = sceneContextLabel(s.db, chosenScene, chosenSubscene) + " / " + seed.Context
+		}
 		realized = c.Difficulty
 		if len(pool) > 1 {
 			allSeen := true
@@ -885,13 +941,17 @@ func (s *Server) generateExerciseForSession(ctx context.Context, diff float64, m
 	if generatedBy == "fallback" && validationFailed {
 		validationStatus = "fallback_after_validation_failure"
 	}
-	metaMap := map[string]any{"mode": mode, "selection_reason": c.Reason, "is_review": c.Review, "is_probe": c.Probe, "is_new_skill": c.New, "generated_by": generatedBy, "reference_answers": seed.Answers, "target_difficulty": c.Difficulty, "realized_difficulty": realized, "difficulty_delta": math.Abs(realized - c.Difficulty), "difficulty_validation_status": validationStatus, "difficulty_validation_reason": validationReason, "difficulty_policy_version": cfg.DifficultyPolicyVersion, "normalized_chinese_hash": hash, "recent_contexts": recent, "review_timing": c.ReviewTiming, "decision_trace_version": 2, "decision_trace": c.DecisionTrace}
+	c.DecisionTrace["selected_scene"] = chosenScene
+	c.DecisionTrace["selected_subscene"] = chosenSubscene
+	c.DecisionTrace["scope_relaxed"] = c.ScopeRelaxed
+	c.DecisionTrace["relaxation_reason"] = c.RelaxationReason
+	metaMap := map[string]any{"mode": mode, "selection_reason": c.Reason, "is_review": c.Review, "is_probe": c.Probe, "is_new_skill": c.New, "generated_by": generatedBy, "reference_answers": seed.Answers, "target_difficulty": c.Difficulty, "realized_difficulty": realized, "difficulty_delta": math.Abs(realized - c.Difficulty), "difficulty_validation_status": validationStatus, "difficulty_validation_reason": validationReason, "difficulty_policy_version": cfg.DifficultyPolicyVersion, "normalized_chinese_hash": hash, "recent_contexts": recent, "review_timing": c.ReviewTiming, "scene_id": chosenScene, "subscene_id": chosenSubscene, "scope_relaxed": c.ScopeRelaxed, "relaxation_reason": c.RelaxationReason, "decision_trace_version": 3, "decision_trace": c.DecisionTrace}
 	meta, _ := json.Marshal(metaMap)
 	trace, _ := json.Marshal(c.DecisionTrace)
-	if _, err := s.db.Exec(`INSERT INTO exercises(id,chinese_prompt,pattern_id,scene_id,intent_id,difficulty,target_difficulty,realized_difficulty,difficulty_delta,difficulty_validation_status,difficulty_validation_reason,difficulty_policy_version,metadata_json,created_at,normalized_chinese_hash,generated_by,decision_trace_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, exID, seed.Prompt, c.ID, chosenScene, c.Intent, c.Difficulty, c.Difficulty, realized, math.Abs(realized-c.Difficulty), validationStatus, validationReason, cfg.DifficultyPolicyVersion, string(meta), time.Now().UTC().Format(time.RFC3339), hash, generatedBy, string(trace)); err != nil {
+	if _, err := s.db.Exec(`INSERT INTO exercises(id,chinese_prompt,pattern_id,scene_id,subscene_id,intent_id,difficulty,target_difficulty,realized_difficulty,difficulty_delta,difficulty_validation_status,difficulty_validation_reason,difficulty_policy_version,metadata_json,created_at,normalized_chinese_hash,generated_by,decision_trace_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, exID, seed.Prompt, c.ID, chosenScene, chosenSubscene, c.Intent, c.Difficulty, c.Difficulty, realized, math.Abs(realized-c.Difficulty), validationStatus, validationReason, cfg.DifficultyPolicyVersion, string(meta), time.Now().UTC().Format(time.RFC3339), hash, generatedBy, string(trace)); err != nil {
 		return nil, err
 	}
-	return map[string]any{"exercise_id": exID, "chinese_prompt": seed.Prompt, "target_pattern": c.Pattern, "pattern_id": c.ID, "scene_id": chosenScene, "communication_intent": c.Intent, "difficulty": c.Difficulty, "target_difficulty": c.Difficulty, "realized_difficulty": realized, "difficulty_delta": math.Abs(realized - c.Difficulty), "difficulty_validation_status": validationStatus, "difficulty_validation_reason": validationReason, "difficulty_policy_version": cfg.DifficultyPolicyVersion, "selection_reason": c.Reason, "is_review": c.Review, "is_probe": c.Probe, "is_new_skill": c.New, "generated_by": generatedBy, "reference_answers": seed.Answers, "decision_trace": c.DecisionTrace}, nil
+	return map[string]any{"exercise_id": exID, "chinese_prompt": seed.Prompt, "target_pattern": c.Pattern, "pattern_id": c.ID, "scene_id": chosenScene, "subscene_id": chosenSubscene, "communication_intent": c.Intent, "difficulty": c.Difficulty, "target_difficulty": c.Difficulty, "realized_difficulty": realized, "difficulty_delta": math.Abs(realized - c.Difficulty), "difficulty_validation_status": validationStatus, "difficulty_validation_reason": validationReason, "difficulty_policy_version": cfg.DifficultyPolicyVersion, "selection_reason": c.Reason, "is_review": c.Review, "is_probe": c.Probe, "is_new_skill": c.New, "generated_by": generatedBy, "scope_relaxed": c.ScopeRelaxed, "relaxation_reason": c.RelaxationReason, "reference_answers": seed.Answers, "decision_trace": c.DecisionTrace}, nil
 }
 
 // Emergency selection is used only when the normal candidate query cannot
@@ -958,7 +1018,7 @@ func (s *Server) adaptiveChooseScene(pattern string) string {
 		}
 		r.Close()
 	}
-	rows, _ := s.db.Query(`SELECT id FROM scenes ORDER BY id`)
+	rows, _ := s.db.Query(`SELECT id FROM scenes WHERE parent_id='' AND enabled=1 ORDER BY sort_order,id`)
 	if rows == nil {
 		return "daily"
 	}
@@ -1167,7 +1227,10 @@ func updateAdaptiveStateTx(tx *sql.Tx, attempt, pattern, scene string, difficult
 		return err
 	}
 	_, err = tx.Exec(`INSERT INTO difficulty_state(scope,entity_id,difficulty,success_rate,attempts,updated_at) VALUES('scene',?,?,?,1,?) ON CONFLICT(scope,entity_id) DO UPDATE SET difficulty=excluded.difficulty,success_rate=(difficulty_state.success_rate*difficulty_state.attempts+excluded.success_rate)/(difficulty_state.attempts+1),attempts=difficulty_state.attempts+1,updated_at=excluded.updated_at`, scene, difficulty, score, now.Format(time.RFC3339))
-	return err
+	if err != nil {
+		return err
+	}
+	return updateSceneMasteryTx(tx, pattern, scene, difficulty, e, attempt)
 }
 func parseTime(s string) time.Time { t, _ := time.Parse(time.RFC3339, s); return t }
 func nullableTime(ok bool, t time.Time) any {

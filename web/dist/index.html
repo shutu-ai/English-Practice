@@ -1,16 +1,7 @@
 <!doctype html>
-<html lang="en">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>English Practice AI</title><link rel="icon" href="data:,"><link rel="stylesheet" href="/app.css"></head>
-<body>
-  <div id="app">
-    <header><div class="brand"><b>文</b><strong>English Practice AI<small>Active expression practice</small></strong></div><nav><button data-page="practice" class="active">Practice</button><button data-page="review">Review</button><button data-page="scenes">Scenes</button><button data-page="progress">Progress</button><button data-page="history">History</button><button data-page="settings">Settings</button></nav><i></i></header>
-    <main>
-      <div class="eyebrow">DAILY PRACTICE</div><h1>Turn ideas into natural English.</h1><p class="lede">Write a complete sentence first, then review focused feedback.</p>
-      <section id="practice"><article class="card"><div class="meta"><span>Chinese prompt</span><span id="difficulty"></span></div><h2 id="prompt">Loading…</h2><p id="exercise-status" class="exercise-status loading-state" aria-live="polite">Loading next question<span class="loading-dots">...</span></p><div class="target"><span>Target pattern</span><b id="pattern"></b></div><div class="answer-editor"><textarea id="answer" placeholder="Write a complete English sentence…"></textarea><button id="speak-input" class="speech-button" type="button" aria-label="Read current answer aloud" title="Read current answer aloud" disabled>🔊</button></div><button id="submit">Submit</button></article><article id="feedback" class="card hidden"></article></section>
-      <section id="progress" class="hidden"></section><section id="history" class="hidden"></section><section id="review" class="hidden"></section><section id="scenes" class="hidden"></section>
-      <section id="settings" class="hidden"><div class="panel settings-panel"><h2>LLM Provider</h2><p>Configure OpenAI, OpenAI-Compatible, or Ollama.</p><label>Provider Name<input id="provider-name"></label><label>Provider Type<select id="provider-type"><option value="openai">OpenAI</option><option value="openai-compatible">OpenAI-Compatible</option><option value="ollama">Ollama</option></select></label><label>Base URL<input id="provider-url" placeholder="https://api.openai.com/v1"></label><label>API Key<input id="provider-key" type="password" autocomplete="off"></label><label>Model<input id="provider-model"></label><div class="settings-grid"><label>Timeout<input id="provider-timeout" type="number" value="45"></label><label>Temperature<input id="provider-temperature" type="number" step=".1" value=".2"></label><label>Max Tokens<input id="provider-tokens" type="number" value="800"></label></div><label class="check"><input id="provider-enabled" type="checkbox"> Enabled</label><div class="settings-actions"><button id="provider-test">Test connection</button><button id="provider-save">Save provider</button></div><h2 class="speech-heading">Pronunciation / Speech</h2><p id="speech-support" class="speech-support"></p><label>Voice<select id="speech-voice" disabled><option value="">Auto</option></select></label><label>Speech Rate<select id="speech-rate"><option value="0.8">0.8</option><option value="0.9">0.9</option><option value="1">1.0</option><option value="1.1">1.1</option><option value="1.2">1.2</option></select></label><p id="provider-message"></p></div></section>
-    </main>
-  </div>
-  <script src="/speech.js"></script><script src="/app.js"></script>
-</body>
+<html lang="zh-CN">
+  <head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" /><title>English Practice AI</title>  <script type="module" crossorigin src="/assets/index-BiA5eVL7.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index-G7G7dX4C.css">
+</head>
+  <body><div id="app"></div></body>
 </html>
