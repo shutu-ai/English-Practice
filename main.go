@@ -21,7 +21,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 type Server struct {
 	db     *sql.DB
@@ -275,6 +275,12 @@ func contentString(v any) (string, bool) {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "calibration-report" {
+		if err := runCalibrationReportCLI(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	dataDir := os.Getenv("ENGLISH_PRACTICE_DATA")
 	if dataDir == "" {
 		dataDir = "data"
@@ -313,7 +319,7 @@ func migrate(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS communication_intents (id TEXT PRIMARY KEY, name TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS sentence_patterns (id TEXT PRIMARY KEY, pattern TEXT NOT NULL, intent_id TEXT NOT NULL, difficulty REAL NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}', catalog_difficulty REAL NOT NULL DEFAULT 0, FOREIGN KEY(intent_id) REFERENCES communication_intents(id))`,
 		`CREATE TABLE IF NOT EXISTS exercises (id TEXT PRIMARY KEY, chinese_prompt TEXT NOT NULL, pattern_id TEXT NOT NULL, scene_id TEXT NOT NULL, intent_id TEXT NOT NULL, difficulty REAL NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, FOREIGN KEY(pattern_id) REFERENCES sentence_patterns(id), FOREIGN KEY(scene_id) REFERENCES scenes(id))`,
-		`CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, mode TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT)`,
+		`CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, mode TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, start_global_difficulty REAL NOT NULL DEFAULT 0, end_global_difficulty REAL NOT NULL DEFAULT 0, patterns_seen TEXT NOT NULL DEFAULT '{}', skills_seen TEXT NOT NULL DEFAULT '{}', reviews_served INTEGER NOT NULL DEFAULT 0, probes_served INTEGER NOT NULL DEFAULT 0, new_skills_served INTEGER NOT NULL DEFAULT 0)`,
 		`CREATE TABLE IF NOT EXISTS attempts (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, exercise_id TEXT NOT NULL, user_answer TEXT NOT NULL, submitted_at TEXT NOT NULL, provider TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', prompt_version TEXT NOT NULL DEFAULT '', evaluation_status TEXT NOT NULL, FOREIGN KEY(session_id) REFERENCES sessions(id), FOREIGN KEY(exercise_id) REFERENCES exercises(id))`,
 		`CREATE TABLE IF NOT EXISTS evaluations (id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL UNIQUE, verdict TEXT NOT NULL, meaning_score REAL NOT NULL, grammar_score REAL NOT NULL, naturalness_score REAL NOT NULL, pattern_score REAL NOT NULL, errors_json TEXT NOT NULL, suggested_answer TEXT NOT NULL, explanation_zh TEXT NOT NULL, validated INTEGER NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY(attempt_id) REFERENCES attempts(id))`,
 		`CREATE TABLE IF NOT EXISTS pattern_mastery (pattern_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL, correct INTEGER NOT NULL, recent_accuracy REAL NOT NULL, long_term_accuracy REAL NOT NULL, consecutive_correct INTEGER NOT NULL, last_practiced TEXT, mastery REAL NOT NULL, FOREIGN KEY(pattern_id) REFERENCES sentence_patterns(id))`,
@@ -329,6 +335,8 @@ func migrate(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS learner_skill_state (user_id TEXT NOT NULL, skill_id TEXT NOT NULL DEFAULT '', pattern_id TEXT NOT NULL, mastery REAL NOT NULL DEFAULT 0.25, acquisition REAL NOT NULL DEFAULT 0, retention REAL NOT NULL DEFAULT 0, transfer REAL NOT NULL DEFAULT 0, attempt_count INTEGER NOT NULL DEFAULT 0, success_count INTEGER NOT NULL DEFAULT 0, failure_count INTEGER NOT NULL DEFAULT 0, recent_accuracy REAL NOT NULL DEFAULT 0, long_term_accuracy REAL NOT NULL DEFAULT 0, current_difficulty REAL NOT NULL DEFAULT 1, max_success_difficulty REAL NOT NULL DEFAULT 1, consecutive_success INTEGER NOT NULL DEFAULT 0, consecutive_failure INTEGER NOT NULL DEFAULT 0, last_seen_at TEXT, last_success_at TEXT, last_failure_at TEXT, next_review_at TEXT, scene_coverage TEXT NOT NULL DEFAULT '{}', intent_coverage TEXT NOT NULL DEFAULT '{}', context_diversity REAL NOT NULL DEFAULT 0, memory_strength REAL NOT NULL DEFAULT 0, stability REAL NOT NULL DEFAULT 0, state_version INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL, PRIMARY KEY(user_id,pattern_id))`,
 		`CREATE TABLE IF NOT EXISTS difficulty_state (scope TEXT NOT NULL, entity_id TEXT NOT NULL, difficulty REAL NOT NULL, success_rate REAL NOT NULL DEFAULT 0.5, attempts INTEGER NOT NULL DEFAULT 0, empirical_difficulty REAL NOT NULL DEFAULT 0, confidence REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY(scope,entity_id))`,
 		`CREATE TABLE IF NOT EXISTS adaptive_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS feedback (id TEXT PRIMARY KEY, exercise_id TEXT NOT NULL DEFAULT '', attempt_id TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', feedback_type TEXT NOT NULL, details_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS skill_unlock_events (id TEXT PRIMARY KEY, skill_id TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', unlocked_at TEXT NOT NULL, prerequisite_evidence TEXT NOT NULL DEFAULT '{}', prerequisite_mastery REAL NOT NULL DEFAULT 0, retention REAL NOT NULL DEFAULT 0, probe_evidence TEXT NOT NULL DEFAULT '{}', unlock_reason TEXT NOT NULL DEFAULT '')`,
 	}
 	for _, q := range stmts {
 		if _, err := db.Exec(q); err != nil {
@@ -351,6 +359,12 @@ func migrate(db *sql.DB) error {
 		{"error_severity", "TEXT NOT NULL DEFAULT ''"},
 		{"generated_by", "TEXT NOT NULL DEFAULT 'fallback'"},
 		{"normalized_chinese_hash", "TEXT NOT NULL DEFAULT ''"},
+		{"mastery_before", "REAL NOT NULL DEFAULT 0"},
+		{"mastery_after", "REAL NOT NULL DEFAULT 0"},
+		{"difficulty_before", "REAL NOT NULL DEFAULT 0"},
+		{"difficulty_after", "REAL NOT NULL DEFAULT 0"},
+		{"position", "INTEGER NOT NULL DEFAULT 0"},
+		{"review_timing", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if err := ensureColumn(db, "attempts", c.name, c.definition); err != nil {
 			return err
@@ -363,6 +377,14 @@ func migrate(db *sql.DB) error {
 		{"learner_skill_state", "state", "TEXT NOT NULL DEFAULT 'UNKNOWN'"},
 		{"difficulty_state", "empirical_difficulty", "REAL NOT NULL DEFAULT 0"},
 		{"difficulty_state", "confidence", "REAL NOT NULL DEFAULT 0"},
+		{"sessions", "attempt_count", "INTEGER NOT NULL DEFAULT 0"},
+		{"sessions", "start_global_difficulty", "REAL NOT NULL DEFAULT 0"},
+		{"sessions", "end_global_difficulty", "REAL NOT NULL DEFAULT 0"},
+		{"sessions", "patterns_seen", "TEXT NOT NULL DEFAULT '{}'"},
+		{"sessions", "skills_seen", "TEXT NOT NULL DEFAULT '{}'"},
+		{"sessions", "reviews_served", "INTEGER NOT NULL DEFAULT 0"},
+		{"sessions", "probes_served", "INTEGER NOT NULL DEFAULT 0"},
+		{"sessions", "new_skills_served", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := ensureColumn(db, c.table, c.name, c.definition); err != nil {
 			return err
@@ -376,11 +398,17 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
+	if err := ensureColumn(db, "exercises", "decision_trace_json", "TEXT NOT NULL DEFAULT '{}' "); err != nil {
+		return err
+	}
 	for _, q := range []string{
 		`CREATE INDEX IF NOT EXISTS idx_attempts_submitted ON attempts(submitted_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_attempts_pattern ON attempts(exercise_id,submitted_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_learner_review ON learner_skill_state(next_review_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_exercises_pattern_created ON exercises(pattern_id,created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_feedback_session ON feedback(session_id,created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_feedback_pattern ON feedback(exercise_id,created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_unlock_events_skill ON skill_unlock_events(skill_id,unlocked_at DESC)`,
 	} {
 		if _, err := db.Exec(q); err != nil {
 			return err
@@ -584,7 +612,9 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 				req.Mode = "adaptive"
 			}
 			session := id("session")
-			_, err := s.db.Exec("INSERT INTO sessions(id,mode,started_at) VALUES(?,?,?)", session, req.Mode, time.Now().UTC().Format(time.RFC3339))
+			var difficulty float64
+			_ = s.db.QueryRow("SELECT global_difficulty FROM user_profile WHERE id='default'").Scan(&difficulty)
+			_, err := s.db.Exec("INSERT INTO sessions(id,mode,started_at,start_global_difficulty,end_global_difficulty) VALUES(?,?,?,?,?)", session, req.Mode, time.Now().UTC().Format(time.RFC3339), difficulty, difficulty)
 			if err != nil {
 				jsonResp(w, 500, map[string]string{"error": err.Error()})
 				return
@@ -592,7 +622,7 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 			jsonResp(w, 201, map[string]any{"session_id": session, "mode": req.Mode})
 			return
 		}
-		rows, err := s.db.Query("SELECT id,mode,started_at,ended_at FROM sessions ORDER BY started_at DESC LIMIT 50")
+		rows, err := s.db.Query("SELECT id,mode,started_at,ended_at,attempt_count,start_global_difficulty,end_global_difficulty,patterns_seen,skills_seen,reviews_served,probes_served,new_skills_served FROM sessions ORDER BY started_at DESC LIMIT 50")
 		if err != nil {
 			jsonResp(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -600,10 +630,12 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		defer rows.Close()
 		out := []map[string]any{}
 		for rows.Next() {
-			var idv, mode, start string
+			var idv, mode, start, patterns, skills string
 			var end sql.NullString
-			_ = rows.Scan(&idv, &mode, &start, &end)
-			out = append(out, map[string]any{"session_id": idv, "mode": mode, "started_at": start, "ended_at": end.String})
+			var count, reviews, probes, newSkills int
+			var startDifficulty, endDifficulty float64
+			_ = rows.Scan(&idv, &mode, &start, &end, &count, &startDifficulty, &endDifficulty, &patterns, &skills, &reviews, &probes, &newSkills)
+			out = append(out, map[string]any{"session_id": idv, "mode": mode, "started_at": start, "ended_at": end.String, "attempt_count": count, "start_global_difficulty": startDifficulty, "end_global_difficulty": endDifficulty, "patterns_seen": decodeJSONMap(patterns), "skills_seen": decodeJSONMap(skills), "reviews_served": reviews, "probes_served": probes, "new_skills_served": newSkills})
 		}
 		jsonResp(w, 200, out)
 	})
@@ -767,12 +799,88 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 			jsonResp(w, 405, nil)
 			return
 		}
-		report, err := s.curriculumCalibrationReport()
+		report, err := s.realUseCalibrationReport(r.URL.Query().Get("window"), r.URL.Query().Get("session_id"))
 		if err != nil {
 			jsonResp(w, 500, map[string]string{"error": err.Error()})
 			return
 		}
 		jsonResp(w, 200, report)
+	})
+	mux.HandleFunc("/api/calibration/patterns", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			jsonResp(w, 405, nil)
+			return
+		}
+		patterns, err := s.calibrationPatternDiagnostics(r.URL.Query().Get("window"))
+		if err != nil {
+			jsonResp(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		jsonResp(w, 200, patterns)
+	})
+	mux.HandleFunc("/api/calibration/sessions/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			jsonResp(w, 405, nil)
+			return
+		}
+		sessionID := strings.TrimPrefix(r.URL.Path, "/api/calibration/sessions/")
+		if sessionID == "" {
+			jsonResp(w, 400, map[string]string{"error": "session id is required"})
+			return
+		}
+		report, err := s.calibrationSessionReport(sessionID)
+		if err != nil {
+			status := 500
+			if errors.Is(err, sql.ErrNoRows) {
+				status = 404
+			}
+			jsonResp(w, status, map[string]string{"error": err.Error()})
+			return
+		}
+		jsonResp(w, 200, report)
+	})
+	mux.HandleFunc("/api/calibration/snapshot", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			jsonResp(w, 405, nil)
+			return
+		}
+		snapshot, err := s.calibrationSnapshot(r.URL.Query().Get("window"), r.URL.Query().Get("session_id"), r.URL.Query().Get("debug") == "true")
+		if err != nil {
+			jsonResp(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		jsonResp(w, 200, snapshot)
+	})
+	mux.HandleFunc("/api/calibration/replay", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			jsonResp(w, 405, nil)
+			return
+		}
+		replay, err := s.calibrationReplay(r.URL.Query().Get("window"), r.URL.Query().Get("candidate"))
+		if err != nil {
+			jsonResp(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		jsonResp(w, 200, replay)
+	})
+	mux.HandleFunc("/api/feedback", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			jsonResp(w, 405, nil)
+			return
+		}
+		var req FeedbackRequest
+		if err := decode(r, &req); err != nil {
+			jsonResp(w, 400, map[string]string{"error": "invalid request"})
+			return
+		}
+		if req.ID == "" {
+			req.ID = id("feedback")
+		}
+		if err := s.recordFeedback(req); err != nil {
+			jsonResp(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		jsonResp(w, 201, map[string]any{"ok": true, "feedback_id": req.ID})
 	})
 	mux.HandleFunc("/api/adaptive-config", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
@@ -1324,7 +1432,9 @@ func (s *Server) submitAttempt(ctx context.Context, session, exercise, answer st
 	if session == "" {
 		session = id("session")
 	}
-	_, _ = s.db.Exec("INSERT OR IGNORE INTO sessions(id,mode,started_at) VALUES(?,?,?)", session, "adaptive", time.Now().UTC().Format(time.RFC3339))
+	var sessionDifficulty float64
+	_ = s.db.QueryRow("SELECT global_difficulty FROM user_profile WHERE id='default'").Scan(&sessionDifficulty)
+	_, _ = s.db.Exec("INSERT OR IGNORE INTO sessions(id,mode,started_at,start_global_difficulty,end_global_difficulty) VALUES(?,?,?,?,?)", session, "adaptive", time.Now().UTC().Format(time.RFC3339), sessionDifficulty, sessionDifficulty)
 	var prompt, pattern, scene string
 	var difficulty float64
 	if err := s.db.QueryRow("SELECT chinese_prompt,pattern_id,scene_id,difficulty FROM exercises WHERE id=?", exercise).Scan(&prompt, &pattern, &scene, &difficulty); err != nil {
@@ -1393,6 +1503,9 @@ func (s *Server) saveValidatedAttempt(attempt, prompt, pattern, scene string, di
 	if _, err = tx.Exec(`INSERT INTO evaluations(id,attempt_id,verdict,meaning_score,grammar_score,naturalness_score,pattern_score,errors_json,suggested_answer,explanation_zh,validated,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,1,?)`, id("evaluation"), attempt, eval.Verdict, eval.MeaningScore, eval.GrammarScore, eval.NaturalnessScore, eval.PatternScore, string(errorsJSON), eval.SuggestedAnswer, eval.ExplanationZH, time.Now().UTC().Format(time.RFC3339)); err != nil {
 		return nil, err
 	}
+	var masteryBefore, difficultyBefore float64
+	_ = tx.QueryRow(`SELECT COALESCE(mastery,.25) FROM learner_skill_state WHERE user_id='default' AND pattern_id=?`, pattern).Scan(&masteryBefore)
+	_ = tx.QueryRow(`SELECT global_difficulty FROM user_profile WHERE id='default'`).Scan(&difficultyBefore)
 	_, _, _, isProbe, _, _, _ := adaptiveAttemptMetadata(tx, attempt)
 	if err = updateMasteryTxMode(tx, pattern, scene, difficulty, eval, isProbe); err != nil {
 		return nil, err
@@ -1401,6 +1514,17 @@ func (s *Server) saveValidatedAttempt(attempt, prompt, pattern, scene string, di
 		return nil, err
 	}
 	if err = updateProfileTx(tx, eval, difficulty); err != nil {
+		return nil, err
+	}
+	var masteryAfter, difficultyAfter float64
+	_ = tx.QueryRow(`SELECT COALESCE(mastery,.25) FROM learner_skill_state WHERE user_id='default' AND pattern_id=?`, pattern).Scan(&masteryAfter)
+	_ = tx.QueryRow(`SELECT global_difficulty FROM user_profile WHERE id='default'`).Scan(&difficultyAfter)
+	var position int
+	_ = tx.QueryRow(`SELECT COUNT(*) FROM attempts WHERE session_id=? AND evaluation_status='validated'`, session).Scan(&position)
+	if err = updateSessionObservationTx(tx, session, pattern, eval, isProbe, masteryBefore, masteryAfter, difficultyBefore, difficultyAfter, position); err != nil {
+		return nil, err
+	}
+	if _, err = tx.Exec(`UPDATE attempts SET mastery_before=?,mastery_after=?,difficulty_before=?,difficulty_after=?,position=? WHERE id=?`, masteryBefore, masteryAfter, difficultyBefore, difficultyAfter, position, attempt); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {

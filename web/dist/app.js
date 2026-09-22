@@ -3,6 +3,18 @@ const api = (url, options) => fetch(url, { headers: { 'Content-Type': 'applicati
 let current = null
 let providerId = ''
 let nextLoading = false
+let lastAttemptId = ''
+let sessionId = ''
+
+async function sendFeedback(type) {
+  if (!current || !lastAttemptId) return
+  try {
+    await api('/api/feedback', { method: 'POST', body: JSON.stringify({ exercise_id: current.exercise_id, attempt_id: lastAttemptId, feedback_type: type }) })
+    document.querySelectorAll('[data-feedback]').forEach(button => { button.disabled = true })
+  } catch (error) {
+    console.warn('feedback was not recorded', error)
+  }
+}
 
 function setNextLoading(loading, message = '') {
   nextLoading = loading
@@ -29,6 +41,13 @@ function setNextLoading(loading, message = '') {
   $('#prompt').classList.remove('prompt-loading')
 }
 
+async function ensureSession() {
+  if (sessionId) return sessionId
+  const session = await api('/api/sessions', { method: 'POST', body: JSON.stringify({ mode: 'adaptive' }) })
+  sessionId = session.session_id
+  return sessionId
+}
+
 function renderExercise() {
   if (!current) return
   $('#prompt').textContent = current.chinese_prompt
@@ -42,6 +61,7 @@ async function next() {
   if (nextLoading) return
   setNextLoading(true)
   try {
+    await ensureSession()
     current = await api('/api/practice/next', { method: 'POST', body: JSON.stringify({ mode: 'adaptive' }) })
     renderExercise()
     setNextLoading(false)
@@ -61,7 +81,10 @@ function renderEvaluation(result) {
     return
   }
   const evaluation = result.evaluation
+  lastAttemptId = result.attempt_id || lastAttemptId
   feedback.innerHTML = `<b>${({ correct: 'Correct', mostly_correct: 'Mostly correct', needs_improvement: 'Needs improvement', incorrect: 'Try again' })[evaluation.verdict] || evaluation.verdict}</b><button class="next">Next →</button><p>${evaluation.explanation_zh}</p><p><strong>More natural:</strong> ${evaluation.suggested_answer}</p><div class="score">Meaning <b>${Math.round(evaluation.meaning_score * 100)}%</b></div><div class="score">Grammar <b>${Math.round(evaluation.grammar_score * 100)}%</b></div><div class="score">Naturalness <b>${Math.round(evaluation.naturalness_score * 100)}%</b></div><div class="score">Pattern <b>${Math.round(evaluation.pattern_score * 100)}%</b></div>`
+  feedback.innerHTML += '<div class="user-feedback"><small>Quick signal</small><div><button data-feedback="too_easy">Too easy</button><button data-feedback="too_hard">Too hard</button><button data-feedback="unnatural">Unnatural</button><button data-feedback="evaluation_inaccurate">Evaluation inaccurate</button><button data-feedback="repetitive">Repetitive</button></div></div>'
+  feedback.querySelectorAll('[data-feedback]').forEach(button => { button.onclick = () => sendFeedback(button.dataset.feedback) })
   feedback.querySelector('.next').onclick = next
   feedback.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
@@ -76,7 +99,7 @@ async function submit() {
   feedback.innerHTML = '<p class="loading-state" aria-live="polite">Evaluating<span class="loading-dots">...</span></p>'
   feedback.scrollIntoView({ behavior: 'smooth', block: 'start' })
   try {
-    renderEvaluation(await api('/api/attempts', { method: 'POST', body: JSON.stringify({ exercise_id: current.exercise_id, answer: $('#answer').value }) }))
+    renderEvaluation(await api('/api/attempts', { method: 'POST', body: JSON.stringify({ session_id: sessionId, exercise_id: current.exercise_id, answer: $('#answer').value }) }))
   } catch (error) {
     feedback.innerHTML = `<b>Evaluation failed</b><p>${error.message || 'Please try again.'}</p>`
     feedback.scrollIntoView({ behavior: 'smooth', block: 'start' })

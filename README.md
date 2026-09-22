@@ -37,7 +37,35 @@ The built-in catalog contains 44 spoken-English patterns across a gradual diffic
 
 ```powershell
 go test -mod=mod ./...
+go vet ./...
+go build -mod=mod ./...
 ```
+
+## CI and real-use calibration
+
+Every push and pull request runs the offline Go quality gates in
+`.github/workflows/ci.yml`: tests, vet, and a build with a fixed Go 1.25
+toolchain and module caching. CI never needs an LLM API key or a production
+database. Frontend rebuilds are intentionally not a CI gate because this
+repository does not currently commit an npm lockfile; the checked-in
+`web/dist` bundle remains the serving artifact.
+
+Calibration inspection is on demand so practice latency is unaffected:
+
+```powershell
+go run -mod=mod . calibration-report
+# optional: $env:CALIBRATION_WINDOW='7d'
+```
+
+Use `/api/calibration/report?window=all`, `7d`, `30d`, or
+`current_session&session_id=...`, plus `/api/calibration/patterns`,
+`/api/calibration/sessions/{id}`, and `/api/calibration/snapshot`. Reports
+label small samples as `insufficient_evidence`; code readiness is separate
+from real-use validation. See `docs/real-use-acceptance.md` and
+`docs/calibration-report.md` for the protocol and interpretation.
+Until the protocol has produced 100+ real validated attempts across the
+required sessions and time span, the correct status is `CODE READY,
+REAL-USE DATA PENDING` rather than a real-use PASS.
 
 ## Data and backup
 

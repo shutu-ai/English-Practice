@@ -282,7 +282,9 @@ type adaptiveCandidate struct {
 	Attempts, Correct                     int
 	State                                 string
 	Reason                                string
+	ReviewTiming                          string
 	Review, Probe, New                    bool
+	DecisionTrace                         map[string]float64
 }
 
 func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandidate, error) {
@@ -303,13 +305,16 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 		counts[p]++
 	}
 	due := map[string]float64{}
-	dr, _ := s.db.Query(`SELECT pattern_id,priority FROM review_schedule WHERE due_at<=?`, now.Format(time.RFC3339))
+	dueAt := map[string]string{}
+	dr, _ := s.db.Query(`SELECT pattern_id,priority,due_at FROM review_schedule WHERE due_at<=?`, now.Format(time.RFC3339))
 	if dr != nil {
 		for dr.Next() {
 			var p string
 			var x float64
-			_ = dr.Scan(&p, &x)
+			var at string
+			_ = dr.Scan(&p, &x, &at)
 			due[p] = x
+			dueAt[p] = at
 		}
 		dr.Close()
 	}
@@ -381,12 +386,19 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 		if x.Reason == "" {
 			x.Reason = "current_level"
 		}
-		x.Score = cfg.CurrentZoneWeight*fit + cfg.WeakWeight*weak + cfg.ReviewWeight*urgency + div - 0.25*float64(counts[x.ID])
+		repeatPenalty := 0.25 * float64(counts[x.ID])
+		recencyPenalty := 0.0
+		if len(recent) > 0 && recent[0] == x.ID {
+			recencyPenalty = 1
+		}
+		x.DecisionTrace = map[string]float64{"candidate_score": 0, "review_urgency": urgency, "weakness_score": weak, "difficulty_fit": fit, "recency_penalty": recencyPenalty, "repeat_penalty": repeatPenalty, "diversity_bonus": div, "graph_readiness": 1, "probe_factor": 0}
+		x.Score = cfg.CurrentZoneWeight*fit + cfg.WeakWeight*weak + cfg.ReviewWeight*urgency + div - repeatPenalty
 		if x.Attempts == 0 {
 			// New curriculum is explored deliberately. A strong learner can
 			// still reach a new high-level pattern, while an unknown low-level
 			// item does not crowd out productive work.
 			x.Score += cfg.ProbeWeight + cfg.NewSkillRatio*3 - .2
+			x.DecisionTrace["probe_factor"] = cfg.ProbeWeight + cfg.NewSkillRatio*3 - .2
 			if diff-x.Difficulty > 1.2 && len(recent) > 0 {
 				x.Score -= .5
 			}
@@ -397,6 +409,7 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 		if mode == "weak" {
 			x.Score += weak
 		}
+		x.DecisionTrace["candidate_score"] = x.Score
 		cs = append(cs, x)
 	}
 	rows.Close()
@@ -427,6 +440,7 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 			if candidate.ID == anchor {
 				chosen = candidate
 				chosen.Reason = anchorReason
+				chosen.DecisionTrace["graph_readiness"] = 1
 				break
 			}
 		}
@@ -445,9 +459,17 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 		chosen.Probe = true
 		chosen.Reason = "probe"
 		chosen.Difficulty = clamp(chosen.Difficulty+.4, 1, 8)
+		chosen.DecisionTrace["probe_factor"] += .4
 	}
 	if _, ok := due[chosen.ID]; ok {
 		chosen.Review = true
+		chosenReviewTiming := "overdue"
+		if dueAt[chosen.ID] != "" {
+			if dueTime, parseErr := time.Parse(time.RFC3339, dueAt[chosen.ID]); parseErr == nil && dueTime.After(now.Add(-24*time.Hour)) {
+				chosenReviewTiming = "near_due"
+			}
+		}
+		chosen.ReviewTiming = chosenReviewTiming
 		if chosen.Reason == "current_level" {
 			chosen.Reason = "scheduled_review"
 		}
@@ -693,12 +715,13 @@ func (s *Server) generateExercise(ctx context.Context, diff float64, mode, scene
 		}
 	}
 	exID := id("exercise")
-	metaMap := map[string]any{"mode": mode, "selection_reason": c.Reason, "is_review": c.Review, "is_probe": c.Probe, "is_new_skill": c.New, "generated_by": generatedBy, "reference_answers": seed.Answers, "target_difficulty": c.Difficulty, "normalized_chinese_hash": hash, "recent_contexts": recent}
+	metaMap := map[string]any{"mode": mode, "selection_reason": c.Reason, "is_review": c.Review, "is_probe": c.Probe, "is_new_skill": c.New, "generated_by": generatedBy, "reference_answers": seed.Answers, "target_difficulty": c.Difficulty, "normalized_chinese_hash": hash, "recent_contexts": recent, "review_timing": c.ReviewTiming, "decision_trace_version": 1, "decision_trace": c.DecisionTrace}
 	meta, _ := json.Marshal(metaMap)
-	if _, err := s.db.Exec(`INSERT INTO exercises(id,chinese_prompt,pattern_id,scene_id,intent_id,difficulty,metadata_json,created_at,normalized_chinese_hash,generated_by) VALUES(?,?,?,?,?,?,?,?,?,?)`, exID, seed.Prompt, c.ID, chosenScene, c.Intent, c.Difficulty, string(meta), time.Now().UTC().Format(time.RFC3339), hash, generatedBy); err != nil {
+	trace, _ := json.Marshal(c.DecisionTrace)
+	if _, err := s.db.Exec(`INSERT INTO exercises(id,chinese_prompt,pattern_id,scene_id,intent_id,difficulty,metadata_json,created_at,normalized_chinese_hash,generated_by,decision_trace_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, exID, seed.Prompt, c.ID, chosenScene, c.Intent, c.Difficulty, string(meta), time.Now().UTC().Format(time.RFC3339), hash, generatedBy, string(trace)); err != nil {
 		return nil, err
 	}
-	return map[string]any{"exercise_id": exID, "chinese_prompt": seed.Prompt, "target_pattern": c.Pattern, "pattern_id": c.ID, "scene_id": chosenScene, "communication_intent": c.Intent, "difficulty": c.Difficulty, "selection_reason": c.Reason, "is_review": c.Review, "is_probe": c.Probe, "is_new_skill": c.New, "generated_by": generatedBy, "reference_answers": seed.Answers}, nil
+	return map[string]any{"exercise_id": exID, "chinese_prompt": seed.Prompt, "target_pattern": c.Pattern, "pattern_id": c.ID, "scene_id": chosenScene, "communication_intent": c.Intent, "difficulty": c.Difficulty, "selection_reason": c.Reason, "is_review": c.Review, "is_probe": c.Probe, "is_new_skill": c.New, "generated_by": generatedBy, "reference_answers": seed.Answers, "decision_trace": c.DecisionTrace}, nil
 }
 
 // Emergency selection is used only when the normal candidate query cannot
@@ -828,7 +851,8 @@ func (s *Server) populateAttemptMetadata(attempt string) error {
 	review, _ := m["is_review"].(bool)
 	probe, _ := m["is_probe"].(bool)
 	newSkill, _ := m["is_new_skill"].(bool)
-	_, err := s.db.Exec(`UPDATE attempts SET intent_id=(SELECT intent_id FROM exercises WHERE id=?),exercise_difficulty=(SELECT difficulty FROM exercises WHERE id=?),practice_mode=?,selection_reason=?,is_review=?,is_probe=?,is_new_skill=?,generated_by=?,normalized_chinese_hash=? WHERE id=?`, exercise, exercise, mode, reason, boolInt(review), boolInt(probe), boolInt(newSkill), generated, hash, attempt)
+	reviewTiming, _ := m["review_timing"].(string)
+	_, err := s.db.Exec(`UPDATE attempts SET intent_id=(SELECT intent_id FROM exercises WHERE id=?),exercise_difficulty=(SELECT difficulty FROM exercises WHERE id=?),practice_mode=?,selection_reason=?,is_review=?,is_probe=?,is_new_skill=?,generated_by=?,normalized_chinese_hash=?,review_timing=? WHERE id=?`, exercise, exercise, mode, reason, boolInt(review), boolInt(probe), boolInt(newSkill), generated, hash, reviewTiming, attempt)
 	return err
 }
 

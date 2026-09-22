@@ -1,0 +1,28 @@
+name: core-ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+      - name: Download modules
+        run: go mod download
+      - name: Test
+        run: go test -mod=mod ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Build
+        run: go build -mod=mod ./...
