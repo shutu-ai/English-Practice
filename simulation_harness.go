@@ -329,7 +329,7 @@ func (g LLMExerciseGenerator) Generate(ctx context.Context, ex SimulationExercis
 	if maxTokens <= 0 {
 		maxTokens = 512
 	}
-	system := "Generate one English practice exercise as strict JSON only. Return chinese_prompt, target_pattern, scene, intent, estimated_difficulty, and reference_answers. Keep the requested scene and target pattern. Do not include explanations."
+	system := "Generate one English practice exercise as strict JSON only. Return chinese_prompt, target_pattern, scene, intent, estimated_difficulty, and reference_answers. Keep the requested scene and target pattern exactly. estimated_difficulty MUST be a numeric value from 1 to 8 inclusive and should fit the requested difficulty band. Use the requested intent exactly. Do not include explanations or any text outside the JSON object."
 	user := fmt.Sprintf("Target scene: %s\nTarget subscene: %s\nTarget pattern: %s\nIntent: %s\nDifficulty band: %s", ex.SceneID, ex.SubsceneID, ex.Pattern, ex.Intent, ex.DifficultyBand)
 	resp, err := g.Client.Chat(ctx, ChatRequest{Messages: []ChatMessage{{Role: "system", Content: system}, {Role: "user", Content: user}}, MaxTokens: maxTokens, JSONMode: true})
 	if err != nil {
