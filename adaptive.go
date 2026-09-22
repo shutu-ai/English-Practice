@@ -18,31 +18,57 @@ import (
 )
 
 type AdaptiveConfig struct {
-	CurrentZoneWeight   float64 `json:"current_zone_weight"`
-	WeakWeight          float64 `json:"weak_weight"`
-	ReviewWeight        float64 `json:"review_weight"`
-	MaintenanceWeight   float64 `json:"maintenance_weight"`
-	ProbeWeight         float64 `json:"probe_weight"`
-	RecentPatternWindow int     `json:"recent_pattern_window"`
-	MaxPatternRepeats   int     `json:"max_pattern_repeats"`
-	TargetSuccessMin    float64 `json:"target_success_min"`
-	TargetSuccessMax    float64 `json:"target_success_max"`
-	ProbeRatio          float64 `json:"probe_ratio"`
-	NewSkillRatio       float64 `json:"new_skill_ratio"`
-	WeakSkillThreshold  float64 `json:"weak_skill_threshold"`
-	MasteryThreshold    float64 `json:"mastery_threshold"`
-	RetentionThreshold  float64 `json:"retention_threshold"`
-	FailureShortMinutes int     `json:"failure_short_minutes"`
-	FailureRepeatHours  int     `json:"failure_repeat_hours"`
-	SuccessFirstDays    int     `json:"success_first_days"`
-	SuccessTwoDays      int     `json:"success_two_days"`
-	SuccessThreeDays    int     `json:"success_three_days"`
-	SuccessFiveDays     int     `json:"success_five_days"`
-	SuccessLongDays     int     `json:"success_long_days"`
+	CurrentZoneWeight           float64 `json:"current_zone_weight"`
+	WeakWeight                  float64 `json:"weak_weight"`
+	ReviewWeight                float64 `json:"review_weight"`
+	MaintenanceWeight           float64 `json:"maintenance_weight"`
+	ProbeWeight                 float64 `json:"probe_weight"`
+	RecentPatternWindow         int     `json:"recent_pattern_window"`
+	MaxPatternRepeats           int     `json:"max_pattern_repeats"`
+	TargetSuccessMin            float64 `json:"target_success_min"`
+	TargetSuccessMax            float64 `json:"target_success_max"`
+	ProbeRatio                  float64 `json:"probe_ratio"`
+	NewSkillRatio               float64 `json:"new_skill_ratio"`
+	WeakSkillThreshold          float64 `json:"weak_skill_threshold"`
+	MasteryThreshold            float64 `json:"mastery_threshold"`
+	RetentionThreshold          float64 `json:"retention_threshold"`
+	FailureShortMinutes         int     `json:"failure_short_minutes"`
+	FailureRepeatHours          int     `json:"failure_repeat_hours"`
+	SuccessFirstDays            int     `json:"success_first_days"`
+	SuccessTwoDays              int     `json:"success_two_days"`
+	SuccessThreeDays            int     `json:"success_three_days"`
+	SuccessFiveDays             int     `json:"success_five_days"`
+	SuccessLongDays             int     `json:"success_long_days"`
+	DifficultyPolicyVersion     string  `json:"difficulty_policy_version"`
+	DeadbandLow                 float64 `json:"deadband_low"`
+	DeadbandHigh                float64 `json:"deadband_high"`
+	MaxAbilityStep              float64 `json:"max_ability_step"`
+	MaxSessionCenterStep        float64 `json:"max_session_center_step"`
+	MaxPatternTargetStep        float64 `json:"max_pattern_target_step"`
+	RecentWindowSize            int     `json:"recent_window_size"`
+	EWMAAlpha                   float64 `json:"ewma_alpha"`
+	SessionBandLower            float64 `json:"session_band_lower"`
+	SessionBandUpper            float64 `json:"session_band_upper"`
+	ProbeMinRatio               float64 `json:"probe_min_ratio"`
+	ProbeMaxRatio               float64 `json:"probe_max_ratio"`
+	ProbeDelta                  float64 `json:"probe_delta"`
+	DifficultyMismatchThreshold float64 `json:"difficulty_mismatch_threshold"`
+	MaxGeneratorRetries         int     `json:"max_generator_retries"`
+	MinimumProductiveChallenge  float64 `json:"minimum_productive_challenge"`
 }
 
 func defaultAdaptiveConfig() AdaptiveConfig {
-	return AdaptiveConfig{CurrentZoneWeight: .40, WeakWeight: .25, ReviewWeight: .15, MaintenanceWeight: .10, ProbeWeight: .10, RecentPatternWindow: 5, MaxPatternRepeats: 2, TargetSuccessMin: .70, TargetSuccessMax: .85, ProbeRatio: .10, NewSkillRatio: .15, WeakSkillThreshold: .55, MasteryThreshold: .75, RetentionThreshold: .65, FailureShortMinutes: 10, FailureRepeatHours: 2, SuccessFirstDays: 1, SuccessTwoDays: 3, SuccessThreeDays: 7, SuccessFiveDays: 14, SuccessLongDays: 30}
+	return AdaptiveConfig{
+		CurrentZoneWeight: .40, WeakWeight: .25, ReviewWeight: .15, MaintenanceWeight: .10, ProbeWeight: .10,
+		RecentPatternWindow: 5, MaxPatternRepeats: 2, TargetSuccessMin: .70, TargetSuccessMax: .85, ProbeRatio: .10,
+		NewSkillRatio: .15, WeakSkillThreshold: .55, MasteryThreshold: .75, RetentionThreshold: .65,
+		FailureShortMinutes: 10, FailureRepeatHours: 2, SuccessFirstDays: 1, SuccessTwoDays: 3, SuccessThreeDays: 7,
+		SuccessFiveDays: 14, SuccessLongDays: 30, DifficultyPolicyVersion: difficultyPolicyVersion,
+		DeadbandLow: .70, DeadbandHigh: .85, MaxAbilityStep: .12, MaxSessionCenterStep: .10,
+		MaxPatternTargetStep: .20, RecentWindowSize: 10, EWMAAlpha: .35, SessionBandLower: .45,
+		SessionBandUpper: .45, ProbeMinRatio: .05, ProbeMaxRatio: .15, ProbeDelta: .40,
+		DifficultyMismatchThreshold: .60, MaxGeneratorRetries: 2, MinimumProductiveChallenge: .35,
+	}
 }
 
 func seedAdaptiveData(db *sql.DB) error {
@@ -260,6 +286,41 @@ func (s *Server) adaptiveConfig() AdaptiveConfig {
 				c.MasteryThreshold = n
 			case "retention_threshold":
 				c.RetentionThreshold = n
+			case "deadband_low":
+				c.DeadbandLow = n
+			case "deadband_high":
+				c.DeadbandHigh = n
+			case "max_ability_step":
+				c.MaxAbilityStep = n
+			case "max_session_center_step":
+				c.MaxSessionCenterStep = n
+			case "max_pattern_target_step":
+				c.MaxPatternTargetStep = n
+			case "recent_window_size":
+				c.RecentWindowSize = int(n)
+			case "ewma_alpha":
+				c.EWMAAlpha = n
+			case "session_band_lower":
+				c.SessionBandLower = n
+			case "session_band_upper":
+				c.SessionBandUpper = n
+			case "probe_min_ratio":
+				c.ProbeMinRatio = n
+			case "probe_max_ratio":
+				c.ProbeMaxRatio = n
+			case "probe_delta":
+				c.ProbeDelta = n
+			case "difficulty_mismatch_threshold":
+				c.DifficultyMismatchThreshold = n
+			case "max_generator_retries":
+				c.MaxGeneratorRetries = int(n)
+			case "minimum_productive_challenge":
+				c.MinimumProductiveChallenge = n
+			case "difficulty_policy_version":
+				var version string
+				if json.Unmarshal([]byte(v), &version) == nil && version != "" {
+					c.DifficultyPolicyVersion = version
+				}
 			}
 		} else {
 			var i int
@@ -271,20 +332,27 @@ func (s *Server) adaptiveConfig() AdaptiveConfig {
 					c.MaxPatternRepeats = i
 				}
 			}
+			if k == "difficulty_policy_version" {
+				var version string
+				if json.Unmarshal([]byte(v), &version) == nil && version != "" {
+					c.DifficultyPolicyVersion = version
+				}
+			}
 		}
 	}
 	return c
 }
 
 type adaptiveCandidate struct {
-	ID, Pattern, Intent, Skill            string
-	Difficulty, Mastery, Retention, Score float64
-	Attempts, Correct                     int
-	State                                 string
-	Reason                                string
-	ReviewTiming                          string
-	Review, Probe, New                    bool
-	DecisionTrace                         map[string]float64
+	ID, Pattern, Intent, Skill                                               string
+	Difficulty, CatalogDifficulty, PatternAbility, Mastery, Retention, Score float64
+	LearnerAbility, SessionCenter, TargetDifficulty                          float64
+	Attempts, Correct                                                        int
+	State                                                                    string
+	Reason                                                                   string
+	ReviewTiming                                                             string
+	Review, Probe, New                                                       bool
+	DecisionTrace                                                            map[string]any
 }
 
 func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandidate, error) {
@@ -332,7 +400,7 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 	}
 	var observedPatterns int
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM learner_skill_state WHERE user_id='default' AND attempt_count>0`).Scan(&observedPatterns)
-	rows, err := s.db.Query(`SELECT p.id,p.pattern,i.id,COALESCE(ps.skill_id,''),COALESCE(p.catalog_difficulty,p.difficulty),COALESCE(ls.mastery,COALESCE(pm.mastery,.25)),COALESCE(ls.retention,0),COALESCE(ds.difficulty,COALESCE(p.catalog_difficulty,p.difficulty)),COALESCE(ls.attempt_count,0),COALESCE(ls.success_count,0),COALESCE(ls.state,'') FROM sentence_patterns p JOIN communication_intents i ON i.id=p.intent_id LEFT JOIN (SELECT pattern_id,MIN(skill_id) AS skill_id FROM pattern_skills GROUP BY pattern_id) ps ON ps.pattern_id=p.id LEFT JOIN learner_skill_state ls ON ls.pattern_id=p.id AND ls.user_id='default' LEFT JOIN pattern_mastery pm ON pm.pattern_id=p.id LEFT JOIN difficulty_state ds ON ds.scope='pattern' AND ds.entity_id=p.id`)
+	rows, err := s.db.Query(`SELECT p.id,p.pattern,i.id,COALESCE(ps.skill_id,''),COALESCE(p.catalog_difficulty,p.difficulty),COALESCE(ls.mastery,COALESCE(pm.mastery,.25)),COALESCE(ls.retention,0),COALESCE(ds.difficulty,COALESCE(p.catalog_difficulty,p.difficulty)),COALESCE(ls.current_difficulty,COALESCE(p.catalog_difficulty,p.difficulty)),COALESCE(ls.attempt_count,0),COALESCE(ls.success_count,0),COALESCE(ls.state,'') FROM sentence_patterns p JOIN communication_intents i ON i.id=p.intent_id LEFT JOIN (SELECT pattern_id,MIN(skill_id) AS skill_id FROM pattern_skills GROUP BY pattern_id) ps ON ps.pattern_id=p.id LEFT JOIN learner_skill_state ls ON ls.pattern_id=p.id AND ls.user_id='default' LEFT JOIN pattern_mastery pm ON pm.pattern_id=p.id LEFT JOIN difficulty_state ds ON ds.scope='pattern' AND ds.entity_id=p.id`)
 	if err != nil {
 		return adaptiveCandidate{}, err
 	}
@@ -341,9 +409,10 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 	for rows.Next() {
 		var x adaptiveCandidate
 		var entityDifficulty float64
-		if err := rows.Scan(&x.ID, &x.Pattern, &x.Intent, &x.Skill, &x.Difficulty, &x.Mastery, &x.Retention, &entityDifficulty, &x.Attempts, &x.Correct, &x.State); err != nil {
+		if err := rows.Scan(&x.ID, &x.Pattern, &x.Intent, &x.Skill, &x.CatalogDifficulty, &x.Mastery, &x.Retention, &entityDifficulty, &x.PatternAbility, &x.Attempts, &x.Correct, &x.State); err != nil {
 			return adaptiveCandidate{}, err
 		}
+		x.Difficulty = x.CatalogDifficulty
 		x.State = stateFromRow(x.Attempts, x.Correct, x.Mastery, x.State, cfg)
 		if entityDifficulty > 0 {
 			x.Difficulty = entityDifficulty
@@ -391,7 +460,7 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 		if len(recent) > 0 && recent[0] == x.ID {
 			recencyPenalty = 1
 		}
-		x.DecisionTrace = map[string]float64{"candidate_score": 0, "review_urgency": urgency, "weakness_score": weak, "difficulty_fit": fit, "recency_penalty": recencyPenalty, "repeat_penalty": repeatPenalty, "diversity_bonus": div, "graph_readiness": 1, "probe_factor": 0}
+		x.DecisionTrace = map[string]any{"candidate_score": 0.0, "review_urgency": urgency, "weakness_score": weak, "difficulty_fit": fit, "recency_penalty": recencyPenalty, "repeat_penalty": repeatPenalty, "diversity_bonus": div, "graph_readiness": 1.0, "probe_factor": 0.0}
 		x.Score = cfg.CurrentZoneWeight*fit + cfg.WeakWeight*weak + cfg.ReviewWeight*urgency + div - repeatPenalty
 		if x.Attempts == 0 {
 			// New curriculum is explored deliberately. A strong learner can
@@ -452,14 +521,16 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 			}
 		}
 	}
-	// A small, controlled probe budget explores the upper boundary without changing the policy.
-	var attempts int
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM attempts WHERE evaluation_status='validated'`).Scan(&attempts)
-	if mode != "review" && mode != "assessment" && cfg.ProbeRatio > 0 && attempts > 0 && attempts%int(math.Max(1, math.Round(1/cfg.ProbeRatio))) == 0 {
+	// A bounded, dynamic probe budget explores the upper boundary without
+	// changing the normal session baseline.
+	if mode != "review" && mode != "assessment" && shouldServeProbe(s.db, cfg) {
 		chosen.Probe = true
 		chosen.Reason = "probe"
-		chosen.Difficulty = clamp(chosen.Difficulty+.4, 1, 8)
-		chosen.DecisionTrace["probe_factor"] += .4
+		if factor, ok := chosen.DecisionTrace["probe_factor"].(float64); ok {
+			chosen.DecisionTrace["probe_factor"] = factor + cfg.ProbeDelta
+		} else {
+			chosen.DecisionTrace["probe_factor"] = cfg.ProbeDelta
+		}
 	}
 	if _, ok := due[chosen.ID]; ok {
 		chosen.Review = true
@@ -480,6 +551,21 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 			chosen.Difficulty = .7*chosen.Difficulty + .3*sd
 		}
 	}
+	ability := learnerAbility(s.db)
+	chosen.LearnerAbility = ability
+	chosen.SessionCenter = diff
+	target, adjustment := targetDifficulty(diff, ability, chosen.PatternAbility, chosen.Difficulty, chosen.Reason, chosen.Review, chosen.Probe, chosen.Retention, cfg)
+	chosen.TargetDifficulty = target
+	chosen.Difficulty = target
+	chosen.DecisionTrace["learner_ability"] = ability
+	chosen.DecisionTrace["session_center"] = diff
+	chosen.DecisionTrace["pattern_ability"] = chosen.PatternAbility
+	chosen.DecisionTrace["catalog_pattern_difficulty"] = chosen.CatalogDifficulty
+	chosen.DecisionTrace["target_difficulty"] = target
+	lower, upper := sessionBand(diff, cfg)
+	chosen.DecisionTrace["session_band_lower"] = lower
+	chosen.DecisionTrace["session_band_upper"] = upper
+	chosen.DecisionTrace["difficulty_adjustment_reason"] = adjustment
 	if chosen.Attempts == 0 {
 		chosen.New = true
 		if chosen.Reason == "current_level" {
@@ -572,7 +658,7 @@ func normalizeChineseHash(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(h[:])
 }
-func (s *Server) generateAIExercise(ctx context.Context, c adaptiveCandidate, scene string, recent []string) (exerciseSeed, string) {
+func (s *Server) generateAIExercise(ctx context.Context, c adaptiveCandidate, scene string, recent []string) (exerciseSeed, string, float64) {
 	s.llm.mu.RLock()
 	var pc ProviderConfig
 	for _, x := range s.llm.configs {
@@ -583,13 +669,14 @@ func (s *Server) generateAIExercise(ctx context.Context, c adaptiveCandidate, sc
 	}
 	s.llm.mu.RUnlock()
 	if pc.ID == "" {
-		return exerciseSeed{}, ""
+		return exerciseSeed{}, "", 0
 	}
-	sys := `Generate one English practice exercise as strict JSON only. Fields: chinese_prompt, target_pattern, scene, intent, estimated_difficulty, reference_answers (array of strings). The target pattern and difficulty are constraints. Make a substantially different context from the recent exercises; do not reveal the answer before the learner responds.`
-	user := fmt.Sprintf("pattern=%s skill=%s scene=%s intent=%s target_difficulty=%.1f selection_reason=%s recent=%s", c.Pattern, c.Skill, scene, c.Intent, c.Difficulty, c.Reason, strings.Join(recent, " | "))
+	lower, upper := sessionBand(c.SessionCenter, s.adaptiveConfig())
+	sys := `Generate one English practice exercise as strict JSON only. Fields: chinese_prompt, target_pattern, scene, intent, estimated_difficulty, reference_answers (array of strings). Respect every constraint: target difficulty, allowed difficulty range, sentence length target, grammar complexity, maximum clause count, lexical complexity, scene, pattern, and intent. Do not exceed the specified difficulty band. Make a substantially different context from recent exercises and do not reveal the answer before the learner responds.`
+	user := fmt.Sprintf("pattern=%s skill=%s scene=%s intent=%s target_difficulty=%.1f allowed_difficulty_range=%.1f-%.1f sentence_length_target=%s grammar_complexity=%s max_clause_count=%d lexical_complexity=%s selection_reason=%s recent=%s", c.Pattern, c.Skill, scene, c.Intent, c.Difficulty, lower, upper, difficultySentenceLength(c.Difficulty), difficultyGrammarComplexity(c.Pattern), difficultyMaxClauses(c.Difficulty), difficultyLexicalComplexity(c.Difficulty), c.Reason, strings.Join(recent, " | "))
 	r, err := s.llm.Client(pc).Chat(ctx, ChatRequest{Messages: []ChatMessage{{Role: "system", Content: sys}, {Role: "user", Content: user}}, Temperature: pc.Temperature, MaxTokens: maxInt(pc.MaxTokens, 500), JSONMode: true})
 	if err != nil {
-		return exerciseSeed{}, ""
+		return exerciseSeed{}, "", 0
 	}
 	var out struct {
 		Prompt     string   `json:"chinese_prompt"`
@@ -599,7 +686,7 @@ func (s *Server) generateAIExercise(ctx context.Context, c adaptiveCandidate, sc
 		Answers    []string `json:"reference_answers"`
 	}
 	if json.Unmarshal([]byte(strings.TrimSpace(r.Content)), &out) != nil || strings.TrimSpace(out.Prompt) == "" || out.Pattern == "" {
-		return exerciseSeed{}, ""
+		return exerciseSeed{}, "", 0
 	}
 	if out.Pattern != c.Pattern {
 		out.Pattern = c.Pattern
@@ -607,7 +694,7 @@ func (s *Server) generateAIExercise(ctx context.Context, c adaptiveCandidate, sc
 	if out.Difficulty <= 0 {
 		out.Difficulty = c.Difficulty
 	}
-	return exerciseSeed{Prompt: out.Prompt, Answers: out.Answers}, "provider"
+	return exerciseSeed{Prompt: out.Prompt, Answers: out.Answers}, "provider", out.Difficulty
 }
 func maxInt(a, b int) int {
 	if a > b {
@@ -617,7 +704,26 @@ func maxInt(a, b int) int {
 }
 
 func (s *Server) generateExercise(ctx context.Context, diff float64, mode, scene string) (map[string]any, error) {
+	return s.generateExerciseForSession(ctx, diff, mode, scene, "")
+}
+
+func (s *Server) generateExerciseForSession(ctx context.Context, diff float64, mode, scene, sessionID string) (map[string]any, error) {
 	ensureCatalogFallbackSeeds()
+	cfg := difficultyConfig(s.adaptiveConfig())
+	var sessionState sessionDifficultyState
+	if sessionID != "" {
+		if state, sessionErr := loadSessionDifficulty(s.db, sessionID); sessionErr == nil {
+			sessionState = state
+			diff = state.Center
+		}
+	}
+	if diff <= 0 {
+		diff = learnerAbility(s.db)
+	}
+	if sessionState.Center <= 0 {
+		sessionState = sessionDifficultyState{ID: sessionID, Center: diff}
+		sessionState.Lower, sessionState.Upper = sessionBand(diff, cfg)
+	}
 	c, err := s.adaptiveSelect(diff, mode, scene)
 	if err != nil {
 		if mode == "weak" || mode == "review" {
@@ -639,7 +745,34 @@ func (s *Server) generateExercise(ctx context.Context, diff float64, mode, scene
 			recent = append(recent, p)
 		}
 	}
-	seed, generatedBy := s.generateAIExercise(ctx, c, chosenScene, recent)
+	var seed exerciseSeed
+	var generatedBy string
+	var realized float64
+	validationStatus := "validated"
+	validationReason := "within_configured_difficulty_band"
+	validationFailed := false
+	for retry := 0; retry <= cfg.MaxGeneratorRetries; retry++ {
+		var candidate exerciseSeed
+		var candidateBy string
+		var candidateRealized float64
+		candidate, candidateBy, candidateRealized = s.generateAIExercise(ctx, c, chosenScene, recent)
+		if candidate.Prompt == "" {
+			break
+		}
+		if candidateRealized <= 0 {
+			candidateRealized, _ = validateExerciseHeuristics(candidate.Prompt, c.Pattern, c.Difficulty)
+		}
+		check := validateExerciseDifficulty(c.Difficulty, candidateRealized, cfg)
+		_, features := validateExerciseHeuristics(candidate.Prompt, c.Pattern, c.Difficulty)
+		check.Features = features
+		if !check.Accepted {
+			recordDifficultyValidation(s.db, "", check, retry)
+			validationFailed = true
+			continue
+		}
+		seed, generatedBy, realized = candidate, candidateBy, candidateRealized
+		break
+	}
 	if seed.Prompt == "" {
 		pool := adaptiveSeeds[c.ID]
 		if len(pool) == 0 {
@@ -668,6 +801,7 @@ func (s *Server) generateExercise(ctx context.Context, diff float64, mode, scene
 			}
 		}
 		seed = pool[start]
+		realized = c.Difficulty
 		if len(pool) > 1 {
 			allSeen := true
 			for _, p := range pool {
@@ -690,6 +824,10 @@ func (s *Server) generateExercise(ctx context.Context, diff float64, mode, scene
 			}
 		}
 		generatedBy = "fallback"
+		if validationFailed {
+			validationStatus = "fallback_after_validation_failure"
+			validationReason = "difficulty_validation_failed"
+		}
 	}
 	hash := normalizeChineseHash(seed.Prompt) // exact repeat guard; rotate curated candidates when needed.
 	var same int
@@ -710,18 +848,50 @@ func (s *Server) generateExercise(ctx context.Context, diff float64, mode, scene
 			}
 		} else if generatedBy == "provider" {
 			seed = exerciseSeed{Prompt: "Express this idea in a different natural context.", Context: "dedup fallback"}
+			realized = c.Difficulty
 			hash = normalizeChineseHash(seed.Prompt)
 			generatedBy = "fallback"
 		}
 	}
+	if realized <= 0 {
+		realized = c.Difficulty
+	}
+	check := validateExerciseDifficulty(c.Difficulty, realized, cfg)
+	if !check.Accepted {
+		// Curated fallback prompts inherit the requested target. The failed
+		// provider estimates remain recorded above and are never shown.
+		realized = c.Difficulty
+		check = validateExerciseDifficulty(c.Difficulty, realized, cfg)
+		validationStatus = "fallback_after_validation_failure"
+		validationReason = "difficulty_validation_failed"
+		validationFailed = true
+	}
+	_, difficultyFeatures := validateExerciseHeuristics(seed.Prompt, c.Pattern, c.Difficulty)
+	check.Features = difficultyFeatures
+	if generatedBy == "fallback" && validationStatus == "validated" {
+		validationStatus = "validated_fallback"
+	}
+	if validationFailed {
+		recordDifficultyValidation(s.db, "", difficultyValidation{Target: c.Difficulty, Realized: realized, Delta: math.Abs(realized - c.Difficulty), Accepted: true, Status: validationStatus, Reason: validationReason}, cfg.MaxGeneratorRetries)
+	}
+	c.DecisionTrace["realized_difficulty"] = realized
+	c.DecisionTrace["difficulty_delta"] = math.Abs(realized - c.Difficulty)
+	c.DecisionTrace["difficulty_validation_status"] = validationStatus
+	c.DecisionTrace["difficulty_validation_reason"] = validationReason
+	c.DecisionTrace["difficulty_features"] = difficultyFeatures
+	c.DecisionTrace["difficulty_policy_version"] = cfg.DifficultyPolicyVersion
 	exID := id("exercise")
-	metaMap := map[string]any{"mode": mode, "selection_reason": c.Reason, "is_review": c.Review, "is_probe": c.Probe, "is_new_skill": c.New, "generated_by": generatedBy, "reference_answers": seed.Answers, "target_difficulty": c.Difficulty, "normalized_chinese_hash": hash, "recent_contexts": recent, "review_timing": c.ReviewTiming, "decision_trace_version": 1, "decision_trace": c.DecisionTrace}
+	validationStatus = check.Status
+	if generatedBy == "fallback" && validationFailed {
+		validationStatus = "fallback_after_validation_failure"
+	}
+	metaMap := map[string]any{"mode": mode, "selection_reason": c.Reason, "is_review": c.Review, "is_probe": c.Probe, "is_new_skill": c.New, "generated_by": generatedBy, "reference_answers": seed.Answers, "target_difficulty": c.Difficulty, "realized_difficulty": realized, "difficulty_delta": math.Abs(realized - c.Difficulty), "difficulty_validation_status": validationStatus, "difficulty_validation_reason": validationReason, "difficulty_policy_version": cfg.DifficultyPolicyVersion, "normalized_chinese_hash": hash, "recent_contexts": recent, "review_timing": c.ReviewTiming, "decision_trace_version": 2, "decision_trace": c.DecisionTrace}
 	meta, _ := json.Marshal(metaMap)
 	trace, _ := json.Marshal(c.DecisionTrace)
-	if _, err := s.db.Exec(`INSERT INTO exercises(id,chinese_prompt,pattern_id,scene_id,intent_id,difficulty,metadata_json,created_at,normalized_chinese_hash,generated_by,decision_trace_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, exID, seed.Prompt, c.ID, chosenScene, c.Intent, c.Difficulty, string(meta), time.Now().UTC().Format(time.RFC3339), hash, generatedBy, string(trace)); err != nil {
+	if _, err := s.db.Exec(`INSERT INTO exercises(id,chinese_prompt,pattern_id,scene_id,intent_id,difficulty,target_difficulty,realized_difficulty,difficulty_delta,difficulty_validation_status,difficulty_validation_reason,difficulty_policy_version,metadata_json,created_at,normalized_chinese_hash,generated_by,decision_trace_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, exID, seed.Prompt, c.ID, chosenScene, c.Intent, c.Difficulty, c.Difficulty, realized, math.Abs(realized-c.Difficulty), validationStatus, validationReason, cfg.DifficultyPolicyVersion, string(meta), time.Now().UTC().Format(time.RFC3339), hash, generatedBy, string(trace)); err != nil {
 		return nil, err
 	}
-	return map[string]any{"exercise_id": exID, "chinese_prompt": seed.Prompt, "target_pattern": c.Pattern, "pattern_id": c.ID, "scene_id": chosenScene, "communication_intent": c.Intent, "difficulty": c.Difficulty, "selection_reason": c.Reason, "is_review": c.Review, "is_probe": c.Probe, "is_new_skill": c.New, "generated_by": generatedBy, "reference_answers": seed.Answers, "decision_trace": c.DecisionTrace}, nil
+	return map[string]any{"exercise_id": exID, "chinese_prompt": seed.Prompt, "target_pattern": c.Pattern, "pattern_id": c.ID, "scene_id": chosenScene, "communication_intent": c.Intent, "difficulty": c.Difficulty, "target_difficulty": c.Difficulty, "realized_difficulty": realized, "difficulty_delta": math.Abs(realized - c.Difficulty), "difficulty_validation_status": validationStatus, "difficulty_validation_reason": validationReason, "difficulty_policy_version": cfg.DifficultyPolicyVersion, "selection_reason": c.Reason, "is_review": c.Review, "is_probe": c.Probe, "is_new_skill": c.New, "generated_by": generatedBy, "reference_answers": seed.Answers, "decision_trace": c.DecisionTrace}, nil
 }
 
 // Emergency selection is used only when the normal candidate query cannot
@@ -765,12 +935,15 @@ func (s *Server) generateExerciseEmergency(diff float64, mode, scene string) (ma
 		chosenScene = s.adaptiveChooseScene(chosen.id)
 	}
 	hash := normalizeChineseHash(prompt)
-	meta, _ := json.Marshal(map[string]any{"mode": mode, "selection_reason": "recovery", "generated_by": "fallback", "normalized_chinese_hash": hash})
+	cfg := difficultyConfig(s.adaptiveConfig())
+	lower, upper := sessionBand(diff, cfg)
+	target := clamp(diff, lower, upper)
+	meta, _ := json.Marshal(map[string]any{"mode": mode, "selection_reason": "recovery", "generated_by": "fallback", "normalized_chinese_hash": hash, "target_difficulty": target, "realized_difficulty": target, "difficulty_validation_status": "validated_fallback", "difficulty_policy_version": cfg.DifficultyPolicyVersion, "decision_trace": map[string]any{"learner_ability": learnerAbility(s.db), "session_center": diff, "target_difficulty": target, "realized_difficulty": target, "difficulty_adjustment_reason": "emergency_recovery"}})
 	exID := id("exercise")
-	if _, err = s.db.Exec(`INSERT INTO exercises(id,chinese_prompt,pattern_id,scene_id,intent_id,difficulty,metadata_json,created_at,normalized_chinese_hash,generated_by) VALUES(?,?,?,?,?,?,?,?,?,?)`, exID, prompt, chosen.id, chosenScene, chosen.intent, chosen.difficulty, string(meta), time.Now().UTC().Format(time.RFC3339), hash, "fallback"); err != nil {
+	if _, err = s.db.Exec(`INSERT INTO exercises(id,chinese_prompt,pattern_id,scene_id,intent_id,difficulty,target_difficulty,realized_difficulty,difficulty_delta,difficulty_validation_status,difficulty_validation_reason,difficulty_policy_version,metadata_json,created_at,normalized_chinese_hash,generated_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, exID, prompt, chosen.id, chosenScene, chosen.intent, target, target, target, 0, "validated_fallback", "emergency_recovery", cfg.DifficultyPolicyVersion, string(meta), time.Now().UTC().Format(time.RFC3339), hash, "fallback"); err != nil {
 		return nil, err
 	}
-	return map[string]any{"exercise_id": exID, "chinese_prompt": prompt, "target_pattern": chosen.pattern, "pattern_id": chosen.id, "scene_id": chosenScene, "communication_intent": chosen.intent, "difficulty": chosen.difficulty, "selection_reason": "recovery", "generated_by": "fallback"}, nil
+	return map[string]any{"exercise_id": exID, "chinese_prompt": prompt, "target_pattern": chosen.pattern, "pattern_id": chosen.id, "scene_id": chosenScene, "communication_intent": chosen.intent, "difficulty": target, "target_difficulty": target, "realized_difficulty": target, "difficulty_delta": 0.0, "difficulty_validation_status": "validated_fallback", "difficulty_policy_version": cfg.DifficultyPolicyVersion, "selection_reason": "recovery", "generated_by": "fallback"}, nil
 }
 
 func (s *Server) adaptiveChooseScene(pattern string) string {
@@ -852,7 +1025,16 @@ func (s *Server) populateAttemptMetadata(attempt string) error {
 	probe, _ := m["is_probe"].(bool)
 	newSkill, _ := m["is_new_skill"].(bool)
 	reviewTiming, _ := m["review_timing"].(string)
-	_, err := s.db.Exec(`UPDATE attempts SET intent_id=(SELECT intent_id FROM exercises WHERE id=?),exercise_difficulty=(SELECT difficulty FROM exercises WHERE id=?),practice_mode=?,selection_reason=?,is_review=?,is_probe=?,is_new_skill=?,generated_by=?,normalized_chinese_hash=?,review_timing=? WHERE id=?`, exercise, exercise, mode, reason, boolInt(review), boolInt(probe), boolInt(newSkill), generated, hash, reviewTiming, attempt)
+	validationStatus, _ := m["difficulty_validation_status"].(string)
+	validationReason, _ := m["difficulty_validation_reason"].(string)
+	policyVersion, _ := m["difficulty_policy_version"].(string)
+	var target, realized float64
+	_ = s.db.QueryRow(`SELECT COALESCE(NULLIF(target_difficulty,0),difficulty),COALESCE(NULLIF(realized_difficulty,0),0) FROM exercises WHERE id=?`, exercise).Scan(&target, &realized)
+	delta := 0.0
+	if realized > 0 {
+		delta = math.Abs(realized - target)
+	}
+	_, err := s.db.Exec(`UPDATE attempts SET intent_id=(SELECT intent_id FROM exercises WHERE id=?),exercise_difficulty=(SELECT difficulty FROM exercises WHERE id=?),practice_mode=?,selection_reason=?,is_review=?,is_probe=?,is_new_skill=?,generated_by=?,normalized_chinese_hash=?,review_timing=?,target_difficulty=?,realized_difficulty=?,difficulty_delta=?,difficulty_validation_status=?,difficulty_validation_reason=?,difficulty_policy_version=? WHERE id=?`, exercise, exercise, mode, reason, boolInt(review), boolInt(probe), boolInt(newSkill), generated, hash, reviewTiming, target, realized, delta, validationStatus, validationReason, policyVersion, attempt)
 	return err
 }
 
@@ -915,14 +1097,23 @@ func updateAdaptiveStateTx(tx *sql.Tx, attempt, pattern, scene string, difficult
 	} else {
 		mastery = clamp(.4*acq+.3*ret+.2*tr+.1*math.Min(1, float64(css)/5), 0, 1)
 	}
-	if difficulty > cur {
-		cur = .65*cur + .35*difficulty
+	if cur == 0 {
+		cur = difficulty
+	}
+	// Pattern ability is also deadbanded and bounded. Probe outcomes are
+	// deliberately excluded so an exploratory miss cannot collapse mastery.
+	patternCfg := difficultyConfig(defaultAdaptiveConfig())
+	if !probe && a >= 3 {
+		proposed := cur
+		if acq > patternCfg.DeadbandHigh {
+			proposed = cur + patternCfg.MaxPatternTargetStep
+		} else if acq < patternCfg.DeadbandLow {
+			proposed = cur - patternCfg.MaxPatternTargetStep
+		}
+		cur = patternTargetStep(cur, proposed, patternCfg.MaxPatternTargetStep)
 	}
 	if ok && difficulty > maxd {
 		maxd = difficulty
-	}
-	if cur == 0 {
-		cur = difficulty
 	}
 	mem = clamp(.65*mem+.35*score, 0, 1)
 	if ok {
@@ -1110,15 +1301,15 @@ func (s *Server) rebuildLearnerState() error {
 	if _, err = tx.Exec(`INSERT OR IGNORE INTO difficulty_state(scope,entity_id,difficulty,success_rate,updated_at) VALUES('global','default',3,.5,?)`, time.Now().UTC().Format(time.RFC3339)); err != nil {
 		return err
 	}
-	rows, err := tx.Query(`SELECT a.id,e.pattern_id,e.scene_id,e.difficulty,v.verdict,v.meaning_score,v.grammar_score,v.naturalness_score,v.pattern_score,v.errors_json FROM attempts a JOIN exercises e ON e.id=a.exercise_id JOIN evaluations v ON v.attempt_id=a.id WHERE a.evaluation_status='validated' ORDER BY a.submitted_at,a.id`)
+	rows, err := tx.Query(`SELECT a.id,a.session_id,e.pattern_id,e.scene_id,e.difficulty,v.verdict,v.meaning_score,v.grammar_score,v.naturalness_score,v.pattern_score,v.errors_json FROM attempts a JOIN exercises e ON e.id=a.exercise_id JOIN evaluations v ON v.attempt_id=a.id WHERE a.evaluation_status='validated' ORDER BY a.submitted_at,a.id`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var attempt, pattern, scene, errorsJSON, verdict string
+		var attempt, session, pattern, scene, errorsJSON, verdict string
 		var d, m, g, n, p float64
-		if err := rows.Scan(&attempt, &pattern, &scene, &d, &verdict, &m, &g, &n, &p, &errorsJSON); err != nil {
+		if err := rows.Scan(&attempt, &session, &pattern, &scene, &d, &verdict, &m, &g, &n, &p, &errorsJSON); err != nil {
 			return err
 		}
 		var errorsList []map[string]any
@@ -1131,6 +1322,9 @@ func (s *Server) rebuildLearnerState() error {
 			return err
 		}
 		if err = updateProfileTx(tx, ev, d); err != nil {
+			return err
+		}
+		if _, _, err = updateSessionCenterTx(tx, session, difficultyConfig(defaultAdaptiveConfig())); err != nil {
 			return err
 		}
 	}

@@ -21,7 +21,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 6
+const schemaVersion = 7
 
 type Server struct {
 	db     *sql.DB
@@ -337,6 +337,7 @@ func migrate(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS adaptive_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS feedback (id TEXT PRIMARY KEY, exercise_id TEXT NOT NULL DEFAULT '', attempt_id TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', feedback_type TEXT NOT NULL, details_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS skill_unlock_events (id TEXT PRIMARY KEY, skill_id TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', unlocked_at TEXT NOT NULL, prerequisite_evidence TEXT NOT NULL DEFAULT '{}', prerequisite_mastery REAL NOT NULL DEFAULT 0, retention REAL NOT NULL DEFAULT 0, probe_evidence TEXT NOT NULL DEFAULT '{}', unlock_reason TEXT NOT NULL DEFAULT '')`,
+		`CREATE TABLE IF NOT EXISTS difficulty_validation_events (id TEXT PRIMARY KEY, exercise_id TEXT NOT NULL DEFAULT '', target_difficulty REAL NOT NULL DEFAULT 0, realized_difficulty REAL NOT NULL DEFAULT 0, difficulty_delta REAL NOT NULL DEFAULT 0, status TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', retry_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)`,
 	}
 	for _, q := range stmts {
 		if _, err := db.Exec(q); err != nil {
@@ -365,6 +366,16 @@ func migrate(db *sql.DB) error {
 		{"difficulty_after", "REAL NOT NULL DEFAULT 0"},
 		{"position", "INTEGER NOT NULL DEFAULT 0"},
 		{"review_timing", "TEXT NOT NULL DEFAULT ''"},
+		{"learner_ability", "REAL NOT NULL DEFAULT 0"},
+		{"session_center", "REAL NOT NULL DEFAULT 0"},
+		{"pattern_ability", "REAL NOT NULL DEFAULT 0"},
+		{"target_difficulty", "REAL NOT NULL DEFAULT 0"},
+		{"realized_difficulty", "REAL NOT NULL DEFAULT 0"},
+		{"difficulty_delta", "REAL NOT NULL DEFAULT 0"},
+		{"difficulty_validation_status", "TEXT NOT NULL DEFAULT 'unknown'"},
+		{"difficulty_validation_reason", "TEXT NOT NULL DEFAULT ''"},
+		{"difficulty_policy_version", "TEXT NOT NULL DEFAULT ''"},
+		{"perceived_difficulty_signal", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if err := ensureColumn(db, "attempts", c.name, c.definition); err != nil {
 			return err
@@ -388,6 +399,11 @@ func migrate(db *sql.DB) error {
 		{"sessions", "reviews_served", "INTEGER NOT NULL DEFAULT 0"},
 		{"sessions", "probes_served", "INTEGER NOT NULL DEFAULT 0"},
 		{"sessions", "new_skills_served", "INTEGER NOT NULL DEFAULT 0"},
+		{"sessions", "session_difficulty_center", "REAL NOT NULL DEFAULT 0"},
+		{"sessions", "session_band_lower", "REAL NOT NULL DEFAULT 0"},
+		{"sessions", "session_band_upper", "REAL NOT NULL DEFAULT 0"},
+		{"sessions", "session_center_confidence", "REAL NOT NULL DEFAULT 0"},
+		{"sessions", "session_evidence_count", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := ensureColumn(db, c.table, c.name, c.definition); err != nil {
 			return err
@@ -403,6 +419,18 @@ func migrate(db *sql.DB) error {
 	}
 	if err := ensureColumn(db, "exercises", "decision_trace_json", "TEXT NOT NULL DEFAULT '{}' "); err != nil {
 		return err
+	}
+	for _, c := range []struct{ name, definition string }{
+		{"target_difficulty", "REAL NOT NULL DEFAULT 0"},
+		{"realized_difficulty", "REAL NOT NULL DEFAULT 0"},
+		{"difficulty_delta", "REAL NOT NULL DEFAULT 0"},
+		{"difficulty_validation_status", "TEXT NOT NULL DEFAULT 'unknown'"},
+		{"difficulty_validation_reason", "TEXT NOT NULL DEFAULT ''"},
+		{"difficulty_policy_version", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := ensureColumn(db, "exercises", c.name, c.definition); err != nil {
+			return err
+		}
 	}
 	for _, q := range []string{
 		`CREATE INDEX IF NOT EXISTS idx_attempts_submitted ON attempts(submitted_at DESC)`,
@@ -590,15 +618,21 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 	})
 	mux.HandleFunc("/api/practice/next", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Mode    string `json:"mode"`
-			SceneID string `json:"scene_id"`
+			Mode      string `json:"mode"`
+			SceneID   string `json:"scene_id"`
+			SessionID string `json:"session_id"`
 		}
 		if r.Method == http.MethodPost {
 			_ = decode(r, &req)
 		}
 		var diff float64
 		_ = s.db.QueryRow("SELECT global_difficulty FROM user_profile WHERE id='default'").Scan(&diff)
-		ex, err := s.generateExercise(r.Context(), diff, req.Mode, req.SceneID)
+		if req.SessionID != "" {
+			if state, sessionErr := loadSessionDifficulty(s.db, req.SessionID); sessionErr == nil && state.Center > 0 {
+				diff = state.Center
+			}
+		}
+		ex, err := s.generateExerciseForSession(r.Context(), diff, req.Mode, req.SceneID, req.SessionID)
 		if err != nil {
 			jsonResp(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -617,7 +651,9 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 			session := id("session")
 			var difficulty float64
 			_ = s.db.QueryRow("SELECT global_difficulty FROM user_profile WHERE id='default'").Scan(&difficulty)
-			_, err := s.db.Exec("INSERT INTO sessions(id,mode,started_at,start_global_difficulty,end_global_difficulty) VALUES(?,?,?,?,?)", session, req.Mode, time.Now().UTC().Format(time.RFC3339), difficulty, difficulty)
+			cfg := difficultyConfig(s.adaptiveConfig())
+			lower, upper := sessionBand(difficulty, cfg)
+			_, err := s.db.Exec("INSERT INTO sessions(id,mode,started_at,start_global_difficulty,end_global_difficulty,session_difficulty_center,session_band_lower,session_band_upper,session_center_confidence,session_evidence_count) VALUES(?,?,?,?,?,?,?,?,?,0)", session, req.Mode, time.Now().UTC().Format(time.RFC3339), difficulty, difficulty, difficulty, lower, upper, 0)
 			if err != nil {
 				jsonResp(w, 500, map[string]string{"error": err.Error()})
 				return
@@ -625,7 +661,7 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 			jsonResp(w, 201, map[string]any{"session_id": session, "mode": req.Mode})
 			return
 		}
-		rows, err := s.db.Query("SELECT id,mode,started_at,ended_at,attempt_count,start_global_difficulty,end_global_difficulty,patterns_seen,skills_seen,reviews_served,probes_served,new_skills_served FROM sessions ORDER BY started_at DESC LIMIT 50")
+		rows, err := s.db.Query("SELECT id,mode,started_at,ended_at,attempt_count,start_global_difficulty,end_global_difficulty,patterns_seen,skills_seen,reviews_served,probes_served,new_skills_served,session_difficulty_center,session_band_lower,session_band_upper,session_center_confidence,session_evidence_count FROM sessions ORDER BY started_at DESC LIMIT 50")
 		if err != nil {
 			jsonResp(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -636,9 +672,10 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 			var idv, mode, start, patterns, skills string
 			var end sql.NullString
 			var count, reviews, probes, newSkills int
-			var startDifficulty, endDifficulty float64
-			_ = rows.Scan(&idv, &mode, &start, &end, &count, &startDifficulty, &endDifficulty, &patterns, &skills, &reviews, &probes, &newSkills)
-			out = append(out, map[string]any{"session_id": idv, "mode": mode, "started_at": start, "ended_at": end.String, "attempt_count": count, "start_global_difficulty": startDifficulty, "end_global_difficulty": endDifficulty, "patterns_seen": decodeJSONMap(patterns), "skills_seen": decodeJSONMap(skills), "reviews_served": reviews, "probes_served": probes, "new_skills_served": newSkills})
+			var startDifficulty, endDifficulty, center, lower, upper, confidence float64
+			var evidence int
+			_ = rows.Scan(&idv, &mode, &start, &end, &count, &startDifficulty, &endDifficulty, &patterns, &skills, &reviews, &probes, &newSkills, &center, &lower, &upper, &confidence, &evidence)
+			out = append(out, map[string]any{"session_id": idv, "mode": mode, "started_at": start, "ended_at": end.String, "attempt_count": count, "start_global_difficulty": startDifficulty, "end_global_difficulty": endDifficulty, "session_difficulty_center": center, "session_band_lower": lower, "session_band_upper": upper, "session_center_confidence": confidence, "session_evidence_count": evidence, "patterns_seen": decodeJSONMap(patterns), "skills_seen": decodeJSONMap(skills), "reviews_served": reviews, "probes_served": probes, "new_skills_served": newSkills})
 		}
 		jsonResp(w, 200, out)
 	})
@@ -709,7 +746,7 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		jsonResp(w, 200, result)
 	})
 	mux.HandleFunc("/api/history", func(w http.ResponseWriter, r *http.Request) {
-		rows, err := s.db.Query(`SELECT a.id,a.submitted_at,e.chinese_prompt,a.user_answer,COALESCE(v.verdict,''),COALESCE(v.suggested_answer,''),COALESCE(v.errors_json,'[]'),e.pattern_id,e.scene_id,a.intent_id,a.exercise_difficulty,a.selection_reason,a.is_review,a.is_probe,a.generated_by FROM attempts a JOIN exercises e ON e.id=a.exercise_id LEFT JOIN evaluations v ON v.attempt_id=a.id ORDER BY a.submitted_at DESC LIMIT 100`)
+		rows, err := s.db.Query(`SELECT a.id,a.submitted_at,e.chinese_prompt,a.user_answer,COALESCE(v.verdict,''),COALESCE(v.suggested_answer,''),COALESCE(v.errors_json,'[]'),e.pattern_id,e.scene_id,a.intent_id,a.exercise_difficulty,COALESCE(NULLIF(a.target_difficulty,0),NULLIF(e.target_difficulty,0),e.difficulty),COALESCE(NULLIF(a.realized_difficulty,0),NULLIF(e.realized_difficulty,0),e.difficulty),COALESCE(NULLIF(a.difficulty_delta,0),ABS(COALESCE(NULLIF(e.realized_difficulty,0),e.difficulty)-COALESCE(NULLIF(e.target_difficulty,0),e.difficulty))),a.selection_reason,a.is_review,a.is_probe,a.generated_by,COALESCE(NULLIF(a.difficulty_validation_status,'unknown'),NULLIF(e.difficulty_validation_status,'unknown'),'unknown') FROM attempts a JOIN exercises e ON e.id=a.exercise_id LEFT JOIN evaluations v ON v.attempt_id=a.id ORDER BY a.submitted_at DESC LIMIT 100`)
 		if err != nil {
 			jsonResp(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -717,13 +754,13 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		defer rows.Close()
 		out := []map[string]any{}
 		for rows.Next() {
-			var a, b, c, d, e, f, g, h, i, intent, reason, generated string
-			var difficulty float64
+			var a, b, c, d, e, f, g, h, i, intent, reason, generated, validationStatus string
+			var difficulty, targetDifficulty, realizedDifficulty, difficultyDelta float64
 			var review, probe int
-			_ = rows.Scan(&a, &b, &c, &d, &e, &f, &g, &h, &i, &intent, &difficulty, &reason, &review, &probe, &generated)
+			_ = rows.Scan(&a, &b, &c, &d, &e, &f, &g, &h, &i, &intent, &difficulty, &targetDifficulty, &realizedDifficulty, &difficultyDelta, &reason, &review, &probe, &generated, &validationStatus)
 			var er any
 			_ = json.Unmarshal([]byte(g), &er)
-			out = append(out, map[string]any{"id": a, "submitted_at": b, "prompt": c, "answer": d, "verdict": e, "suggested_answer": f, "errors": er, "pattern_id": h, "scene_id": i, "intent_id": intent, "difficulty": difficulty, "selection_reason": reason, "is_review": review == 1, "is_probe": probe == 1, "generated_by": generated})
+			out = append(out, map[string]any{"id": a, "submitted_at": b, "prompt": c, "answer": d, "verdict": e, "suggested_answer": f, "errors": er, "pattern_id": h, "scene_id": i, "intent_id": intent, "difficulty": difficulty, "target_difficulty": targetDifficulty, "realized_difficulty": realizedDifficulty, "difficulty_delta": difficultyDelta, "difficulty_validation_status": validationStatus, "selection_reason": reason, "is_review": review == 1, "is_probe": probe == 1, "generated_by": generated})
 		}
 		jsonResp(w, 200, out)
 	})
@@ -808,6 +845,22 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 			return
 		}
 		jsonResp(w, 200, report)
+	})
+	mux.HandleFunc("/api/calibration/difficulty-trace", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			jsonResp(w, 405, nil)
+			return
+		}
+		limit := 50
+		if r.URL.Query().Get("limit") == "100" {
+			limit = 100
+		}
+		trace, err := s.difficultyTrace(r.URL.Query().Get("window"), r.URL.Query().Get("session_id"), limit)
+		if err != nil {
+			jsonResp(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		jsonResp(w, 200, trace)
 	})
 	mux.HandleFunc("/api/calibration/patterns", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -1458,14 +1511,20 @@ func (s *Server) submitAttempt(ctx context.Context, session, exercise, answer st
 	}
 	var sessionDifficulty float64
 	_ = s.db.QueryRow("SELECT global_difficulty FROM user_profile WHERE id='default'").Scan(&sessionDifficulty)
-	_, _ = s.db.Exec("INSERT OR IGNORE INTO sessions(id,mode,started_at,start_global_difficulty,end_global_difficulty) VALUES(?,?,?,?,?)", session, "adaptive", time.Now().UTC().Format(time.RFC3339), sessionDifficulty, sessionDifficulty)
+	if state, err := ensureSessionDifficulty(s.db, session, "adaptive"); err == nil && state.Center > 0 {
+		sessionDifficulty = state.Center
+	}
 	var prompt, pattern, scene string
-	var difficulty float64
-	if err := s.db.QueryRow("SELECT chinese_prompt,pattern_id,scene_id,difficulty FROM exercises WHERE id=?", exercise).Scan(&prompt, &pattern, &scene, &difficulty); err != nil {
+	var difficulty, target, realized float64
+	var validationStatus, validationReason, policyVersion string
+	if err := s.db.QueryRow("SELECT chinese_prompt,pattern_id,scene_id,difficulty,COALESCE(NULLIF(target_difficulty,0),difficulty),COALESCE(NULLIF(realized_difficulty,0),0),COALESCE(difficulty_validation_status,'unknown'),COALESCE(difficulty_validation_reason,''),COALESCE(difficulty_policy_version,'') FROM exercises WHERE id=?", exercise).Scan(&prompt, &pattern, &scene, &difficulty, &target, &realized, &validationStatus, &validationReason, &policyVersion); err != nil {
 		return nil, err
 	}
+	if target <= 0 {
+		target = difficulty
+	}
 	attempt := id("attempt")
-	if _, err := s.db.Exec(`INSERT INTO attempts(id,session_id,exercise_id,user_answer,submitted_at,evaluation_status,evaluation_diagnostics_json) VALUES(?,?,?,?,?,?,?)`, attempt, session, exercise, answer, time.Now().UTC().Format(time.RFC3339), "pending", "{}"); err != nil {
+	if _, err := s.db.Exec(`INSERT INTO attempts(id,session_id,exercise_id,user_answer,submitted_at,evaluation_status,evaluation_diagnostics_json,learner_ability,session_center,target_difficulty,realized_difficulty,difficulty_delta,difficulty_validation_status,difficulty_validation_reason,difficulty_policy_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, attempt, session, exercise, answer, time.Now().UTC().Format(time.RFC3339), "pending", "{}", learnerAbility(s.db), sessionDifficulty, target, realized, math.Abs(realized-target), validationStatus, validationReason, policyVersion); err != nil {
 		return nil, err
 	}
 	_ = s.populateAttemptMetadata(attempt)
@@ -1527,10 +1586,12 @@ func (s *Server) saveValidatedAttempt(attempt, prompt, pattern, scene string, di
 	if _, err = tx.Exec(`INSERT INTO evaluations(id,attempt_id,verdict,meaning_score,grammar_score,naturalness_score,pattern_score,errors_json,suggested_answer,more_natural,more_natural_needed,alternative,explanation_zh,validated,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)`, id("evaluation"), attempt, eval.Verdict, eval.MeaningScore, eval.GrammarScore, eval.NaturalnessScore, eval.PatternScore, string(errorsJSON), eval.SuggestedAnswer, eval.MoreNatural, boolInt(eval.MoreNaturalNeeded), eval.Alternative, eval.ExplanationZH, time.Now().UTC().Format(time.RFC3339)); err != nil {
 		return nil, err
 	}
-	var masteryBefore, difficultyBefore float64
+	var masteryBefore, difficultyBefore, patternAbilityBefore, targetDifficulty, realizedDifficulty float64
 	_ = tx.QueryRow(`SELECT COALESCE(mastery,.25) FROM learner_skill_state WHERE user_id='default' AND pattern_id=?`, pattern).Scan(&masteryBefore)
+	_ = tx.QueryRow(`SELECT COALESCE(current_difficulty,0) FROM learner_skill_state WHERE user_id='default' AND pattern_id=?`, pattern).Scan(&patternAbilityBefore)
 	_ = tx.QueryRow(`SELECT global_difficulty FROM user_profile WHERE id='default'`).Scan(&difficultyBefore)
-	_, _, _, isProbe, _, _, _ := adaptiveAttemptMetadata(tx, attempt)
+	mode, selectionReason, _, isProbe, _, _, _ := adaptiveAttemptMetadata(tx, attempt)
+	_ = tx.QueryRow(`SELECT COALESCE(NULLIF(target_difficulty,0),difficulty),COALESCE(NULLIF(realized_difficulty,0),0) FROM exercises WHERE id=(SELECT exercise_id FROM attempts WHERE id=?)`, attempt).Scan(&targetDifficulty, &realizedDifficulty)
 	if err = updateMasteryTxMode(tx, pattern, scene, difficulty, eval, isProbe); err != nil {
 		return nil, err
 	}
@@ -1538,6 +1599,41 @@ func (s *Server) saveValidatedAttempt(attempt, prompt, pattern, scene string, di
 		return nil, err
 	}
 	if err = updateProfileTx(tx, eval, difficulty); err != nil {
+		return nil, err
+	}
+	cfg := difficultyConfig(defaultAdaptiveConfig())
+	if rows, configErr := tx.Query(`SELECT key,value FROM adaptive_config`); configErr == nil {
+		// Keep the transactional controller aligned with runtime-configured limits.
+		for rows.Next() {
+			var key, value string
+			if rows.Scan(&key, &value) != nil {
+				continue
+			}
+			var n float64
+			if json.Unmarshal([]byte(value), &n) == nil {
+				switch key {
+				case "deadband_low":
+					cfg.DeadbandLow = n
+				case "deadband_high":
+					cfg.DeadbandHigh = n
+				case "max_session_center_step":
+					cfg.MaxSessionCenterStep = n
+				case "recent_window_size":
+					cfg.RecentWindowSize = int(n)
+				case "ewma_alpha":
+					cfg.EWMAAlpha = n
+				case "session_band_lower":
+					cfg.SessionBandLower = n
+				case "session_band_upper":
+					cfg.SessionBandUpper = n
+				}
+			}
+		}
+		rows.Close()
+	}
+	sessionBefore, _ := loadSessionDifficultyTx(tx, session)
+	updatedSession, sessionReason, err := updateSessionCenterTx(tx, session, cfg)
+	if err != nil {
 		return nil, err
 	}
 	var masteryAfter, difficultyAfter float64
@@ -1548,7 +1644,30 @@ func (s *Server) saveValidatedAttempt(attempt, prompt, pattern, scene string, di
 	if err = updateSessionObservationTx(tx, session, pattern, eval, isProbe, masteryBefore, masteryAfter, difficultyBefore, difficultyAfter, position); err != nil {
 		return nil, err
 	}
-	if _, err = tx.Exec(`UPDATE attempts SET mastery_before=?,mastery_after=?,difficulty_before=?,difficulty_after=?,position=? WHERE id=?`, masteryBefore, masteryAfter, difficultyBefore, difficultyAfter, position, attempt); err != nil {
+	if targetDifficulty <= 0 {
+		targetDifficulty = difficulty
+	}
+	adjustment := sessionReason
+	if adjustment == "insufficient_rolling_evidence" {
+		adjustment = "session_center_waiting_for_rolling_evidence"
+	}
+	traceRealized := realizedDifficulty
+	traceDelta := 0.0
+	if traceRealized > 0 {
+		traceDelta = math.Abs(traceRealized - targetDifficulty)
+	}
+	trace := difficultyPolicyTrace(difficultyBefore, updatedSession, patternAbilityBefore, targetDifficulty, traceRealized, selectionReason, adjustment, isProbe, cfg)
+	trace["difficulty_delta"] = traceDelta
+	trace["mode"] = mode
+	trace["session_center_before"] = sessionBefore.Center
+	trace["session_center_after"] = updatedSession.Center
+	trace["learner_ability_after"] = difficultyAfter
+	trace["difficulty_validation_status"] = validationStatusForAttempt(tx, attempt)
+	traceJSON, _ := json.Marshal(trace)
+	if _, err = tx.Exec(`UPDATE attempts SET mastery_before=?,mastery_after=?,difficulty_before=?,difficulty_after=?,learner_ability=?,session_center=?,pattern_ability=?,target_difficulty=?,realized_difficulty=?,difficulty_delta=?,difficulty_validation_status=?,difficulty_policy_version=?,position=? WHERE id=?`, masteryBefore, masteryAfter, difficultyBefore, difficultyAfter, difficultyAfter, updatedSession.Center, patternAbilityBefore, targetDifficulty, realizedDifficulty, traceDelta, validationStatusForAttempt(tx, attempt), cfg.DifficultyPolicyVersion, position, attempt); err != nil {
+		return nil, err
+	}
+	if _, err = tx.Exec(`UPDATE exercises SET decision_trace_json=?,metadata_json=json_set(metadata_json,'$.decision_trace',json(?),'$.realized_difficulty',?,'$.difficulty_delta',?) WHERE id=(SELECT exercise_id FROM attempts WHERE id=?)`, string(traceJSON), string(traceJSON), realizedDifficulty, math.Abs(realizedDifficulty-targetDifficulty), attempt); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -1840,26 +1959,9 @@ func clamp(v, a, b float64) float64 {
 // updateProfileTx keeps policy decisions in application logic. Provider output
 // supplies scores, while difficulty is adjusted conservatively from outcomes.
 func updateProfileTx(tx *sql.Tx, e Eval, exerciseDifficulty float64) error {
-	var current float64
-	if err := tx.QueryRow("SELECT global_difficulty FROM user_profile WHERE id='default'").Scan(&current); err != nil {
-		return err
-	}
-	success := e.Verdict == "correct" || e.Verdict == "mostly_correct"
-	if success && e.PatternScore >= .75 {
-		current += .12
-	} else if !success {
-		current -= .10
-	}
-	current = clamp(current, 1, 8)
-	now := time.Now().UTC().Format(time.RFC3339)
-	if _, err := tx.Exec("UPDATE user_profile SET global_difficulty=?, updated_at=? WHERE id='default'", current, now); err != nil {
-		return err
-	}
-	successRate := 0.0
-	if success {
-		successRate = 1
-	}
-	_, err := tx.Exec(`INSERT INTO difficulty_state(scope,entity_id,difficulty,success_rate,attempts,updated_at) VALUES('global','default',?,?,1,?) ON CONFLICT(scope,entity_id) DO UPDATE SET difficulty=excluded.difficulty,updated_at=excluded.updated_at`, current, successRate, now)
+	// Long-term ability is updated from rolling non-probe evidence. A single
+	// success/failure therefore cannot move the learner state.
+	_, _, err := updateLearnerAbilityTx(tx, difficultyConfig(defaultAdaptiveConfig()))
 	return err
 }
 

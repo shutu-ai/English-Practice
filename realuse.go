@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const calibrationVersion = "v2.1-real-use-1"
+const calibrationVersion = "v2.2-difficulty-stabilization-1"
 
 var allowedFeedbackTypes = map[string]bool{
 	"too_easy": true, "too_hard": true, "unnatural": true,
@@ -38,11 +38,14 @@ type calibrationWindow struct {
 }
 
 type observedAttempt struct {
-	ID, SessionID, ExerciseID, PatternID, SceneID, IntentID        string
-	Submitted, Verdict, Reason, Hash, ReviewTiming                 string
-	Difficulty, Meaning, Grammar, Naturalness, PatternScore        float64
-	MasteryBefore, MasteryAfter, DifficultyBefore, DifficultyAfter float64
-	Review, Probe, NewSkill                                        bool
+	ID, SessionID, ExerciseID, PatternID, SceneID, IntentID             string
+	Submitted, Verdict, Reason, Hash, ReviewTiming                      string
+	Difficulty, Meaning, Grammar, Naturalness, PatternScore             float64
+	MasteryBefore, MasteryAfter, DifficultyBefore, DifficultyAfter      float64
+	LearnerAbility, SessionCenter, PatternAbility                       float64
+	TargetDifficulty, RealizedDifficulty, DifficultyDelta               float64
+	ValidationStatus, ValidationReason, PolicyVersion, AdjustmentReason string
+	Review, Probe, NewSkill                                             bool
 }
 
 func decodeJSONMap(raw string) map[string]any {
@@ -99,6 +102,9 @@ func (s *Server) observedAttempts(w calibrationWindow) ([]observedAttempt, error
         COALESCE(v.meaning_score,0),COALESCE(v.grammar_score,0),COALESCE(v.naturalness_score,0),COALESCE(v.pattern_score,0),
         COALESCE(a.selection_reason,''),COALESCE(a.normalized_chinese_hash,''),COALESCE(a.review_timing,''),
         COALESCE(a.mastery_before,0),COALESCE(a.mastery_after,0),COALESCE(a.difficulty_before,0),COALESCE(a.difficulty_after,0),
+        COALESCE(a.learner_ability,0),COALESCE(a.session_center,0),COALESCE(a.pattern_ability,0),
+        COALESCE(NULLIF(a.target_difficulty,0),NULLIF(e.target_difficulty,0),e.difficulty),COALESCE(NULLIF(a.realized_difficulty,0),NULLIF(e.realized_difficulty,0),e.difficulty),COALESCE(NULLIF(a.difficulty_delta,0),ABS(COALESCE(NULLIF(e.realized_difficulty,0),e.difficulty)-COALESCE(NULLIF(e.target_difficulty,0),e.difficulty))),
+        COALESCE(NULLIF(a.difficulty_validation_status,'unknown'),NULLIF(e.difficulty_validation_status,'unknown'),'unknown'),COALESCE(NULLIF(a.difficulty_validation_reason,''),NULLIF(e.difficulty_validation_reason,''),''),COALESCE(NULLIF(a.difficulty_policy_version,''),NULLIF(e.difficulty_policy_version,''),''),COALESCE(json_extract(e.decision_trace_json,'$.difficulty_adjustment_reason'),''),
         a.is_review,a.is_probe,a.is_new_skill
         FROM attempts a JOIN exercises e ON e.id=a.exercise_id LEFT JOIN evaluations v ON v.attempt_id=a.id
         WHERE ` + where + ` ORDER BY a.submitted_at,a.id`
@@ -111,7 +117,7 @@ func (s *Server) observedAttempts(w calibrationWindow) ([]observedAttempt, error
 	for rows.Next() {
 		var x observedAttempt
 		var review, probe, newSkill int
-		if err := rows.Scan(&x.ID, &x.SessionID, &x.ExerciseID, &x.PatternID, &x.SceneID, &x.IntentID, &x.Submitted, &x.Verdict, &x.Difficulty, &x.Meaning, &x.Grammar, &x.Naturalness, &x.PatternScore, &x.Reason, &x.Hash, &x.ReviewTiming, &x.MasteryBefore, &x.MasteryAfter, &x.DifficultyBefore, &x.DifficultyAfter, &review, &probe, &newSkill); err != nil {
+		if err := rows.Scan(&x.ID, &x.SessionID, &x.ExerciseID, &x.PatternID, &x.SceneID, &x.IntentID, &x.Submitted, &x.Verdict, &x.Difficulty, &x.Meaning, &x.Grammar, &x.Naturalness, &x.PatternScore, &x.Reason, &x.Hash, &x.ReviewTiming, &x.MasteryBefore, &x.MasteryAfter, &x.DifficultyBefore, &x.DifficultyAfter, &x.LearnerAbility, &x.SessionCenter, &x.PatternAbility, &x.TargetDifficulty, &x.RealizedDifficulty, &x.DifficultyDelta, &x.ValidationStatus, &x.ValidationReason, &x.PolicyVersion, &x.AdjustmentReason, &review, &probe, &newSkill); err != nil {
 			return nil, err
 		}
 		x.Review, x.Probe, x.NewSkill = review == 1, probe == 1, newSkill == 1
@@ -145,8 +151,26 @@ func difficultyMetrics(xs []observedAttempt) map[string]any {
 		return map[string]any{"status": "insufficient_evidence", "sample_size": 0}
 	}
 	values := make([]float64, len(xs))
+	targets := make([]float64, len(xs))
+	realized := make([]float64, len(xs))
+	mismatchCount := 0
 	for i, x := range xs {
-		values[i] = x.Difficulty
+		values[i] = x.RealizedDifficulty
+		if values[i] <= 0 {
+			values[i] = x.Difficulty
+		}
+		targets[i] = x.TargetDifficulty
+		if targets[i] <= 0 {
+			targets[i] = x.Difficulty
+		}
+		realized[i] = values[i]
+		if x.DifficultyDelta > 0 {
+			if x.DifficultyDelta > difficultyConfig(defaultAdaptiveConfig()).DifficultyMismatchThreshold {
+				mismatchCount++
+			}
+		} else if abs(values[i]-targets[i]) > difficultyConfig(defaultAdaptiveConfig()).DifficultyMismatchThreshold {
+			mismatchCount++
+		}
 	}
 	sorted := append([]float64(nil), values...)
 	sort.Float64s(sorted)
@@ -167,7 +191,40 @@ func difficultyMetrics(xs []observedAttempt) map[string]any {
 		"status": "ok", "sample_size": len(values), "current": values[len(values)-1],
 		"min": sorted[0], "max": sorted[len(sorted)-1], "p50": sorted[(len(sorted)-1)/2],
 		"changes_last_10": changes(10), "changes_last_50": changes(50), "jitter": jitter,
+		"target_p50": sortedFloatPercentile(targets, .50), "realized_p50": sortedFloatPercentile(realized, .50),
+		"target_realized_mismatch_count": mismatchCount, "target_realized_mismatch_rate": float64(mismatchCount) / float64(len(values)),
 	}
+}
+
+func sessionDifficultyMetrics(xs []observedAttempt) map[string]any {
+	if len(xs) == 0 {
+		return map[string]any{"status": "insufficient_evidence", "sample_size": 0}
+	}
+	bySession := map[string][]float64{}
+	centers := []float64{}
+	values := []float64{}
+	for _, x := range xs {
+		value := x.RealizedDifficulty
+		if value <= 0 {
+			value = x.Difficulty
+		}
+		bySession[x.SessionID] = append(bySession[x.SessionID], value)
+		values = append(values, value)
+		if x.SessionCenter > 0 {
+			centers = append(centers, x.SessionCenter)
+		}
+	}
+	jitter := 0.0
+	for i := 1; i < len(values); i++ {
+		jitter += abs(values[i] - values[i-1])
+	}
+	if len(values) > 1 {
+		jitter /= float64(len(values) - 1)
+	}
+	if len(centers) == 0 {
+		centers = append(centers, values...)
+	}
+	return map[string]any{"status": "ok", "sample_size": len(values), "session_count": len(bySession), "session_difficulty_center": sortedFloatPercentile(centers, .50), "session_difficulty_p25": sortedFloatPercentile(values, .25), "session_difficulty_p50": sortedFloatPercentile(values, .50), "session_difficulty_p75": sortedFloatPercentile(values, .75), "session_difficulty_range": []float64{sortedFloatPercentile(values, 0), sortedFloatPercentile(values, 1)}, "session_difficulty_jitter": jitter}
 }
 
 func streakAndSpacing(xs []observedAttempt) map[string]any {
@@ -317,6 +374,8 @@ func (s *Server) realUseCalibrationReport(windowName, sessionID string) (map[str
 	report["observed_pattern_count"] = states[stateWeak] + states[stateStable] + states[stateMastered] + states[stateLearning]
 	report["unknown_pattern_count"] = states[stateUnknown]
 	report["difficulty"] = difficultyMetrics(xs)
+	report["session_difficulty"] = sessionDifficultyMetrics(xs)
+	report["difficulty_policy_version"] = difficultyPolicyVersion
 	report["accuracy"] = map[string]any{"overall": accuracyMetric(xs), "recent_10": accuracySlice(xs, 10), "recent_30": accuracySlice(xs, 30), "recent_100": accuracySlice(xs, 100), "by_band": bandMetrics}
 	report["repetition"] = streakAndSpacing(xs)
 	dueReviews := s.countDueReviews()
@@ -329,7 +388,54 @@ func (s *Server) realUseCalibrationReport(windowName, sessionID string) (map[str
 	report["health_flags"] = health
 	report["readiness_gate"] = readiness
 	report["feedback_count"] = s.countFeedback(w)
+	report["difficulty_feedback"] = s.difficultyFeedbackReport(w)
+	report["difficulty_simulation"] = difficultySimulationReport(s.adaptiveConfig(), 500)
 	return report, nil
+}
+
+func (s *Server) difficultyFeedbackReport(w calibrationWindow) map[string]any {
+	args := []any{}
+	query := `SELECT f.feedback_type,COALESCE(a.target_difficulty,e.target_difficulty,e.difficulty),COALESCE(e.pattern_id,''),COALESCE(a.selection_reason,'') FROM feedback f LEFT JOIN attempts a ON a.id=f.attempt_id LEFT JOIN exercises e ON e.id=COALESCE(f.exercise_id,a.exercise_id) WHERE f.feedback_type IN ('too_easy','too_hard')`
+	if w.Since != "" {
+		query += " AND f.created_at>=?"
+		args = append(args, w.Since)
+	}
+	if w.SessionID != "" {
+		query += " AND f.session_id=?"
+		args = append(args, w.SessionID)
+	}
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return map[string]any{"status": "query_error", "error": err.Error()}
+	}
+	defer rows.Close()
+	total, easy, hard := 0, 0, 0
+	byTarget := map[string]map[string]int{}
+	byPattern := map[string]map[string]int{}
+	byReason := map[string]map[string]int{}
+	inc := func(bucket map[string]map[string]int, key, signal string) {
+		if bucket[key] == nil {
+			bucket[key] = map[string]int{"too_easy": 0, "too_hard": 0}
+		}
+		bucket[key][signal]++
+	}
+	for rows.Next() {
+		var signal, pattern, reason string
+		var target float64
+		if rows.Scan(&signal, &target, &pattern, &reason) != nil {
+			continue
+		}
+		total++
+		if signal == "too_easy" {
+			easy++
+		} else if signal == "too_hard" {
+			hard++
+		}
+		inc(byTarget, difficultyBand(target), signal)
+		inc(byPattern, pattern, signal)
+		inc(byReason, reason, signal)
+	}
+	return map[string]any{"status": "ok", "sample_size": total, "too_easy_feedback_rate": metricRatio(easy, total), "too_hard_feedback_rate": metricRatio(hard, total), "feedback_by_target_difficulty": byTarget, "feedback_by_pattern": byPattern, "feedback_by_selection_reason": byReason}
 }
 
 func metricRatio(n, d int) any {
@@ -680,9 +786,35 @@ func (s *Server) calibrationSessionReport(sessionID string) (map[string]any, err
 	}
 	questions := make([]map[string]any, 0, len(xs))
 	for i, x := range xs {
-		questions = append(questions, map[string]any{"position": i + 1, "attempt_id": x.ID, "exercise_id": x.ExerciseID, "pattern_id": x.PatternID, "difficulty": x.Difficulty, "selection_reason": x.Reason, "is_review": x.Review, "is_probe": x.Probe, "is_new_skill": x.NewSkill, "verdict": x.Verdict, "mastery_before": x.MasteryBefore, "mastery_after": x.MasteryAfter, "difficulty_before": x.DifficultyBefore, "difficulty_after": x.DifficultyAfter, "spacing_from_previous_same_pattern_hours": s.spacingFromPrevious(x, xs[:i])})
+		questions = append(questions, map[string]any{"position": i + 1, "attempt_id": x.ID, "exercise_id": x.ExerciseID, "pattern_id": x.PatternID, "difficulty": x.Difficulty, "target_difficulty": x.TargetDifficulty, "realized_difficulty": x.RealizedDifficulty, "difficulty_delta": x.DifficultyDelta, "difficulty_validation_status": x.ValidationStatus, "difficulty_policy_version": x.PolicyVersion, "learner_ability": x.LearnerAbility, "session_center": x.SessionCenter, "pattern_ability": x.PatternAbility, "selection_reason": x.Reason, "difficulty_adjustment_reason": x.AdjustmentReason, "is_review": x.Review, "is_probe": x.Probe, "is_new_skill": x.NewSkill, "verdict": x.Verdict, "mastery_before": x.MasteryBefore, "mastery_after": x.MasteryAfter, "difficulty_before": x.DifficultyBefore, "difficulty_after": x.DifficultyAfter, "spacing_from_previous_same_pattern_hours": s.spacingFromPrevious(x, xs[:i])})
 	}
 	return map[string]any{"session_id": sessionID, "mode": mode, "started_at": started, "ended_at": ended.String, "attempt_count": len(xs), "questions": questions}, nil
+}
+
+func (s *Server) difficultyTrace(window string, sessionID string, limit int) ([]map[string]any, error) {
+	if limit != 100 {
+		limit = 50
+	}
+	xs, err := s.observedAttempts(s.calibrationWindow(window, sessionID))
+	if err != nil {
+		return nil, err
+	}
+	if len(xs) > limit {
+		xs = xs[len(xs)-limit:]
+	}
+	out := make([]map[string]any, 0, len(xs))
+	for index, x := range xs {
+		out = append(out, map[string]any{
+			"index": index + 1, "attempt_id": x.ID, "session_id": x.SessionID, "exercise_id": x.ExerciseID,
+			"pattern": x.PatternID, "selection_reason": x.Reason, "learner_ability": x.LearnerAbility,
+			"session_center": x.SessionCenter, "pattern_ability": x.PatternAbility,
+			"target_difficulty": x.TargetDifficulty, "realized_difficulty": x.RealizedDifficulty,
+			"difficulty_delta": x.DifficultyDelta, "difficulty_validation_status": x.ValidationStatus,
+			"difficulty_policy_version": x.PolicyVersion, "evaluation": x.Verdict,
+			"is_probe": x.Probe, "is_review": x.Review, "difficulty_adjustment_reason": x.AdjustmentReason,
+		})
+	}
+	return out, nil
 }
 
 func (s *Server) spacingFromPrevious(x observedAttempt, previous []observedAttempt) any {
@@ -811,7 +943,7 @@ func (s *Server) calibrationSnapshot(window, sessionID string, debug bool) (map[
 	if err != nil {
 		return nil, err
 	}
-	snapshot := map[string]any{"policy_version": "adaptive-v2.1", "calibration_version": calibrationVersion, "generated_at": time.Now().UTC().Format(time.RFC3339), "summary": report, "pattern_diagnostics": patterns, "health_flags": report["health_flags"]}
+	snapshot := map[string]any{"policy_version": difficultyPolicyVersion, "calibration_version": calibrationVersion, "generated_at": time.Now().UTC().Format(time.RFC3339), "summary": report, "pattern_diagnostics": patterns, "health_flags": report["health_flags"]}
 	snapshot["skill_unlock_events"] = s.unlockEventSnapshot()
 	if sessionID != "" {
 		if session, e := s.calibrationSessionReport(sessionID); e == nil {
@@ -865,7 +997,172 @@ func (s *Server) calibrationReplay(window, candidate string) (map[string]any, er
 			return nil, fmt.Errorf("candidate must be JSON: %w", err)
 		}
 	}
-	return map[string]any{"mode": "historical_replay", "applied": false, "candidate": candidateConfig, "current_summary": map[string]any{"accuracy": report["accuracy"], "difficulty": report["difficulty"], "health_flags": report["health_flags"]}, "note": "Replay is diagnostic only; candidate policy is never auto-applied."}, nil
+	var changes map[string]any
+	if raw, ok := candidateConfig["changes"].(map[string]any); ok {
+		changes = raw
+	} else {
+		changes = candidateConfig
+	}
+	cfg := difficultyConfig(s.adaptiveConfig())
+	before, _ := s.observedAttempts(s.calibrationWindow(window, ""))
+	afterTargets := replayDifficultyTargets(before, cfg, changes)
+	beforeMetrics := replayMetrics(before, nil, difficultyConfig(s.adaptiveConfig()))
+	afterMetrics := replayMetrics(before, afterTargets, cfg)
+	return map[string]any{
+		"mode": "historical_replay", "applied": false, "candidate": candidateConfig,
+		"current_summary": map[string]any{"accuracy": report["accuracy"], "difficulty": report["difficulty"], "health_flags": report["health_flags"]},
+		"before":          beforeMetrics, "after": afterMetrics,
+		"trace": replayTrace(before, afterTargets),
+		"note":  "Replay is diagnostic only; candidate policy is never auto-applied.",
+	}, nil
+}
+
+func replayDifficultyTargets(xs []observedAttempt, cfg AdaptiveConfig, changes map[string]any) []float64 {
+	if len(changes) > 0 {
+		b, _ := json.Marshal(changes)
+		var patch map[string]json.RawMessage
+		_ = json.Unmarshal(b, &patch)
+		for key, raw := range patch {
+			var number float64
+			if json.Unmarshal(raw, &number) != nil {
+				continue
+			}
+			switch key {
+			case "deadband_low":
+				cfg.DeadbandLow = number
+			case "deadband_high":
+				cfg.DeadbandHigh = number
+			case "max_ability_step":
+				cfg.MaxAbilityStep = number
+			case "max_session_center_step":
+				cfg.MaxSessionCenterStep = number
+			case "max_pattern_target_step":
+				cfg.MaxPatternTargetStep = number
+			case "session_band_lower":
+				cfg.SessionBandLower = number
+			case "session_band_upper":
+				cfg.SessionBandUpper = number
+			case "probe_delta":
+				cfg.ProbeDelta = number
+			case "difficulty_mismatch_threshold":
+				cfg.DifficultyMismatchThreshold = number
+			case "recent_window_size":
+				cfg.RecentWindowSize = int(number)
+			case "ewma_alpha":
+				cfg.EWMAAlpha = number
+			}
+		}
+	}
+	cfg = difficultyConfig(cfg)
+	targets := make([]float64, 0, len(xs))
+	center, ability := 3.0, 3.0
+	if len(xs) > 0 {
+		center, ability = xs[0].SessionCenter, xs[0].LearnerAbility
+		if center <= 0 {
+			center = xs[0].TargetDifficulty
+		}
+		if ability <= 0 {
+			ability = center
+		}
+	}
+	history := []float64{}
+	for _, x := range xs {
+		if x.SessionCenter > 0 && len(history) == 0 {
+			center = x.SessionCenter
+		}
+		pattern := x.PatternAbility
+		if pattern <= 0 {
+			pattern = x.TargetDifficulty
+		}
+		catalog := x.TargetDifficulty
+		target, _ := targetDifficulty(center, ability, pattern, catalog, x.Reason, x.Review, x.Probe, 0, cfg)
+		if x.Probe {
+			target = clamp(center+cfg.ProbeDelta, 1, 8)
+		}
+		targets = append(targets, target)
+		history = append(history, scoreFromVerdict(x.Verdict))
+		if len(history) > cfg.RecentWindowSize {
+			history = history[len(history)-cfg.RecentWindowSize:]
+		}
+		if len(history) >= 3 && !x.Probe {
+			performance := meanEWMA(history, cfg.EWMAAlpha)
+			center, _ = boundedControllerStep(center, performance, cfg, cfg.MaxSessionCenterStep)
+			ability, _ = boundedControllerStep(ability, performance, cfg, cfg.MaxAbilityStep)
+		}
+	}
+	return targets
+}
+
+func replayMetrics(xs []observedAttempt, targets []float64, cfg AdaptiveConfig) map[string]any {
+	if len(xs) == 0 {
+		return map[string]any{"status": "insufficient_evidence", "sample_size": 0}
+	}
+	values := make([]float64, len(xs))
+	for i, x := range xs {
+		values[i] = x.RealizedDifficulty
+		if values[i] <= 0 {
+			values[i] = x.Difficulty
+		}
+	}
+	if targets != nil {
+		mismatch := 0
+		for i, target := range targets {
+			if i < len(values) && abs(values[i]-target) > cfg.DifficultyMismatchThreshold {
+				mismatch++
+			}
+		}
+		jitter := 0.0
+		for i := 1; i < len(targets); i++ {
+			jitter += abs(targets[i] - targets[i-1])
+		}
+		if len(targets) > 1 {
+			jitter /= float64(len(targets) - 1)
+		}
+		return map[string]any{"status": "ok", "sample_size": len(targets), "difficulty_jitter": jitter, "session_difficulty_p25": sortedFloatPercentile(targets, .25), "session_difficulty_p50": sortedFloatPercentile(targets, .50), "session_difficulty_p75": sortedFloatPercentile(targets, .75), "session_difficulty_range": []float64{sortedFloatPercentile(targets, 0), sortedFloatPercentile(targets, 1)}, "target_realized_mismatch_rate": float64(mismatch) / float64(len(targets)), "probe_recovery_rate": replayProbeRecovery(xs, targets)}
+	}
+	jitter := 0.0
+	for i := 1; i < len(values); i++ {
+		jitter += abs(values[i] - values[i-1])
+	}
+	if len(values) > 1 {
+		jitter /= float64(len(values) - 1)
+	}
+	return map[string]any{"status": "ok", "sample_size": len(values), "difficulty_jitter": jitter, "session_difficulty_p25": sortedFloatPercentile(values, .25), "session_difficulty_p50": sortedFloatPercentile(values, .50), "session_difficulty_p75": sortedFloatPercentile(values, .75), "session_difficulty_range": []float64{sortedFloatPercentile(values, 0), sortedFloatPercentile(values, 1)}, "target_realized_mismatch_rate": difficultyMetrics(xs)["target_realized_mismatch_rate"]}
+}
+
+func replayProbeRecovery(xs []observedAttempt, targets []float64) float64 {
+	probes, recovered := 0, 0
+	for i, x := range xs {
+		if !x.Probe {
+			continue
+		}
+		probes++
+		if i+1 < len(targets) && !xs[i+1].Probe {
+			baseline := xs[i+1].SessionCenter
+			if baseline <= 0 {
+				baseline = targets[i+1]
+			}
+			if abs(targets[i+1]-baseline) <= .60 {
+				recovered++
+			}
+		}
+	}
+	if probes == 0 {
+		return 0
+	}
+	return float64(recovered) / float64(probes)
+}
+
+func replayTrace(xs []observedAttempt, targets []float64) []map[string]any {
+	out := make([]map[string]any, 0, len(xs))
+	for i, x := range xs {
+		target := x.TargetDifficulty
+		if i < len(targets) {
+			target = targets[i]
+		}
+		out = append(out, map[string]any{"index": i + 1, "attempt_id": x.ID, "before_target": x.TargetDifficulty, "candidate_target": target, "realized_difficulty": x.RealizedDifficulty, "selection_reason": x.Reason, "is_probe": x.Probe})
+	}
+	return out
 }
 
 func runCalibrationReportCLI() error {
