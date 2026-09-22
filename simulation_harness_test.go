@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -124,6 +126,16 @@ type recordingChatClient struct {
 	err      error
 }
 
+type acceptanceFakeGenerator struct {
+	calls int
+}
+
+func (g *acceptanceFakeGenerator) Generate(_ context.Context, ex SimulationExercise) (SimulationExercise, error) {
+	g.calls++
+	ex.ChinesePrompt = "话虽如此，我认为我们应该等待。"
+	return ex, nil
+}
+
 func (c *recordingChatClient) Chat(_ context.Context, req ChatRequest) (*ChatResponse, error) {
 	c.request = req
 	if c.err != nil {
@@ -147,8 +159,36 @@ func TestLLMLearnerAdapterSeparatesPromptAndHandlesFailures(t *testing.T) {
 	if _, err := adapter.Answer(context.Background(), SimulationExercise{}, SimulatedLearnerState{}); err == nil {
 		t.Fatal("provider error was swallowed")
 	}
+	client.err = context.DeadlineExceeded
+	if _, err := adapter.Answer(context.Background(), SimulationExercise{}, SimulatedLearnerState{}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timeout error was not preserved: %v", err)
+	}
 	if _, err := (FakeLearner{}).Answer(context.Background(), SimulationExercise{}, SimulatedLearnerState{}); err == nil {
 		t.Fatal("empty fake answer was accepted")
+	}
+}
+
+func TestFullAIAdaptersClassifyGeneratorAndEvaluatorTimeouts(t *testing.T) {
+	client := &recordingChatClient{err: context.DeadlineExceeded}
+	generator := LLMExerciseGenerator{Client: client}
+	if _, err := generator.Generate(context.Background(), SimulationExercise{Pattern: "Having said that, ...", SceneID: "meeting", Intent: "contrast", DifficultyBand: "challenging"}); classifySimulationFailure(err) != "timeout" {
+		t.Fatalf("generator timeout was not classified: %v", err)
+	}
+
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(100 * time.Millisecond):
+		}
+	}))
+	defer mock.Close()
+	provider := ProviderConfig{ID: "evaluator-timeout", Name: "Evaluator Timeout", Type: "openai-compatible", BaseURL: mock.URL, Model: "mock", Timeout: 1, Enabled: true}
+	server := &Server{llm: &LLMRegistry{configs: map[string]ProviderConfig{provider.ID: provider}}}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := (ProductionSimulationEvaluator{Server: server, Provider: provider.ID}).Evaluate(ctx, SimulationExercise{ChinesePrompt: "话虽如此，我仍然认为我们应该等待。", PatternID: "having-said-that", Pattern: "Having said that, ...", SceneID: "meeting"}, SimulatedAnswer{Text: "That said, I still think we should wait."})
+	if classifySimulationFailure(err) != "timeout" {
+		t.Fatalf("evaluator timeout was not classified: %v", err)
 	}
 }
 
@@ -190,5 +230,60 @@ func TestAIAdaptersKeepProviderFailuresOutOfLearnerAccuracy(t *testing.T) {
 		if attempt.Verdict != "system_failure" || attempt.ErrorKind != "provider_error" {
 			t.Fatalf("bad failure classification: %#v", attempt)
 		}
+	}
+}
+
+func TestFullAIChainRunsGeneratorLearnerEvaluatorAndStateUpdate(t *testing.T) {
+	generator := &acceptanceFakeGenerator{}
+	runner := &SimulationRunner{
+		Generator: generator,
+		Learner:   FakeLearner{AnswerText: "That said, I still think we should wait."},
+		Evaluator: FakeEvaluator{Result: SimulationEvaluation{Correct: true, Verdict: "correct", Meaning: .95, Grammar: .95, Naturalness: .9, Pattern: .9, TargetPatternMatch: TargetPatternSemanticEquivalent, TargetPatternScore: .9}},
+	}
+	c := simulationTestConfig("advanced-uneven", 4)
+	c.Mode, c.Generator, c.SessionSize, c.Scene = SimulationModeFullAI, "real-generator", 2, "meeting"
+	r, err := runner.Run(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generator.calls != 4 || r.AI.GeneratorCalls != 4 || r.AI.LearnerCalls != 4 || r.AI.EvaluatorCalls != 4 || r.AI.TotalCalls != 12 {
+		t.Fatalf("full-AI call chain incomplete: generator=%d usage=%#v", generator.calls, r.AI)
+	}
+	if r.Metrics.AdaptiveStateUpdates != 4 || r.Metrics.AdaptiveNextExerciseReplans == 0 || r.Metrics.PatternMatchCounts[TargetPatternSemanticEquivalent] != 4 {
+		t.Fatalf("full-AI adaptive state or semantic evidence not recorded: %#v", r.Metrics)
+	}
+}
+
+func TestLocalAcceptanceRunsCoverRunAAndRunBWithoutExternalCalls(t *testing.T) {
+	learner := FakeLearner{AnswerText: "I would follow up tomorrow."}
+	evaluator := FakeEvaluator{Result: SimulationEvaluation{Correct: true, Verdict: "correct", Meaning: 1, Grammar: .9, Naturalness: .85, Pattern: .9}}
+	runner := &SimulationRunner{Learner: learner, Evaluator: evaluator}
+
+	runA := simulationTestConfig("stable-intermediate", 20)
+	runA.Mode, runA.SessionSize, runA.TimeProfile = SimulationModeLLMLearner, 10, SimulationTimeDaily
+	a, err := runner.Run(context.Background(), runA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Attempts != 20 || a.Sessions != 2 || a.AI.TotalCalls != 40 || a.Metrics.SystemFailures != 0 {
+		t.Fatalf("Run A local acceptance incomplete: %#v", a)
+	}
+	for _, attempt := range a.AttemptsTrace {
+		if strings.HasPrefix(attempt.Exercise.ChinesePrompt, "Express ") {
+			t.Fatalf("fixture prompt is not a Chinese learner exercise: %q", attempt.Exercise.ChinesePrompt)
+		}
+	}
+
+	runB := simulationTestConfig("advanced-uneven", 20)
+	runB.Mode, runB.SessionSize, runB.Scene, runB.TimeProfile = SimulationModeLLMLearner, 10, "meeting", SimulationTimeDaily
+	b, err := runner.Run(context.Background(), runB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Attempts != 20 || b.Sessions != 2 || b.AI.TotalCalls != 40 || b.Metrics.SystemFailures != 0 {
+		t.Fatalf("Run B local acceptance incomplete: %#v", b)
+	}
+	if b.Metrics.SceneCoverage["meeting"] != 1 || b.Metrics.UniquePatterns < 2 || b.Metrics.MaxConsecutiveSamePattern > 2 {
+		t.Fatalf("Run B scene diversity/stability failed: %#v", b.Metrics)
 	}
 }

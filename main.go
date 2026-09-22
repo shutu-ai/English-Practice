@@ -21,7 +21,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 8
+const schemaVersion = 9
 
 type Server struct {
 	db     *sql.DB
@@ -332,7 +332,7 @@ func migrate(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS exercises (id TEXT PRIMARY KEY, chinese_prompt TEXT NOT NULL, pattern_id TEXT NOT NULL, scene_id TEXT NOT NULL, intent_id TEXT NOT NULL, difficulty REAL NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, FOREIGN KEY(pattern_id) REFERENCES sentence_patterns(id), FOREIGN KEY(scene_id) REFERENCES scenes(id))`,
 		`CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, mode TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, start_global_difficulty REAL NOT NULL DEFAULT 0, end_global_difficulty REAL NOT NULL DEFAULT 0, patterns_seen TEXT NOT NULL DEFAULT '{}', skills_seen TEXT NOT NULL DEFAULT '{}', reviews_served INTEGER NOT NULL DEFAULT 0, probes_served INTEGER NOT NULL DEFAULT 0, new_skills_served INTEGER NOT NULL DEFAULT 0)`,
 		`CREATE TABLE IF NOT EXISTS attempts (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, exercise_id TEXT NOT NULL, user_answer TEXT NOT NULL, submitted_at TEXT NOT NULL, provider TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', prompt_version TEXT NOT NULL DEFAULT '', evaluation_status TEXT NOT NULL, FOREIGN KEY(session_id) REFERENCES sessions(id), FOREIGN KEY(exercise_id) REFERENCES exercises(id))`,
-		`CREATE TABLE IF NOT EXISTS evaluations (id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL UNIQUE, verdict TEXT NOT NULL, meaning_score REAL NOT NULL, grammar_score REAL NOT NULL, naturalness_score REAL NOT NULL, pattern_score REAL NOT NULL, errors_json TEXT NOT NULL, suggested_answer TEXT NOT NULL, more_natural TEXT NOT NULL DEFAULT '', more_natural_needed INTEGER NOT NULL DEFAULT 0, alternative TEXT NOT NULL DEFAULT '', explanation_zh TEXT NOT NULL, validated INTEGER NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY(attempt_id) REFERENCES attempts(id))`,
+		`CREATE TABLE IF NOT EXISTS evaluations (id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL UNIQUE, verdict TEXT NOT NULL, meaning_score REAL NOT NULL, grammar_score REAL NOT NULL, naturalness_score REAL NOT NULL, pattern_score REAL NOT NULL, target_pattern_match TEXT NOT NULL DEFAULT 'unknown', target_pattern_score REAL NOT NULL DEFAULT 0, errors_json TEXT NOT NULL, suggested_answer TEXT NOT NULL, more_natural TEXT NOT NULL DEFAULT '', more_natural_needed INTEGER NOT NULL DEFAULT 0, alternative TEXT NOT NULL DEFAULT '', explanation_zh TEXT NOT NULL, validated INTEGER NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY(attempt_id) REFERENCES attempts(id))`,
 		`CREATE TABLE IF NOT EXISTS pattern_mastery (pattern_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL, correct INTEGER NOT NULL, recent_accuracy REAL NOT NULL, long_term_accuracy REAL NOT NULL, consecutive_correct INTEGER NOT NULL, last_practiced TEXT, mastery REAL NOT NULL, FOREIGN KEY(pattern_id) REFERENCES sentence_patterns(id))`,
 		`CREATE TABLE IF NOT EXISTS scene_mastery (scene_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL, correct INTEGER NOT NULL, mastery REAL NOT NULL, last_practiced TEXT, FOREIGN KEY(scene_id) REFERENCES scenes(id))`,
 		`CREATE TABLE IF NOT EXISTS error_stats (error_type TEXT PRIMARY KEY, count INTEGER NOT NULL, severity_sum REAL NOT NULL, last_seen TEXT NOT NULL)`,
@@ -400,6 +400,8 @@ func migrate(db *sql.DB) error {
 		{"evaluations", "more_natural", "TEXT NOT NULL DEFAULT ''"},
 		{"evaluations", "more_natural_needed", "INTEGER NOT NULL DEFAULT 0"},
 		{"evaluations", "alternative", "TEXT NOT NULL DEFAULT ''"},
+		{"evaluations", "target_pattern_match", "TEXT NOT NULL DEFAULT 'unknown'"},
+		{"evaluations", "target_pattern_score", "REAL NOT NULL DEFAULT 0"},
 		{"sentence_patterns", "catalog_difficulty", "REAL NOT NULL DEFAULT 0"},
 		{"learner_skill_state", "evidence_count", "INTEGER NOT NULL DEFAULT 0"},
 		{"learner_skill_state", "state_confidence", "REAL NOT NULL DEFAULT 0"},
@@ -1218,18 +1220,28 @@ func chooseScene(s string) string {
 }
 
 type Eval struct {
-	Verdict           string           `json:"verdict"`
-	MeaningScore      float64          `json:"meaning_score"`
-	GrammarScore      float64          `json:"grammar_score"`
-	NaturalnessScore  float64          `json:"naturalness_score"`
-	PatternScore      float64          `json:"pattern_score"`
-	Errors            []map[string]any `json:"errors"`
-	SuggestedAnswer   string           `json:"suggested_answer"`
-	MoreNatural       string           `json:"more_natural,omitempty"`
-	MoreNaturalNeeded bool             `json:"more_natural_needed,omitempty"`
-	Alternative       string           `json:"alternative,omitempty"`
-	ExplanationZH     string           `json:"explanation_zh"`
+	Verdict            string           `json:"verdict"`
+	MeaningScore       float64          `json:"meaning_score"`
+	GrammarScore       float64          `json:"grammar_score"`
+	NaturalnessScore   float64          `json:"naturalness_score"`
+	PatternScore       float64          `json:"pattern_score"`
+	TargetPatternMatch string           `json:"target_pattern_match"`
+	TargetPatternScore float64          `json:"target_pattern_score"`
+	Errors             []map[string]any `json:"errors"`
+	SuggestedAnswer    string           `json:"suggested_answer"`
+	MoreNatural        string           `json:"more_natural,omitempty"`
+	MoreNaturalNeeded  bool             `json:"more_natural_needed,omitempty"`
+	Alternative        string           `json:"alternative,omitempty"`
+	ExplanationZH      string           `json:"explanation_zh"`
 }
+
+const (
+	TargetPatternExact              = "exact"
+	TargetPatternSemanticEquivalent = "semantic_equivalent"
+	TargetPatternPartial            = "partial"
+	TargetPatternNotMatched         = "not_matched"
+	TargetPatternUnknown            = "unknown"
+)
 
 type EvaluationDiagnostics struct {
 	RequestID     string `json:"request_id"`
@@ -1320,6 +1332,178 @@ func normalizeSeverity(value string) (string, error) {
 		return v, nil
 	}
 	return "", fmt.Errorf("unknown severity %q", value)
+}
+
+func normalizeTargetPatternMatch(value string) (string, error) {
+	v := normalizeEnum(value)
+	switch v {
+	case TargetPatternExact, TargetPatternSemanticEquivalent, TargetPatternPartial, TargetPatternNotMatched, TargetPatternUnknown:
+		return v, nil
+	case "semantic", "equivalent", "semantic_match":
+		return TargetPatternSemanticEquivalent, nil
+	case "notmatch", "no_match", "mismatch":
+		return TargetPatternNotMatched, nil
+	}
+	return "", fmt.Errorf("unknown target pattern match %q", value)
+}
+
+func normalizePatternText(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.NewReplacer("’", "'", "‘", "'", "“", "\"", "”", "\"", "…", "...", "–", "-", "—", "-").Replace(value)
+	value = strings.NewReplacer(".", " ", ",", " ", ";", " ", ":", " ", "!", " ", "?", " ", "(", " ", ")", " ").Replace(value)
+	return strings.Join(strings.Fields(value), " ")
+}
+
+func hasPatternPhrase(answer, phrase string) bool {
+	return strings.Contains(" "+normalizePatternText(answer)+" ", " "+normalizePatternText(phrase)+" ")
+}
+
+// classifyTargetPattern implements the small, versioned pattern-family model
+// used to reconcile provider judgments. It is deliberately narrower than a
+// general semantic parser: it recognizes only documented equivalents and
+// otherwise leaves the provider result alone.
+func classifyTargetPattern(pattern, targetPattern, answer string) (string, float64, bool) {
+	text := normalizePatternText(answer)
+	if text == "" {
+		return TargetPatternNotMatched, 0, true
+	}
+	id := strings.ToLower(strings.TrimSpace(pattern))
+	target := normalizePatternText(targetPattern)
+	if id == "" {
+		id = target
+	}
+	exact := func(phrases ...string) bool {
+		for _, phrase := range phrases {
+			if hasPatternPhrase(text, phrase) {
+				return true
+			}
+		}
+		return false
+	}
+	semantic := func(phrases ...string) bool {
+		for _, phrase := range phrases {
+			if hasPatternPhrase(text, phrase) {
+				return true
+			}
+		}
+		return false
+	}
+
+	switch id {
+	case "having-said-that", "having said that":
+		if exact("having said that") {
+			return TargetPatternExact, 1, true
+		}
+		if semantic("that said", "even so") {
+			return TargetPatternSemanticEquivalent, .9, true
+		}
+		if semantic("on the other hand", "nevertheless") {
+			return TargetPatternPartial, .6, true
+		}
+		return TargetPatternNotMatched, .15, true
+	case "clarification", "what i mean is":
+		if exact("what i mean is") {
+			return TargetPatternExact, 1, true
+		}
+		if semantic("what i'm trying to say is", "what i am trying to say is", "what i mean to say is") {
+			return TargetPatternSemanticEquivalent, .9, true
+		}
+		if semantic("in other words", "to clarify") {
+			return TargetPatternPartial, .6, true
+		}
+		return TargetPatternNotMatched, .15, true
+	case "professional-suggestion", "i'd like to suggest":
+		if exact("i'd like to suggest", "i would like to suggest") {
+			return TargetPatternExact, 1, true
+		}
+		if semantic("i suggest", "i recommend") {
+			return TargetPatternSemanticEquivalent, .9, true
+		}
+		return TargetPatternNotMatched, .15, true
+	case "disagreement", "i see your point, but":
+		if exact("i see your point but") {
+			return TargetPatternExact, 1, true
+		}
+		if semantic("i understand your point but", "i understand you but", "i get your point but") {
+			return TargetPatternSemanticEquivalent, .9, true
+		}
+		return TargetPatternNotMatched, .15, true
+	case "formal-opinion", "i'm not entirely convinced that":
+		if exact("i'm not entirely convinced that", "i am not entirely convinced that") {
+			return TargetPatternExact, 1, true
+		}
+		if semantic("i'm not completely convinced that", "i am not completely convinced that", "i'm not fully convinced that", "i'm not totally convinced that", "i am not fully convinced that", "i am not totally convinced that") {
+			return TargetPatternSemanticEquivalent, .9, true
+		}
+		return TargetPatternNotMatched, .15, true
+	case "mixed-conditional", "if i had i would":
+		if hasPatternPhrase(text, "if i had") && strings.Contains(text, " would ") {
+			return TargetPatternExact, 1, true
+		}
+		if hasPatternPhrase(text, "had i") && strings.Contains(text, " would ") {
+			return TargetPatternSemanticEquivalent, .9, true
+		}
+		return TargetPatternNotMatched, .15, true
+	}
+	return TargetPatternUnknown, 0, false
+}
+
+func removeTargetPatternErrors(errorsList []map[string]any) []map[string]any {
+	out := make([]map[string]any, 0, len(errorsList))
+	for _, item := range errorsList {
+		typ, _ := item["type"].(string)
+		if typ != "target_pattern_missing" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func reconcileTargetPattern(e *Eval, pattern, targetPattern, answer string) {
+	match, score, supported := classifyTargetPattern(pattern, targetPattern, answer)
+	if !supported {
+		if e.TargetPatternMatch == "" {
+			e.TargetPatternMatch = TargetPatternUnknown
+		}
+		if e.TargetPatternScore <= 0 {
+			e.TargetPatternScore = e.PatternScore
+		}
+		return
+	}
+	e.TargetPatternMatch, e.TargetPatternScore = match, score
+	switch match {
+	case TargetPatternExact, TargetPatternSemanticEquivalent:
+		e.Errors = removeTargetPatternErrors(e.Errors)
+		if e.PatternScore < score {
+			e.PatternScore = score
+		}
+		quality := math.Min(e.MeaningScore, math.Min(e.GrammarScore, e.NaturalnessScore))
+		if quality >= .65 {
+			e.Verdict = "correct"
+		}
+	case TargetPatternPartial:
+		if e.PatternScore > score {
+			e.PatternScore = score
+		}
+		if e.Verdict == "correct" {
+			e.Verdict = "mostly_correct"
+		}
+	case TargetPatternNotMatched:
+		e.PatternScore = math.Min(e.PatternScore, score)
+		found := false
+		for _, item := range e.Errors {
+			if typ, _ := item["type"].(string); typ == "target_pattern_missing" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			e.Errors = append(e.Errors, map[string]any{"type": "target_pattern_missing", "severity": "major", "explanation": "The answer may communicate a related meaning, but it does not demonstrate the target grammatical or discourse function."})
+		}
+		if e.Verdict == "correct" || e.Verdict == "mostly_correct" {
+			e.Verdict = "needs_improvement"
+		}
+	}
 }
 
 func lookupField(fields map[string]json.RawMessage, names ...string) (json.RawMessage, bool) {
@@ -1544,6 +1728,23 @@ func normalizeEvalContent(raw string) (Eval, error) {
 	if err != nil {
 		return out, err
 	}
+	out.TargetPatternMatch = TargetPatternUnknown
+	if raw, ok := lookupField(fields, "target_pattern_match", "targetPatternMatch"); ok {
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return out, errors.New("target_pattern_match must be a string")
+		}
+		out.TargetPatternMatch, err = normalizeTargetPatternMatch(value)
+		if err != nil {
+			return out, err
+		}
+	}
+	if raw, ok := lookupField(fields, "target_pattern_score", "targetPatternScore"); ok && string(raw) != "null" {
+		out.TargetPatternScore, err = parseScore(raw, "target_pattern_score")
+		if err != nil {
+			return out, err
+		}
+	}
 	out.SuggestedAnswer, err = parseRequiredString(fields, "suggested_answer", "suggestedAnswer")
 	if err != nil {
 		return out, err
@@ -1695,7 +1896,7 @@ func (s *Server) saveValidatedAttempt(attempt, prompt, pattern, scene string, di
 	if _, err = tx.Exec(`UPDATE attempts SET provider=?,model=?,prompt_version='v1',evaluation_status='validated',evaluation_diagnostics_json=? WHERE id=?`, provider, model, string(diagJSON), attempt); err != nil {
 		return nil, err
 	}
-	if _, err = tx.Exec(`INSERT INTO evaluations(id,attempt_id,verdict,meaning_score,grammar_score,naturalness_score,pattern_score,errors_json,suggested_answer,more_natural,more_natural_needed,alternative,explanation_zh,validated,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)`, id("evaluation"), attempt, eval.Verdict, eval.MeaningScore, eval.GrammarScore, eval.NaturalnessScore, eval.PatternScore, string(errorsJSON), eval.SuggestedAnswer, eval.MoreNatural, boolInt(eval.MoreNaturalNeeded), eval.Alternative, eval.ExplanationZH, time.Now().UTC().Format(time.RFC3339)); err != nil {
+	if _, err = tx.Exec(`INSERT INTO evaluations(id,attempt_id,verdict,meaning_score,grammar_score,naturalness_score,pattern_score,target_pattern_match,target_pattern_score,errors_json,suggested_answer,more_natural,more_natural_needed,alternative,explanation_zh,validated,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)`, id("evaluation"), attempt, eval.Verdict, eval.MeaningScore, eval.GrammarScore, eval.NaturalnessScore, eval.PatternScore, eval.TargetPatternMatch, eval.TargetPatternScore, string(errorsJSON), eval.SuggestedAnswer, eval.MoreNatural, boolInt(eval.MoreNaturalNeeded), eval.Alternative, eval.ExplanationZH, time.Now().UTC().Format(time.RFC3339)); err != nil {
 		return nil, err
 	}
 	var masteryBefore, difficultyBefore, patternAbilityBefore, targetDifficulty, realizedDifficulty float64
@@ -1774,6 +1975,8 @@ func (s *Server) saveValidatedAttempt(attempt, prompt, pattern, scene string, di
 	trace["session_center_before"] = sessionBefore.Center
 	trace["session_center_after"] = updatedSession.Center
 	trace["learner_ability_after"] = difficultyAfter
+	trace["target_pattern_match"] = eval.TargetPatternMatch
+	trace["target_pattern_score"] = eval.TargetPatternScore
 	trace["difficulty_validation_status"] = validationStatusForAttempt(tx, attempt)
 	traceJSON, _ := json.Marshal(trace)
 	if _, err = tx.Exec(`UPDATE attempts SET mastery_before=?,mastery_after=?,difficulty_before=?,difficulty_after=?,learner_ability=?,session_center=?,pattern_ability=?,target_difficulty=?,realized_difficulty=?,difficulty_delta=?,difficulty_validation_status=?,difficulty_policy_version=?,position=? WHERE id=?`, masteryBefore, masteryAfter, difficultyBefore, difficultyAfter, difficultyAfter, updatedSession.Center, patternAbilityBefore, targetDifficulty, realizedDifficulty, traceDelta, validationStatusForAttempt(tx, attempt), cfg.DifficultyPolicyVersion, position, attempt); err != nil {
@@ -1804,7 +2007,7 @@ func (s *Server) loadEvaluation(attempt string) (Eval, error) {
 	var e Eval
 	var errorsJSON string
 	var moreNaturalNeeded int
-	if err := s.db.QueryRow("SELECT verdict,meaning_score,grammar_score,naturalness_score,pattern_score,errors_json,suggested_answer,more_natural,more_natural_needed,alternative,explanation_zh FROM evaluations WHERE attempt_id=?", attempt).Scan(&e.Verdict, &e.MeaningScore, &e.GrammarScore, &e.NaturalnessScore, &e.PatternScore, &errorsJSON, &e.SuggestedAnswer, &e.MoreNatural, &moreNaturalNeeded, &e.Alternative, &e.ExplanationZH); err != nil {
+	if err := s.db.QueryRow("SELECT verdict,meaning_score,grammar_score,naturalness_score,pattern_score,COALESCE(target_pattern_match,'unknown'),COALESCE(target_pattern_score,0),errors_json,suggested_answer,more_natural,more_natural_needed,alternative,explanation_zh FROM evaluations WHERE attempt_id=?", attempt).Scan(&e.Verdict, &e.MeaningScore, &e.GrammarScore, &e.NaturalnessScore, &e.PatternScore, &e.TargetPatternMatch, &e.TargetPatternScore, &errorsJSON, &e.SuggestedAnswer, &e.MoreNatural, &moreNaturalNeeded, &e.Alternative, &e.ExplanationZH); err != nil {
 		return e, err
 	}
 	e.MoreNaturalNeeded = moreNaturalNeeded == 1
@@ -1830,10 +2033,14 @@ func (s *Server) reevaluateAttempt(ctx context.Context, attempt string) (map[str
 }
 
 func (s *Server) evaluate(ctx context.Context, prompt, pattern, answer string) (Eval, string, string, EvaluationDiagnostics, error) {
+	return s.evaluateWithProvider(ctx, prompt, pattern, answer, "")
+}
+
+func (s *Server) evaluateWithProvider(ctx context.Context, prompt, pattern, answer, providerID string) (Eval, string, string, EvaluationDiagnostics, error) {
 	s.llm.mu.RLock()
 	var c ProviderConfig
 	for _, x := range s.llm.configs {
-		if x.Enabled {
+		if x.Enabled && (providerID == "" || x.ID == providerID || strings.EqualFold(x.Name, providerID)) {
 			c = x
 			break
 		}
@@ -1845,7 +2052,9 @@ func (s *Server) evaluate(ctx context.Context, prompt, pattern, answer string) (
 		diagnostics.ProviderType = "local"
 		diagnostics.Model = "heuristic"
 		diagnostics.Success = true
-		return heuristicEval(prompt, pattern, answer), "local", "heuristic", diagnostics, nil
+		e := heuristicEval(prompt, pattern, answer)
+		reconcileTargetPattern(&e, pattern, pattern, answer)
+		return e, "local", "heuristic", diagnostics, nil
 	}
 	targetPattern := pattern
 	if s.db != nil {
@@ -1854,7 +2063,7 @@ func (s *Server) evaluate(ctx context.Context, prompt, pattern, answer string) (
 			targetPattern = label
 		}
 	}
-	baseMessages := []ChatMessage{{Role: "system", Content: "Evaluate an English learner answer. Return exactly one JSON object in the assistant content; do not include reasoning or prose. The object must have verdict (string), meaning_score (number), grammar_score (number), naturalness_score (number), pattern_score (number), errors (array), suggested_answer (string), explanation_zh (string), and may include more_natural_needed (boolean), more_natural (string), and alternative (string). verdict must be exactly one of: correct, mostly_correct, needs_improvement, incorrect. Scores must be numbers from 0 to 1. Use errors:[] when there are no errors. Every error object must contain all three string fields: type, severity, and explanation. Each error type must be one of meaning, tense, article, preposition, word_order, modal, condition, agreement, word_choice, missing_information, extra_information, unnatural_expression, target_pattern_missing, register, other. Each severity must be minor, moderate, or major. The suggested_answer must preserve and demonstrate the target pattern. Do not rewrite an already correct and natural answer merely to produce a different sentence: set more_natural_needed=false and more_natural to an empty string. Only provide more_natural when it is a meaningful improvement; use alternative for a useful but not strictly better rephrasing."}, {Role: "user", Content: fmt.Sprintf("Prompt: %s\nTarget pattern expression: %s\nTarget pattern ID: %s\nAnswer: %s", prompt, targetPattern, pattern, answer)}}
+	baseMessages := []ChatMessage{{Role: "system", Content: "Evaluate an English learner answer. Return exactly one JSON object in the assistant content; do not include reasoning or prose. The object must have verdict (string), meaning_score (number), grammar_score (number), naturalness_score (number), pattern_score (number), target_pattern_match (string), target_pattern_score (number), errors (array), suggested_answer (string), explanation_zh (string), and may include more_natural_needed (boolean), more_natural (string), and alternative (string). verdict must be exactly one of: correct, mostly_correct, needs_improvement, incorrect. Scores must be numbers from 0 to 1. target_pattern_match must be exactly one of: exact, semantic_equivalent, partial, not_matched. Do not require literal use of the target phrase. Accept natural semantic equivalents when they genuinely demonstrate the same grammatical or discourse function. Do not accept a merely similar overall meaning if the target grammatical/discourse skill was not demonstrated. Decide in this order: meaning, communication intent, grammar, naturalness, target pattern function. Use errors:[] when there are no errors. Every error object must contain all three string fields: type, severity, and explanation. Each error type must be one of meaning, tense, article, preposition, word_order, modal, condition, agreement, word_choice, missing_information, extra_information, unnatural_expression, target_pattern_missing, register, other. Each severity must be minor, moderate, or major. The suggested_answer must preserve and demonstrate the target pattern. Do not rewrite an already correct and natural answer merely to produce a different sentence: set more_natural_needed=false and more_natural to an empty string. Only provide more_natural when it is a meaningful improvement; use alternative for a useful but not strictly better rephrasing."}, {Role: "user", Content: fmt.Sprintf("Prompt: %s\nTarget pattern expression: %s\nTarget pattern ID: %s\nAnswer: %s", prompt, targetPattern, pattern, answer)}}
 	jsonMode := true
 	const maxEvaluationAttempts = 3
 	for attempt := 0; attempt < maxEvaluationAttempts; attempt++ {
@@ -1902,6 +2111,7 @@ func (s *Server) evaluate(ctx context.Context, prompt, pattern, answer string) (
 		diagnostics.ResponseShape = resp.ResponseShape
 		ev, parseErr := normalizeEvalContent(resp.Content)
 		if parseErr == nil {
+			reconcileTargetPattern(&ev, pattern, targetPattern, answer)
 			diagnostics.Success = true
 			return ev, c.ID, c.Model, diagnostics, nil
 		}
@@ -1919,10 +2129,19 @@ func validateEval(e *Eval) error {
 	if e.Verdict != "correct" && e.Verdict != "mostly_correct" && e.Verdict != "needs_improvement" && e.Verdict != "incorrect" {
 		return errors.New("invalid verdict")
 	}
+	if e.TargetPatternMatch == "" {
+		e.TargetPatternMatch = TargetPatternUnknown
+	}
+	if _, err := normalizeTargetPatternMatch(e.TargetPatternMatch); err != nil {
+		return err
+	}
 	for _, v := range []float64{e.MeaningScore, e.GrammarScore, e.NaturalnessScore, e.PatternScore} {
 		if v < 0 || v > 1 {
 			return errors.New("score out of range")
 		}
+	}
+	if e.TargetPatternScore < 0 || e.TargetPatternScore > 1 {
+		return errors.New("target pattern score out of range")
 	}
 	if strings.TrimSpace(e.SuggestedAnswer) == "" || strings.TrimSpace(e.ExplanationZH) == "" {
 		return errors.New("missing required evaluation fields")

@@ -145,6 +145,7 @@ type SimulationConfig struct {
 	Timeout                                                          time.Duration
 	EstimatedCostLimit                                               float64
 	LearnerProvider, LearnerModel, EvaluatorProvider, EvaluatorModel string
+	GeneratorProvider, GeneratorModel                                string
 	Output, SimulationDBPath                                         string
 	DryRun, AllowLarge, AttemptsExplicit                             bool
 }
@@ -205,11 +206,18 @@ type SimulatedAnswer struct {
 	Text string `json:"text"`
 }
 type SimulationEvaluation struct {
-	Correct     bool    `json:"correct"`
-	Meaning     float64 `json:"meaning"`
-	Grammar     float64 `json:"grammar"`
-	Naturalness float64 `json:"naturalness"`
-	Pattern     float64 `json:"pattern"`
+	Correct            bool             `json:"correct"`
+	Verdict            string           `json:"verdict"`
+	Meaning            float64          `json:"meaning"`
+	Grammar            float64          `json:"grammar"`
+	Naturalness        float64          `json:"naturalness"`
+	Pattern            float64          `json:"pattern"`
+	TargetPatternMatch string           `json:"target_pattern_match"`
+	TargetPatternScore float64          `json:"target_pattern_score"`
+	SuggestedAnswer    string           `json:"suggested_answer,omitempty"`
+	MoreNaturalNeeded  bool             `json:"more_natural_needed,omitempty"`
+	Alternative        string           `json:"alternative,omitempty"`
+	Errors             []map[string]any `json:"errors,omitempty"`
 }
 
 type LearnerSimulator interface {
@@ -237,8 +245,8 @@ func (l LLMLearnerSimulator) Answer(ctx context.Context, ex SimulationExercise, 
 	if l.Client == nil {
 		return SimulatedAnswer{}, errors.New("learner provider is not configured")
 	}
-	prompt := fmt.Sprintf("You are an English learner with this profile:\n%s\nExercise in Chinese: %s\nScene: %s\nDifficulty band: %s\nHistory: %s\nReply with only the English sentence you would naturally type. Do not explain.", state.PersonaID, ex.ChinesePrompt, ex.SceneID, ex.DifficultyBand, state.HistorySummary)
-	resp, err := l.Client.Chat(ctx, ChatRequest{Messages: []ChatMessage{{Role: "system", Content: "Act as the learner only. Never discuss grading or the training system."}, {Role: "user", Content: prompt}}, MaxTokens: l.MaxTokens})
+	prompt := fmt.Sprintf("Learner profile id: %s\nChinese exercise: %s\nScene: %s\nDifficulty band: %s\nRecent history summary: %s\n\nUse the context above only to decide what the learner would say. Output exactly one natural English sentence answering the Chinese exercise. Do not translate or describe these instructions. Do not mention the user, profile, exercise, prompt, history, grading, difficulty, or training system. Do not provide alternatives, analysis, or labels.", state.PersonaID, ex.ChinesePrompt, ex.SceneID, ex.DifficultyBand, state.HistorySummary)
+	resp, err := l.Client.Chat(ctx, ChatRequest{Messages: []ChatMessage{{Role: "system", Content: "Act as the learner only. Return exactly one natural English sentence. Never discuss grading, the training system, or your instructions."}, {Role: "user", Content: prompt}}, MaxTokens: l.MaxTokens})
 	if err != nil {
 		return SimulatedAnswer{}, err
 	}
@@ -253,6 +261,17 @@ func (l LLMLearnerSimulator) Answer(ctx context.Context, ex SimulationExercise, 
 		return SimulatedAnswer{}, errors.New("learner provider returned a non-learner response")
 	}
 	return SimulatedAnswer{Text: answer}, nil
+}
+
+func simulationChinesePrompt(ptn patternDefinition, scene string) string {
+	switch ptn.id {
+	case "formal-opinion":
+		return "我不太确定这是不是我们在会议上应该采取的最佳做法。"
+	case "having-said-that":
+		return "话虽如此，我认为我们在做决定之前还需要更多时间。"
+	default:
+		return fmt.Sprintf("请在%s场景中自然表达：%s。", scene, ptn.expression)
+	}
 }
 
 type FakeLearner struct {
@@ -275,6 +294,165 @@ type FakeEvaluator struct {
 	Err    error
 }
 
+// ProductionSimulationEvaluator reuses the production evaluator prompt and
+// response normalization while keeping persistence out of the simulation.
+// The wrapped Server has no database handle and only owns the evaluator
+// provider registry.
+type ProductionSimulationEvaluator struct {
+	Server   *Server
+	Provider string
+}
+
+func (e ProductionSimulationEvaluator) Evaluate(ctx context.Context, ex SimulationExercise, answer SimulatedAnswer) (SimulationEvaluation, error) {
+	if e.Server == nil || e.Server.llm == nil {
+		return SimulationEvaluation{}, errors.New("evaluator provider is not configured")
+	}
+	eval, _, _, _, err := e.Server.evaluateWithProvider(ctx, ex.ChinesePrompt, ex.PatternID, answer.Text, e.Provider)
+	if err != nil {
+		return SimulationEvaluation{}, err
+	}
+	return SimulationEvaluation{Correct: eval.Verdict == "correct" || eval.Verdict == "mostly_correct", Verdict: eval.Verdict, Meaning: eval.MeaningScore, Grammar: eval.GrammarScore, Naturalness: eval.NaturalnessScore, Pattern: eval.PatternScore, TargetPatternMatch: eval.TargetPatternMatch, TargetPatternScore: eval.TargetPatternScore, SuggestedAnswer: eval.SuggestedAnswer, MoreNaturalNeeded: eval.MoreNaturalNeeded, Alternative: eval.Alternative, Errors: eval.Errors}, nil
+}
+
+// LLMExerciseGenerator is intentionally independent from the production DB.
+// It generates a candidate prompt but returns only the learner-facing fields.
+type LLMExerciseGenerator struct {
+	Client    LLMClient
+	MaxTokens int
+}
+
+func (g LLMExerciseGenerator) Generate(ctx context.Context, ex SimulationExercise) (SimulationExercise, error) {
+	if g.Client == nil {
+		return SimulationExercise{}, errors.New("exercise generator provider is not configured")
+	}
+	maxTokens := g.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 512
+	}
+	system := "Generate one English practice exercise as strict JSON only. Return chinese_prompt, target_pattern, scene, intent, estimated_difficulty, and reference_answers. Keep the requested scene and target pattern. Do not include explanations."
+	user := fmt.Sprintf("Target scene: %s\nTarget subscene: %s\nTarget pattern: %s\nIntent: %s\nDifficulty band: %s", ex.SceneID, ex.SubsceneID, ex.Pattern, ex.Intent, ex.DifficultyBand)
+	resp, err := g.Client.Chat(ctx, ChatRequest{Messages: []ChatMessage{{Role: "system", Content: system}, {Role: "user", Content: user}}, MaxTokens: maxTokens, JSONMode: true})
+	if err != nil {
+		return SimulationExercise{}, err
+	}
+	clean, err := stripJSONFence(resp.Content)
+	if err != nil {
+		return SimulationExercise{}, err
+	}
+	var generated struct {
+		ChinesePrompt string  `json:"chinese_prompt"`
+		TargetPattern string  `json:"target_pattern"`
+		Scene         string  `json:"scene"`
+		Intent        string  `json:"intent"`
+		Difficulty    float64 `json:"estimated_difficulty"`
+	}
+	if err := json.Unmarshal([]byte(clean), &generated); err != nil {
+		return SimulationExercise{}, fmt.Errorf("invalid generator response: %w", err)
+	}
+	if strings.TrimSpace(generated.ChinesePrompt) == "" {
+		return SimulationExercise{}, errors.New("generator returned an empty prompt")
+	}
+	if generated.Scene != "" && generated.Scene != ex.SceneID {
+		return SimulationExercise{}, fmt.Errorf("generator scene mismatch: got %s, want %s", generated.Scene, ex.SceneID)
+	}
+	if generated.Intent != "" && generated.Intent != ex.Intent {
+		return SimulationExercise{}, fmt.Errorf("generator intent mismatch: got %s, want %s", generated.Intent, ex.Intent)
+	}
+	if generated.TargetPattern != "" && generated.TargetPattern != ex.Pattern && generated.TargetPattern != ex.PatternID {
+		return SimulationExercise{}, fmt.Errorf("generator target pattern mismatch: got %s, want %s", generated.TargetPattern, ex.Pattern)
+	}
+	if generated.Difficulty <= 0 {
+		generated.Difficulty = ex.Difficulty
+	}
+	if generated.Difficulty < 1 || generated.Difficulty > 8 {
+		return SimulationExercise{}, fmt.Errorf("generator difficulty out of range: %.3f", generated.Difficulty)
+	}
+	return SimulationExercise{ID: ex.ID, ChinesePrompt: generated.ChinesePrompt, PatternID: ex.PatternID, Pattern: ex.Pattern, SceneID: ex.SceneID, SubsceneID: ex.SubsceneID, Intent: ex.Intent, DifficultyBand: ex.DifficultyBand, Difficulty: generated.Difficulty}, nil
+}
+
+func simulationProviderDBPath() string {
+	dataDir := os.Getenv("ENGLISH_PRACTICE_DATA")
+	if dataDir == "" {
+		dataDir = "data"
+	}
+	return filepath.Join(dataDir, "english-practice.db")
+}
+
+func readConfiguredProvider(row interface{ Scan(...any) error }) (ProviderConfig, error) {
+	var c ProviderConfig
+	var enabled int
+	if err := row.Scan(&c.ID, &c.Name, &c.Type, &c.BaseURL, &c.APIKey, &c.Model, &c.Timeout, &c.Temperature, &c.MaxTokens, &enabled); err != nil {
+		return c, err
+	}
+	c.Enabled = enabled == 1
+	return c, nil
+}
+
+func chooseSimulationProvider(configs []ProviderConfig, requested, model string) (ProviderConfig, error) {
+	for _, c := range configs {
+		requestedMatch := requested == "" || requested == c.ID || strings.EqualFold(requested, c.Name)
+		modelMatch := model == "" || model == c.Model
+		if c.Enabled && requestedMatch && modelMatch {
+			if model != "" {
+				c.Model = model
+			}
+			return c, nil
+		}
+	}
+	return ProviderConfig{}, fmt.Errorf("no enabled provider matches provider=%q model=%q", requested, model)
+}
+
+func configuredSimulationRunner(cfg SimulationConfig) (*SimulationRunner, SimulationConfig, error) {
+	path := simulationProviderDBPath()
+	if _, err := os.Stat(path); err != nil {
+		return nil, cfg, fmt.Errorf("provider configuration DB is unavailable: %w", err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, cfg, err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	rows, err := db.Query(`SELECT id,name,type,base_url,api_key,model,timeout,temperature,max_tokens,enabled FROM llm_providers WHERE enabled=1 ORDER BY id`)
+	if err != nil {
+		return nil, cfg, err
+	}
+	defer rows.Close()
+	var configs []ProviderConfig
+	for rows.Next() {
+		c, scanErr := readConfiguredProvider(rows)
+		if scanErr != nil {
+			return nil, cfg, scanErr
+		}
+		configs = append(configs, c)
+	}
+	if len(configs) == 0 {
+		return nil, cfg, errors.New("no enabled simulation provider is configured")
+	}
+	learner, err := chooseSimulationProvider(configs, cfg.LearnerProvider, cfg.LearnerModel)
+	if err != nil {
+		return nil, cfg, err
+	}
+	evaluator, err := chooseSimulationProvider(configs, cfg.EvaluatorProvider, cfg.EvaluatorModel)
+	if err != nil {
+		return nil, cfg, err
+	}
+	generator, err := chooseSimulationProvider(configs, cfg.GeneratorProvider, cfg.GeneratorModel)
+	if err != nil {
+		return nil, cfg, err
+	}
+	cfg.LearnerProvider, cfg.LearnerModel = learner.ID, learner.Model
+	cfg.EvaluatorProvider, cfg.EvaluatorModel = evaluator.ID, evaluator.Model
+	cfg.GeneratorProvider, cfg.GeneratorModel = generator.ID, generator.Model
+	registry := &LLMRegistry{configs: map[string]ProviderConfig{learner.ID: learner, evaluator.ID: evaluator, generator.ID: generator}}
+	server := &Server{llm: registry}
+	runner := &SimulationRunner{Learner: LLMLearnerSimulator{Client: registry.Client(learner), Provider: learner.ID, Model: learner.Model, MaxTokens: cfg.MaxTokens}, Evaluator: ProductionSimulationEvaluator{Server: server, Provider: evaluator.ID}}
+	if cfg.Generator == "real-generator" {
+		runner.Generator = LLMExerciseGenerator{Client: registry.Client(generator), MaxTokens: cfg.MaxTokens}
+	}
+	return runner, cfg, nil
+}
+
 func (f FakeEvaluator) Evaluate(context.Context, SimulationExercise, SimulatedAnswer) (SimulationEvaluation, error) {
 	if f.Err != nil {
 		return SimulationEvaluation{}, f.Err
@@ -283,22 +461,23 @@ func (f FakeEvaluator) Evaluate(context.Context, SimulationExercise, SimulatedAn
 }
 
 type SimulationAttempt struct {
-	Index              int                `json:"index"`
-	Session            int                `json:"session"`
-	VirtualTime        time.Time          `json:"virtual_time"`
-	Exercise           SimulationExercise `json:"exercise"`
-	Correct            bool               `json:"correct"`
-	Review             bool               `json:"review"`
-	Probe              bool               `json:"probe"`
-	NewSkill           bool               `json:"new_skill"`
-	Reason             string             `json:"reason"`
-	ErrorKind          string             `json:"error_kind,omitempty"`
-	TargetDifficulty   float64            `json:"target_difficulty"`
-	RealizedDifficulty float64            `json:"realized_difficulty"`
-	EffectiveAbility   float64            `json:"effective_ability"`
-	SuccessProbability float64            `json:"success_probability"`
-	Answer             string             `json:"answer,omitempty"`
-	Verdict            string             `json:"verdict"`
+	Index              int                  `json:"index"`
+	Session            int                  `json:"session"`
+	VirtualTime        time.Time            `json:"virtual_time"`
+	Exercise           SimulationExercise   `json:"exercise"`
+	Correct            bool                 `json:"correct"`
+	Review             bool                 `json:"review"`
+	Probe              bool                 `json:"probe"`
+	NewSkill           bool                 `json:"new_skill"`
+	Reason             string               `json:"reason"`
+	ErrorKind          string               `json:"error_kind,omitempty"`
+	TargetDifficulty   float64              `json:"target_difficulty"`
+	RealizedDifficulty float64              `json:"realized_difficulty"`
+	EffectiveAbility   float64              `json:"effective_ability"`
+	SuccessProbability float64              `json:"success_probability"`
+	Answer             string               `json:"answer,omitempty"`
+	Verdict            string               `json:"verdict"`
+	Evaluation         SimulationEvaluation `json:"evaluation,omitempty"`
 }
 
 type SkillUnlockEvent struct {
@@ -310,34 +489,51 @@ type SkillUnlockEvent struct {
 }
 
 type SimulationMetrics struct {
-	OverallAccuracy              float64            `json:"overall_accuracy"`
-	AccuracyByDifficulty         map[string]float64 `json:"accuracy_by_difficulty,omitempty"`
-	AccuracyByPattern            map[string]float64 `json:"accuracy_by_pattern,omitempty"`
-	AccuracyByScene              map[string]float64 `json:"accuracy_by_scene,omitempty"`
-	DifficultyJitter             float64            `json:"difficulty_jitter"`
-	MaxAdjacentDifficultyJump    float64            `json:"max_adjacent_difficulty_jump"`
-	ProductiveZoneRatio          float64            `json:"productive_zone_ratio"`
-	ExactRepeatRate              float64            `json:"exact_repeat_rate"`
-	NormalizedExactDuplicateRate float64            `json:"normalized_exact_duplicate_rate"`
-	SamePatternSpacing           float64            `json:"same_pattern_spacing"`
-	WeakSkillExposure            float64            `json:"weak_skill_exposure"`
-	ReviewHitRate                float64            `json:"review_hit_rate"`
-	ProbeRatio                   float64            `json:"probe_ratio"`
-	ProbeSuccessRate             float64            `json:"probe_success_rate"`
-	UnknownToObserved            float64            `json:"unknown_to_observed"`
-	FoundationExposureRatio      float64            `json:"foundation_exposure_ratio"`
-	MaxConsecutiveSamePattern    int                `json:"max_consecutive_same_pattern"`
-	SkillUnlocks                 int                `json:"skill_unlocks"`
-	SceneCoverage                map[string]float64 `json:"scene_coverage"`
-	SceneMastery                 map[string]float64 `json:"scene_mastery"`
-	TransferEvents               int                `json:"transfer_events"`
-	AcquisitionTrajectory        []float64          `json:"acquisition_trajectory"`
-	RetentionTrajectory          []float64          `json:"retention_trajectory"`
-	TransferTrajectory           []float64          `json:"transfer_trajectory"`
-	SessionDifficultyTrajectory  []float64          `json:"session_difficulty_trajectory"`
-	LearnerAbilityTrajectory     []float64          `json:"learner_ability_trajectory"`
-	MemoryIntervalBefore         []float64          `json:"memory_interval_before,omitempty"`
-	MemoryIntervalAfter          []float64          `json:"memory_interval_after,omitempty"`
+	OverallAccuracy                  float64            `json:"overall_accuracy"`
+	AccuracyByDifficulty             map[string]float64 `json:"accuracy_by_difficulty,omitempty"`
+	AccuracyByPattern                map[string]float64 `json:"accuracy_by_pattern,omitempty"`
+	AccuracyByScene                  map[string]float64 `json:"accuracy_by_scene,omitempty"`
+	DifficultyJitter                 float64            `json:"difficulty_jitter"`
+	MaxAdjacentDifficultyJump        float64            `json:"max_adjacent_difficulty_jump"`
+	ProductiveZoneRatio              float64            `json:"productive_zone_ratio"`
+	ExactRepeatRate                  float64            `json:"exact_repeat_rate"`
+	NormalizedExactDuplicateRate     float64            `json:"normalized_exact_duplicate_rate"`
+	SamePatternSpacing               float64            `json:"same_pattern_spacing"`
+	WeakSkillExposure                float64            `json:"weak_skill_exposure"`
+	ReviewHitRate                    float64            `json:"review_hit_rate"`
+	ProbeRatio                       float64            `json:"probe_ratio"`
+	ProbeSuccessRate                 float64            `json:"probe_success_rate"`
+	UnknownToObserved                float64            `json:"unknown_to_observed"`
+	FoundationExposureRatio          float64            `json:"foundation_exposure_ratio"`
+	MaxConsecutiveSamePattern        int                `json:"max_consecutive_same_pattern"`
+	SkillUnlocks                     int                `json:"skill_unlocks"`
+	SceneCoverage                    map[string]float64 `json:"scene_coverage"`
+	SceneMastery                     map[string]float64 `json:"scene_mastery"`
+	TransferEvents                   int                `json:"transfer_events"`
+	AcquisitionTrajectory            []float64          `json:"acquisition_trajectory"`
+	RetentionTrajectory              []float64          `json:"retention_trajectory"`
+	TransferTrajectory               []float64          `json:"transfer_trajectory"`
+	SessionDifficultyTrajectory      []float64          `json:"session_difficulty_trajectory"`
+	LearnerAbilityTrajectory         []float64          `json:"learner_ability_trajectory"`
+	MemoryIntervalBefore             []float64          `json:"memory_interval_before,omitempty"`
+	MemoryIntervalAfter              []float64          `json:"memory_interval_after,omitempty"`
+	SystemFailures                   int                `json:"system_failures"`
+	ReviewDue                        int                `json:"review_due"`
+	ReviewServed                     int                `json:"review_served"`
+	ProbeCount                       int                `json:"probe_count"`
+	UniquePatterns                   int                `json:"unique_patterns"`
+	UniqueIntents                    int                `json:"unique_intents"`
+	SceneMismatchCount               int                `json:"scene_mismatch_count"`
+	ScopeRelaxationCount             int                `json:"scope_relaxation_count"`
+	PatternMatchCounts               map[string]int     `json:"pattern_match_counts,omitempty"`
+	GeneratorExactDuplicateRate      float64            `json:"generator_exact_duplicate_rate"`
+	GeneratorNormalizedDuplicateRate float64            `json:"generator_normalized_duplicate_rate"`
+	GeneratorSceneMismatchCount      int                `json:"generator_scene_mismatch_count"`
+	GeneratorDifficultyRejects       int                `json:"generator_difficulty_rejects"`
+	AdaptiveStateUpdates             int                `json:"adaptive_state_updates"`
+	AdaptiveNextExerciseReplans      int                `json:"adaptive_next_exercise_replans"`
+	TargetDifficultyTrajectory       []float64          `json:"target_difficulty_trajectory"`
+	RealizedDifficultyTrajectory     []float64          `json:"realized_difficulty_trajectory"`
 }
 
 type SimulationResult struct {
@@ -355,6 +551,10 @@ type SimulationResult struct {
 	LearnerModel            string              `json:"learner_model,omitempty"`
 	EvaluatorProvider       string              `json:"evaluator_provider,omitempty"`
 	EvaluatorModel          string              `json:"evaluator_model,omitempty"`
+	GeneratorProvider       string              `json:"generator_provider,omitempty"`
+	GeneratorModel          string              `json:"generator_model,omitempty"`
+	GeneratorMode           string              `json:"generator_mode"`
+	MaxAllowedAttempts      int                 `json:"max_allowed_attempts"`
 	PolicyVersion           string              `json:"policy_version"`
 	DifficultyPolicyVersion string              `json:"difficulty_policy_version"`
 	StartedAt               time.Time           `json:"started_at"`
@@ -485,7 +685,7 @@ func (r *SimulationRunner) Run(ctx context.Context, cfg SimulationConfig) (Simul
 		return SimulationResult{}, err
 	}
 	started := time.Now().UTC()
-	result := SimulationResult{SimulationVersion: simulationVersion, Persona: persona.ID, PersonaVersion: persona.Version, Mode: cfg.Mode, Seed: cfg.Seed, PolicyVersion: "adaptive-v2.3", DifficultyPolicyVersion: difficultyPolicyVersion, StartedAt: started, LearnerProvider: cfg.LearnerProvider, LearnerModel: cfg.LearnerModel, EvaluatorProvider: cfg.EvaluatorProvider, EvaluatorModel: cfg.EvaluatorModel, DryRun: cfg.DryRun, Manifest: map[string]any{"config": cfg, "persona": persona, "seed": cfg.Seed, "virtual_time_profile": cfg.TimeProfile, "database": "isolated-simulation-store"}}
+	result := SimulationResult{SimulationVersion: simulationVersion, Persona: persona.ID, PersonaVersion: persona.Version, Mode: cfg.Mode, Seed: cfg.Seed, PolicyVersion: "adaptive-v2.3", DifficultyPolicyVersion: difficultyPolicyVersion, StartedAt: started, LearnerProvider: cfg.LearnerProvider, LearnerModel: cfg.LearnerModel, EvaluatorProvider: cfg.EvaluatorProvider, EvaluatorModel: cfg.EvaluatorModel, GeneratorProvider: cfg.GeneratorProvider, GeneratorModel: cfg.GeneratorModel, GeneratorMode: cfg.Generator, MaxAllowedAttempts: cfg.MaxAttempts, DryRun: cfg.DryRun, Manifest: map[string]any{"config": cfg, "persona": persona, "seed": cfg.Seed, "virtual_time_profile": cfg.TimeProfile, "database": "isolated-simulation-store"}}
 	if cfg.DryRun {
 		result.Attempts = cfg.Attempts
 		result.Sessions = (cfg.Attempts + cfg.SessionSize - 1) / cfg.SessionSize
@@ -516,27 +716,54 @@ func (r *SimulationRunner) Run(ctx context.Context, cfg SimulationConfig) (Simul
 }
 
 func (r *SimulationRunner) runAI(ctx context.Context, cfg SimulationConfig, p LearnerPersona, result SimulationResult) SimulationResult {
-	// The deterministic scheduler supplies a reproducible candidate sequence;
-	// only learner/evaluator answers are provider-backed. Their failures are
-	// recorded as system failures and never become learner mistakes.
+	// Use the deterministic trace as a bounded preflight, then re-plan each
+	// subsequent exercise from the real evaluator outcome. This keeps the run
+	// reproducible while preserving the Full-AI chain: generator -> learner ->
+	// evaluator -> adaptive state -> next exercise.
 	result = r.runDeterministic(ctx, cfg, p, result)
 	valid, correct := 0, 0
 	byPattern, goodPattern := map[string]int{}, map[string]int{}
 	byScene, goodScene := map[string]int{}, map[string]int{}
 	state := SimulatedLearnerState{PersonaID: p.ID, Ability: p.BaseAbility, PatternMastery: map[string]float64{}, SceneMastery: map[string]float64{}}
+	matchCounts := map[string]int{}
+	promptCounts := map[string]int{}
+	normalizedPromptCounts := map[string]int{}
+	recentAnswers := []string{}
+	aiStates := map[string]*simPatternState{}
+	aiScenes := map[string]*simSceneState{}
+	for _, ptn := range patternCatalog() {
+		aiStates[ptn.id] = &simPatternState{Mastery: .2, Retention: p.RetentionBaseline, Scenes: map[string]bool{}}
+	}
+	for scene := range scenePatternFamilies {
+		aiScenes[scene] = &simSceneState{Patterns: map[string]bool{}, Intents: map[string]bool{}}
+	}
+	aiPatterns := simulationCandidates(cfg.Scene, cfg.Subscene)
+	aiRecentPatterns := []string{}
+	aiConsecutive := 0
+	aiCenter, aiAbility := p.BaseAbility, p.BaseAbility
+	aiRNG := rand.New(rand.NewSource(cfg.Seed + 7919))
+	aiCfg := difficultyConfig(defaultAdaptiveConfig())
 	for i := range result.AttemptsTrace {
 		a := &result.AttemptsTrace[i]
 		ex := a.Exercise
 		if r.Generator != nil {
+			result.AI.GeneratorCalls++
 			generated, err := r.Generator.Generate(ctx, ex)
 			if err != nil {
 				a.ErrorKind, a.Verdict = "generator_failure", "system_failure"
+				if strings.Contains(strings.ToLower(err.Error()), "difficulty") {
+					result.Metrics.GeneratorDifficultyRejects++
+				}
+				if strings.Contains(strings.ToLower(err.Error()), "scene mismatch") {
+					result.Metrics.GeneratorSceneMismatchCount++
+				}
 				continue
 			}
 			ex = generated
 			a.Exercise = generated
-			result.AI.GeneratorCalls++
 		}
+		promptCounts[ex.ChinesePrompt]++
+		normalizedPromptCounts[strings.ToLower(strings.Join(strings.Fields(ex.ChinesePrompt), " "))]++
 		answer, err := r.Learner.Answer(ctx, ex, state)
 		result.AI.LearnerCalls++
 		if err != nil {
@@ -555,6 +782,12 @@ func (r *SimulationRunner) runAI(ctx context.Context, cfg SimulationConfig, p Le
 			continue
 		}
 		valid++
+		a.Evaluation = evaluation
+		match := evaluation.TargetPatternMatch
+		if match == "" {
+			match = TargetPatternUnknown
+		}
+		matchCounts[match]++
 		a.Correct = evaluation.Correct
 		if evaluation.Correct {
 			correct++
@@ -567,6 +800,56 @@ func (r *SimulationRunner) runAI(ctx context.Context, cfg SimulationConfig, p Le
 		if evaluation.Correct {
 			goodPattern[ex.PatternID]++
 			goodScene[ex.SceneID]++
+		}
+		// Feed the real evaluator outcome into the next learner context. The
+		// scheduler remains bounded and reproducible, while learner history and
+		// mastery evidence now reflect the actual Full-AI result rather than the
+		// deterministic preflight outcome.
+		state.PatternMastery[ex.PatternID] = evaluation.Pattern
+		state.SceneMastery[ex.SceneID] = evaluation.Naturalness
+		state.Ability = simClamp(state.Ability+(evaluation.Meaning-.5)*.08, 1, 8)
+		aiAbility = state.Ability
+		recentAnswers = append(recentAnswers, answer.Text)
+		if len(recentAnswers) > 3 {
+			recentAnswers = recentAnswers[len(recentAnswers)-3:]
+		}
+		state.HistorySummary = strings.Join(recentAnswers, " | ")
+		result.Metrics.AdaptiveStateUpdates++
+		updateAIAdaptiveState(aiStates, aiScenes, ex, evaluation, a.VirtualTime, p)
+		if ex.PatternID == aiRecentPattern(aiRecentPatterns) {
+			aiConsecutive++
+		} else {
+			aiConsecutive = 1
+		}
+		aiRecentPatterns = append(aiRecentPatterns, ex.PatternID)
+		if len(aiRecentPatterns) > aiCfg.RecentPatternWindow {
+			aiRecentPatterns = aiRecentPatterns[len(aiRecentPatterns)-aiCfg.RecentPatternWindow:]
+		}
+		nextIndex := i + 1
+		if nextIndex < len(result.AttemptsTrace) && len(aiPatterns) > 0 {
+			if nextIndex%cfg.SessionSize == 0 {
+				aiCenter = simClamp(aiCenter+(aiAbility-aiCenter)*.08, 1, 8)
+			}
+			next, review, probe, reason := chooseSimulationPattern(aiPatterns, aiStates, aiScenes, p, result.AttemptsTrace[nextIndex].VirtualTime, aiCenter, aiAbility, aiRecentPatterns, aiConsecutive, aiCfg, aiRNG)
+			if next.id != "" {
+				nextScene := simSceneForPattern(next.id, cfg.Scene, nextIndex/cfg.SessionSize)
+				patternState := aiStates[next.id]
+				patternAbility := p.BaseAbility + simMapValue(p.PatternStrengths, next.id) + simMapValue(p.PatternWeaknesses, next.id) + (patternState.Mastery-.5)*1.2
+				target, _ := targetDifficulty(aiCenter, aiAbility, patternAbility, next.difficulty, reason, review, probe, patternState.Retention, aiCfg)
+				realized := simClamp(target+(aiRNG.Float64()-.5)*.18, 1, 8)
+				result.AttemptsTrace[nextIndex].Exercise = SimulationExercise{ID: result.AttemptsTrace[nextIndex].Exercise.ID, ChinesePrompt: simulationChinesePrompt(next, nextScene), PatternID: next.id, Pattern: next.expression, SceneID: nextScene, Intent: next.intent, DifficultyBand: simDifficultyBand(target), Difficulty: target}
+				result.AttemptsTrace[nextIndex].Review = review
+				result.AttemptsTrace[nextIndex].Probe = probe
+				result.AttemptsTrace[nextIndex].Reason = reason
+				result.AttemptsTrace[nextIndex].TargetDifficulty = target
+				result.AttemptsTrace[nextIndex].RealizedDifficulty = realized
+				result.Metrics.AdaptiveNextExerciseReplans++
+			}
+		}
+	}
+	for _, attempt := range result.AttemptsTrace {
+		if attempt.ErrorKind != "" {
+			result.Metrics.SystemFailures++
 		}
 	}
 	result.AI.TotalCalls = result.AI.LearnerCalls + result.AI.EvaluatorCalls + result.AI.GeneratorCalls
@@ -582,12 +865,58 @@ func (r *SimulationRunner) runAI(ctx context.Context, cfg SimulationConfig, p Le
 	for key, n := range byScene {
 		result.Metrics.AccuracyByScene[key] = float64(goodScene[key]) / float64(n)
 	}
+	result.Metrics.PatternMatchCounts = matchCounts
+	result.Metrics.GeneratorExactDuplicateRate = duplicateRate(promptCounts)
+	result.Metrics.GeneratorNormalizedDuplicateRate = duplicateRate(normalizedPromptCounts)
 	if r.Reviewer != nil {
 		if _, err := r.Reviewer.Review(ctx, result.AttemptsTrace); err != nil {
 			result.HealthFlags = append(result.HealthFlags, "SIM_REVIEWER_FAILURE")
 		}
 	}
 	return result
+}
+
+func aiRecentPattern(recent []string) string {
+	if len(recent) == 0 {
+		return ""
+	}
+	return recent[len(recent)-1]
+}
+
+func updateAIAdaptiveState(states map[string]*simPatternState, scenes map[string]*simSceneState, ex SimulationExercise, e SimulationEvaluation, now time.Time, p LearnerPersona) {
+	st := states[ex.PatternID]
+	if st == nil {
+		st = &simPatternState{Mastery: .2, Retention: p.RetentionBaseline, Scenes: map[string]bool{}}
+		states[ex.PatternID] = st
+	}
+	st.Attempts++
+	if e.Correct {
+		st.Successes++
+		st.Consecutive++
+		st.Acquisition = .65*st.Acquisition + .35*e.Pattern
+	} else {
+		st.Failures++
+		st.Consecutive = 0
+		st.Acquisition = .65*st.Acquisition + .35*e.Pattern
+	}
+	st.Mastery = simClamp(.65*st.Mastery+.35*e.Pattern, 0, 1)
+	st.Retention = simClamp(.7*st.Retention+.3*e.Naturalness, 0, 1)
+	st.Transfer = simClamp(.7*st.Transfer+.3*e.Naturalness, 0, 1)
+	st.Last = now
+	st.Next = now.Add(time.Duration(nextSimulationInterval(st, e.Correct, 0, p) * float64(time.Hour)))
+	st.Scenes[ex.SceneID] = true
+	sc := scenes[ex.SceneID]
+	if sc == nil {
+		sc = &simSceneState{Patterns: map[string]bool{}, Intents: map[string]bool{}}
+		scenes[ex.SceneID] = sc
+	}
+	sc.Attempts++
+	if e.Correct {
+		sc.Successes++
+	}
+	sc.Patterns[ex.PatternID] = true
+	sc.Intents[ex.Intent] = true
+	sc.Mastery = simClamp(.7*sc.Mastery+.3*e.Naturalness, 0, 1)
 }
 
 func classifySimulationFailure(err error) string {
@@ -628,6 +957,17 @@ func estimateAIUsage(c SimulationConfig) AIUsage {
 		calls += c.Attempts
 	}
 	return AIUsage{LearnerCalls: c.Attempts, EvaluatorCalls: c.Attempts, GeneratorCalls: calls - 2*c.Attempts, TotalCalls: calls, EstimatedCost: float64(calls) * .002}
+}
+
+func duplicateRate(counts map[string]int) float64 {
+	total := 0
+	for _, n := range counts {
+		total += n
+	}
+	if total == 0 {
+		return 0
+	}
+	return float64(total-len(counts)) / float64(total)
 }
 
 func openSimulationStore(c SimulationConfig) (*sql.DB, error) {
@@ -803,11 +1143,14 @@ func (r *SimulationRunner) runDeterministic(ctx context.Context, cfg SimulationC
 			unlocked[ptn.skill] = true
 			unlocks = append(unlocks, SkillUnlockEvent{Skill: ptn.skill, AttemptIndex: i, VirtualTime: now, PrerequisiteState: map[string]float64{ptn.id: st.Mastery}, Reason: "mastery and prerequisite evidence"})
 		}
-		prompt := fmt.Sprintf("Express %s naturally in %s.", ptn.expression, scene)
+		prompt := simulationChinesePrompt(ptn, scene)
 		normalized := strings.ToLower(strings.Join(strings.Fields(prompt), " "))
 		seenPrompt[normalized]++
 		band := simDifficultyBand(target)
-		attempt := SimulationAttempt{Index: i, Session: session + 1, VirtualTime: now, Exercise: SimulationExercise{ID: fmt.Sprintf("sim-%d", i+1), ChinesePrompt: prompt, PatternID: ptn.id, Pattern: ptn.expression, SceneID: scene, Intent: ptn.intent, DifficultyBand: band, Difficulty: target}, Correct: correct, Review: review, Probe: probe, NewSkill: newSkill, Reason: reason, TargetDifficulty: target, RealizedDifficulty: simClamp(target+(rng.Float64()-.5)*.18, 1, 8), EffectiveAbility: effective, SuccessProbability: probability, Verdict: map[bool]string{true: "correct", false: "incorrect"}[correct]}
+		realized := simClamp(target+(rng.Float64()-.5)*.18, 1, 8)
+		metrics.TargetDifficultyTrajectory = append(metrics.TargetDifficultyTrajectory, target)
+		metrics.RealizedDifficultyTrajectory = append(metrics.RealizedDifficultyTrajectory, realized)
+		attempt := SimulationAttempt{Index: i, Session: session + 1, VirtualTime: now, Exercise: SimulationExercise{ID: fmt.Sprintf("sim-%d", i+1), ChinesePrompt: prompt, PatternID: ptn.id, Pattern: ptn.expression, SceneID: scene, Intent: ptn.intent, DifficultyBand: band, Difficulty: target}, Correct: correct, Review: review, Probe: probe, NewSkill: newSkill, Reason: reason, TargetDifficulty: target, RealizedDifficulty: realized, EffectiveAbility: effective, SuccessProbability: probability, Verdict: map[bool]string{true: "correct", false: "incorrect"}[correct]}
 		trace = append(trace, attempt)
 		recent = append(recent, ptn.id)
 		if len(recent) > cfgA.RecentPatternWindow {
@@ -848,6 +1191,13 @@ func (r *SimulationRunner) runDeterministic(ctx context.Context, cfg SimulationC
 		metrics.SceneMastery[k] = scenes[k].Mastery
 	}
 	metrics.OverallAccuracy = float64(correctTotal) / float64(cfg.Attempts)
+	metrics.ReviewDue, metrics.ReviewServed, metrics.ProbeCount = reviews, reviews, probes
+	metrics.UniquePatterns = len(countsP)
+	intentSet := map[string]bool{}
+	for _, x := range trace {
+		intentSet[x.Exercise.Intent] = true
+	}
+	metrics.UniqueIntents = len(intentSet)
 	metrics.DifficultyJitter = jitter / simMax(1, float64(cfg.Attempts-1))
 	metrics.MaxAdjacentDifficultyJump = maxJump
 	metrics.ProductiveZoneRatio = float64(productive) / float64(cfg.Attempts)
@@ -1049,7 +1399,7 @@ func writeSimulationReport(w io.Writer, result SimulationResult, jsonOutput bool
 		enc.SetIndent("", "  ")
 		return enc.Encode(result)
 	}
-	fmt.Fprintf(w, "Simulation %s\nPersona: %s\nMode: %s\nAttempts: %d\nSessions: %d\nAccuracy: %.1f%%\nDifficulty jitter: %.3f\nMax jump: %.3f\nWeak exposure: %.1f%%\nReview hit: %.1f%%\nProbe: %.1f%%\nFoundation exposure: %.1f%%\nTransfer events: %d\nHealth flags: %s\n", result.SimulationVersion, result.Persona, result.Mode, result.Attempts, result.Sessions, result.Metrics.OverallAccuracy*100, result.Metrics.DifficultyJitter, result.Metrics.MaxAdjacentDifficultyJump, result.Metrics.WeakSkillExposure*100, result.Metrics.ReviewHitRate*100, result.Metrics.ProbeRatio*100, result.Metrics.FoundationExposureRatio*100, result.Metrics.TransferEvents, strings.Join(result.HealthFlags, ", "))
+	fmt.Fprintf(w, "Simulation %s\nPersona: %s\nMode: %s\nAttempts: %d\nSessions: %d\nMax allowed attempts: %d\nLearner provider/model: %s / %s\nEvaluator provider/model: %s / %s\nGenerator mode/provider/model: %s / %s / %s\nPlanned/actual LLM calls: %d\nEstimated cost: %.3f\nSystem failures: %d\nAdaptive state updates/replans: %d/%d\nPattern matches: %v\nGenerator duplicate exact/normalized: %.1f%%/%.1f%%\nGenerator scene mismatch/difficulty rejects: %d/%d\nAccuracy: %.1f%%\nDifficulty jitter: %.3f\nMax jump: %.3f\nWeak exposure: %.1f%%\nReview due/served/hit: %d/%d/%.1f%%\nProbe count/ratio/success: %d/%.1f%%/%.1f%%\nUnique patterns/intents: %d/%d\nFoundation exposure: %.1f%%\nTransfer events: %d\nHealth flags: %s\n", result.SimulationVersion, result.Persona, result.Mode, result.Attempts, result.Sessions, result.MaxAllowedAttempts, result.LearnerProvider, result.LearnerModel, result.EvaluatorProvider, result.EvaluatorModel, result.GeneratorMode, result.GeneratorProvider, result.GeneratorModel, result.AI.TotalCalls, result.AI.EstimatedCost, result.Metrics.SystemFailures, result.Metrics.AdaptiveStateUpdates, result.Metrics.AdaptiveNextExerciseReplans, result.Metrics.PatternMatchCounts, result.Metrics.GeneratorExactDuplicateRate*100, result.Metrics.GeneratorNormalizedDuplicateRate*100, result.Metrics.GeneratorSceneMismatchCount, result.Metrics.GeneratorDifficultyRejects, result.Metrics.OverallAccuracy*100, result.Metrics.DifficultyJitter, result.Metrics.MaxAdjacentDifficultyJump, result.Metrics.WeakSkillExposure*100, result.Metrics.ReviewDue, result.Metrics.ReviewServed, result.Metrics.ReviewHitRate*100, result.Metrics.ProbeCount, result.Metrics.ProbeRatio*100, result.Metrics.ProbeSuccessRate*100, result.Metrics.UniquePatterns, result.Metrics.UniqueIntents, result.Metrics.FoundationExposureRatio*100, result.Metrics.TransferEvents, strings.Join(result.HealthFlags, ", "))
 	return nil
 }
 
@@ -1096,6 +1446,8 @@ func runSimulationCLI(args []string) error {
 	learnerModel := fs.String("learner-model", "", "learner model")
 	evaluatorProvider := fs.String("evaluator-provider", "", "evaluator provider id")
 	evaluatorModel := fs.String("evaluator-model", "", "evaluator model")
+	generatorProvider := fs.String("generator-provider", "", "exercise generator provider id")
+	generatorModel := fs.String("generator-model", "", "exercise generator model")
 	simulationDB := fs.String("simulation-db", "", "dedicated simulation DB path")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1119,14 +1471,19 @@ func runSimulationCLI(args []string) error {
 	cfg.EstimatedCostLimit = *costLimit
 	cfg.LearnerProvider, cfg.LearnerModel = *learnerProvider, *learnerModel
 	cfg.EvaluatorProvider, cfg.EvaluatorModel = *evaluatorProvider, *evaluatorModel
+	cfg.GeneratorProvider, cfg.GeneratorModel = *generatorProvider, *generatorModel
 	cfg.SimulationDBPath = *simulationDB
 	if cfg.Mode == SimulationModeDeterministic {
 		cfg.Mode = SimulationModeAlgorithm
 	}
-	if cfg.Mode != SimulationModeAlgorithm && !cfg.DryRun {
-		return errors.New("AI simulation CLI requires an explicitly configured learner/evaluator adapter; run with --dry-run or use SimulationRunner in code")
-	}
 	runner := &SimulationRunner{}
+	if cfg.Mode != SimulationModeAlgorithm {
+		configured, resolved, err := configuredSimulationRunner(cfg)
+		if err != nil {
+			return err
+		}
+		runner, cfg = configured, resolved
+	}
 	if preset == "smoke" || preset == "extended" {
 		personas := []string{"beginner", "stable-intermediate", "noisy-learner", "scene-uneven"}
 		if preset == "extended" {

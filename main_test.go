@@ -234,6 +234,12 @@ func TestStructuredOutputNormalization(t *testing.T) {
 	if _, err := normalizeEvalContent(`{"verdict":"correct","meaning_score":.8,"grammar_score":.8,"naturalness_score":.8,"pattern_score":.8,"errors":[{"type":"unknown","severity":"minor","explanation":"x"}],"suggested_answer":"x","explanation_zh":"x"}`); err == nil {
 		t.Fatal("unknown error type accepted")
 	}
+	if _, err := normalizeEvalContent(`{"verdict":"correct","meaning_score":.8,"grammar_score":.8,"naturalness_score":.8,"pattern_score":.8,"target_pattern_match":"literal_only","target_pattern_score":.8,"errors":[],"suggested_answer":"x","explanation_zh":"x"}`); err == nil {
+		t.Fatal("unknown target pattern match accepted")
+	}
+	if eval, err := normalizeEvalContent(`{"verdict":"correct","meaning_score":0.8,"grammar_score":0.8,"naturalness_score":0.8,"pattern_score":0.8,"target_pattern_match":"semantic_equivalent","target_pattern_score":0.9,"errors":null,"suggested_answer":"x","explanation_zh":"x"}`); err != nil || eval.TargetPatternMatch != TargetPatternSemanticEquivalent || eval.TargetPatternScore != .9 || len(eval.Errors) != 0 {
+		t.Fatalf("semantic target pattern fields were not normalized: %#v err=%v", eval, err)
+	}
 	aliased, err := normalizeEvalContent(`{"verdict":"correct","meaning_score":0.8,"grammar_score":0.8,"naturalness_score":0.8,"pattern_score":0.8,"errors":[{"type":"meaning_mismatch","severity":"low","explanation":"x"}],"suggested_answer":"x","explanation_zh":"x"}`)
 	if err != nil || len(aliased.Errors) != 1 || aliased.Errors[0]["type"] != "meaning" || aliased.Errors[0]["severity"] != "minor" {
 		t.Fatalf("known provider aliases were not normalized: %#v err=%v", aliased, err)
@@ -255,6 +261,70 @@ func TestStructuredOutputNormalization(t *testing.T) {
 	}
 	if _, err := normalizeEvalContent(validEvaluationJSON() + "\n" + validEvaluationJSON()); err == nil {
 		t.Fatal("multiple JSON objects accepted")
+	}
+}
+
+func TestSemanticTargetPatternClassification(t *testing.T) {
+	cases := []struct {
+		name, pattern, target, answer, want string
+	}{
+		{"having-said-that exact", "having-said-that", "Having said that, ...", "Having said that, I still think we should wait.", TargetPatternExact},
+		{"having-said-that equivalent", "having-said-that", "Having said that, ...", "That said, I still think we should wait.", TargetPatternSemanticEquivalent},
+		{"having-said-that equivalent even so", "having-said-that", "Having said that, ...", "Even so, I still think we should wait.", TargetPatternSemanticEquivalent},
+		{"having-said-that partial", "having-said-that", "Having said that, ...", "On the other hand, I still think we should wait.", TargetPatternPartial},
+		{"having-said-that non-equivalent", "having-said-that", "Having said that, ...", "I disagree with the plan.", TargetPatternNotMatched},
+		{"clarification equivalent", "clarification", "What I mean is ...", "What I'm trying to say is that we should wait.", TargetPatternSemanticEquivalent},
+		{"suggestion equivalent", "professional-suggestion", "I'd like to suggest ...", "I suggest that we wait.", TargetPatternSemanticEquivalent},
+		{"disagreement equivalent", "disagreement", "I see your point, but ...", "I understand your point, but we should wait.", TargetPatternSemanticEquivalent},
+		{"uncertainty equivalent", "formal-opinion", "I'm not entirely convinced that ...", "I'm not completely convinced that we should proceed.", TargetPatternSemanticEquivalent},
+		{"mixed conditional guard", "mixed-conditional", "If I had ..., I would ...", "I didn't know, so I made a mistake.", TargetPatternNotMatched},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, score, supported := classifyTargetPattern(tc.pattern, tc.target, tc.answer)
+			if !supported || got != tc.want || score <= 0 {
+				t.Fatalf("classification got=%q score=%.2f supported=%v want=%q", got, score, supported, tc.want)
+			}
+		})
+	}
+}
+
+func TestSemanticPatternReconciliationSeparatesMasteryEvidence(t *testing.T) {
+	exact := Eval{Verdict: "incorrect", MeaningScore: .9, GrammarScore: .9, NaturalnessScore: .9, PatternScore: .05, Errors: []map[string]any{{"type": "target_pattern_missing", "severity": "major"}}}
+	reconcileTargetPattern(&exact, "having-said-that", "Having said that, ...", "Having said that, I still think we should wait.")
+	if exact.Verdict != "correct" || exact.TargetPatternMatch != TargetPatternExact || exact.TargetPatternScore != 1 || len(exact.Errors) != 0 {
+		t.Fatalf("exact reconciliation failed: %#v", exact)
+	}
+	equivalent := Eval{Verdict: "incorrect", MeaningScore: .9, GrammarScore: .9, NaturalnessScore: .9, PatternScore: .05, Errors: []map[string]any{{"type": "target_pattern_missing", "severity": "major"}}}
+	reconcileTargetPattern(&equivalent, "having-said-that", "Having said that, ...", "That said, I still think we should wait.")
+	if equivalent.Verdict != "correct" || equivalent.TargetPatternMatch != TargetPatternSemanticEquivalent || equivalent.TargetPatternScore >= exact.TargetPatternScore || equivalent.PatternScore >= exact.PatternScore {
+		t.Fatalf("semantic reconciliation did not preserve graded evidence: %#v", equivalent)
+	}
+	nonEquivalent := Eval{Verdict: "correct", MeaningScore: .9, GrammarScore: .9, NaturalnessScore: .9, PatternScore: .9}
+	reconcileTargetPattern(&nonEquivalent, "mixed-conditional", "If I had ..., I would ...", "I didn't know, so I made a mistake.")
+	if nonEquivalent.TargetPatternMatch != TargetPatternNotMatched || nonEquivalent.Verdict == "correct" {
+		t.Fatalf("non-equivalent guard failed: %#v", nonEquivalent)
+	}
+}
+
+func TestEvaluationSemanticColumnsMigrateWithV231Schema(t *testing.T) {
+	db, err := sql.Open("sqlite", "file:v231-migration?mode=memory&cache=private")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE schema_meta (version INTEGER NOT NULL); INSERT INTO schema_meta(version) VALUES(8); CREATE TABLE evaluations (id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL UNIQUE, verdict TEXT NOT NULL, meaning_score REAL NOT NULL, grammar_score REAL NOT NULL, naturalness_score REAL NOT NULL, pattern_score REAL NOT NULL, errors_json TEXT NOT NULL, suggested_answer TEXT NOT NULL, more_natural TEXT NOT NULL DEFAULT '', more_natural_needed INTEGER NOT NULL DEFAULT 0, alternative TEXT NOT NULL DEFAULT '', explanation_zh TEXT NOT NULL, validated INTEGER NOT NULL, created_at TEXT NOT NULL);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	var match, definition string
+	if err := db.QueryRow("SELECT name,type FROM pragma_table_info('evaluations') WHERE name='target_pattern_match'").Scan(&match, &definition); err != nil || match != "target_pattern_match" {
+		t.Fatalf("target_pattern_match migration missing: name=%q type=%q err=%v", match, definition, err)
+	}
+	if err := db.QueryRow("SELECT name,type FROM pragma_table_info('evaluations') WHERE name='target_pattern_score'").Scan(&match, &definition); err != nil || match != "target_pattern_score" {
+		t.Fatalf("target_pattern_score migration missing: name=%q type=%q err=%v", match, definition, err)
 	}
 }
 
