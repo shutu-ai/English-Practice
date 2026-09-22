@@ -81,6 +81,27 @@ Pronunciation playback is a local-only browser enhancement documented in
 `docs/pronunciation-playback.md`. It uses native SpeechSynthesis for English
 sentences only and does not affect learning state.
 
+## Simulation & Acceptance
+
+V2.3.1 provides a deterministic learner simulation harness for CI/regression
+and an explicitly separate AI learner adapter for manual acceptance. It uses
+virtual time, standard personas, scene/difficulty/memory/transfer metrics,
+health flags, and isolated simulation storage; it never writes the production
+SQLite history. Start with:
+
+```powershell
+go run . simulate smoke
+go run . simulate --mode algorithm --persona stable-intermediate --attempts 200 --seed 42 --format json --output report.json
+go run . simulate --mode llm-learner --persona intermediate --attempts 50 --dry-run
+```
+
+See [`docs/simulation-harness.md`](docs/simulation-harness.md),
+[`docs/ai-learner-simulation.md`](docs/ai-learner-simulation.md), and
+[`docs/simulation-acceptance.md`](docs/simulation-acceptance.md). AI CLI runs
+remain `PARTIAL` until separate learner/evaluator providers are explicitly
+injected and manually accepted; simulation and human real-use statuses are
+reported independently.
+
 ## Data and backup
 
 SQLite migrations and seed data run on first start. Back up the SQLite file while the app is stopped, for example `Copy-Item data/english-practice.db backups/english-practice-$(Get-Date -Format yyyyMMdd).db`.
