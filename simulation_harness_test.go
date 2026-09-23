@@ -277,6 +277,26 @@ func TestGeneratorFallbackDoesNotCreateLearnerFailureOrDoubleUpdate(t *testing.T
 	}
 }
 
+func TestGeneratorFallbackLongRunPreservesDeliveryAndReplanIntegrity(t *testing.T) {
+	runner := &SimulationRunner{
+		Generator: exhaustedDetailedGenerator{},
+		Learner:   FakeLearner{AnswerText: "Having said that, we should wait."},
+		Evaluator: FakeEvaluator{Result: SimulationEvaluation{Correct: true, Verdict: "correct", Meaning: .9, Grammar: .9, Naturalness: .9, Pattern: .9, TargetPatternMatch: TargetPatternExact, TargetPatternScore: 1}},
+	}
+	c := simulationTestConfig("advanced-uneven", 30)
+	c.Mode, c.Generator, c.Scene, c.SessionSize = SimulationModeFullAI, "real-generator", "meeting", 15
+	r, err := runner.Run(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Metrics.GeneratorFinalDeliveryRate != 1 || r.Metrics.GeneratorFallbackCount != 30 || r.Metrics.SystemFailures != 0 {
+		t.Fatalf("long fallback run did not deliver safely: %#v", r.Metrics)
+	}
+	if r.Metrics.AdaptiveStateUpdates != 30 || r.Metrics.AdaptiveReplanEligible != 29 || r.Metrics.AdaptiveNextExerciseReplans != 29 || r.Metrics.AdaptiveReplanMisses != 0 {
+		t.Fatalf("long fallback run changed state/replan semantics: %#v", r.Metrics)
+	}
+}
+
 func TestLLMLearnerAdapterSeparatesPromptAndHandlesFailures(t *testing.T) {
 	client := &recordingChatClient{response: "I would call tomorrow."}
 	adapter := LLMLearnerSimulator{Client: client, MaxTokens: 64}
