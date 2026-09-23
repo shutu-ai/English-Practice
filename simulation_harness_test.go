@@ -46,6 +46,18 @@ func TestSimulationDeterminismIncludesTrajectoryAndMetrics(t *testing.T) {
 	}
 }
 
+func TestSimulationCurriculumViolationsStayAtZero(t *testing.T) {
+	for _, persona := range []string{"beginner", "stable-intermediate", "advanced-uneven", "scene-uneven"} {
+		result, err := RunSimulation(context.Background(), simulationTestConfig(persona, 120))
+		if err != nil {
+			t.Fatalf("persona %s: %v", persona, err)
+		}
+		if result.Metrics.CurriculumViolationCount != 0 || result.Metrics.PrerequisiteViolationCount != 0 || result.Metrics.D1AdvancedLeakageCount != 0 || result.Metrics.InstructionComplexityViolationCount != 0 {
+			t.Fatalf("persona %s curriculum metrics=%+v", persona, result.Metrics)
+		}
+	}
+}
+
 func TestSimulationUsesIsolatedStoreAndRejectsProductionPath(t *testing.T) {
 	prod := t.TempDir()
 	t.Setenv("ENGLISH_PRACTICE_DATA", prod)

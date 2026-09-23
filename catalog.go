@@ -169,9 +169,8 @@ func catalogIntents() [][2]string {
 }
 
 func assessmentPatternIDs() []string {
-	// This is a deliberately non-catalog-order route: stable early anchors
-	// establish a baseline, then probes span daily, intermediate, professional,
-	// and nuance bands. The selector can confirm the boundary without replaying
-	// every one of the 44 patterns.
-	return []string{"going-to", "modal-possibility", "because", "simple-past", "present-perfect", "if-first", "reported-speech", "professional-suggestion", "negotiate", "having-said-that", "formal-opinion", "mixed-conditional"}
+	// This is a deliberately non-catalog-order route: foundation anchors are
+	// sampled first, then the route spans A1, A2, B1, and higher productive
+	// expression. It is a compact evidence route, not a random pattern list.
+	return []string{"going-to", "modal-possibility", "because", "be-basic", "have-basic", "do-you", "simple-past", "present-perfect", "if-first", "reported-speech", "professional-suggestion", "formal-opinion"}
 }

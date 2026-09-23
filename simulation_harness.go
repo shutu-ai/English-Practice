@@ -443,6 +443,9 @@ func (l LLMLearnerSimulator) Answer(ctx context.Context, ex SimulationExercise, 
 }
 
 func simulationChinesePrompt(ptn patternDefinition, scene string) string {
+	if metadata, ok := curriculumPattern(ptn.id); ok && metadata.AppLevelMin <= 2 {
+		return fmt.Sprintf("请用英语表达：%s。", ptn.expression)
+	}
 	switch ptn.id {
 	case "formal-opinion":
 		return "我不太确定这是不是我们在会议上应该采取的最佳做法。"
@@ -645,6 +648,10 @@ type SimulationMetrics struct {
 	ProbeSuccessRate                      float64            `json:"probe_success_rate"`
 	UnknownToObserved                     float64            `json:"unknown_to_observed"`
 	FoundationExposureRatio               float64            `json:"foundation_exposure_ratio"`
+	CurriculumViolationCount              int                `json:"curriculum_violation_count"`
+	PrerequisiteViolationCount            int                `json:"prerequisite_violation_count"`
+	D1AdvancedLeakageCount                int                `json:"d1_advanced_leakage_count"`
+	InstructionComplexityViolationCount   int                `json:"instruction_complexity_violation_count"`
 	MaxConsecutiveSamePattern             int                `json:"max_consecutive_same_pattern"`
 	SkillUnlocks                          int                `json:"skill_unlocks"`
 	SceneCoverage                         map[string]float64 `json:"scene_coverage"`
@@ -1635,6 +1642,24 @@ func (r *SimulationRunner) runDeterministic(ctx context.Context, cfg SimulationC
 			unlocks = append(unlocks, SkillUnlockEvent{Skill: ptn.skill, AttemptIndex: i, VirtualTime: now, PrerequisiteState: map[string]float64{ptn.id: st.Mastery}, Reason: "mastery and prerequisite evidence"})
 		}
 		prompt := simulationChinesePrompt(ptn, scene)
+		curriculumGate := simulationCurriculumGate(center)
+		if ok, _ := curriculumEligible(ptn.id, curriculumGate); !ok {
+			metrics.CurriculumViolationCount++
+		}
+		if patternMeta, ok := curriculumPattern(ptn.id); ok {
+			for _, prerequisite := range patternMeta.Prerequisites {
+				if skill, exists := curriculumSkillCatalog()[prerequisite]; !exists || skill.AppLevel > curriculumGate {
+					metrics.PrerequisiteViolationCount++
+				}
+			}
+			check := (CurriculumComplianceValidator{}).Validate(curriculumGate, ptn.id, prompt)
+			if check.AdvancedPatternLeakage {
+				metrics.D1AdvancedLeakageCount++
+			}
+			if len(check.InstructionViolations) > 0 {
+				metrics.InstructionComplexityViolationCount++
+			}
+		}
 		normalized := strings.ToLower(strings.Join(strings.Fields(prompt), " "))
 		seenPrompt[normalized]++
 		band := simDifficultyBand(target)
@@ -1800,6 +1825,16 @@ func chooseSimulationPattern(patterns []patternDefinition, states map[string]*si
 	if len(patterns) == 0 {
 		return patternDefinition{}, false, false, "current_zone"
 	}
+	gateLevel := simulationCurriculumGate(center)
+	eligiblePatterns := make([]patternDefinition, 0, len(patterns))
+	for _, x := range patterns {
+		if ok, _ := curriculumEligible(x.id, gateLevel); ok {
+			eligiblePatterns = append(eligiblePatterns, x)
+		}
+	}
+	if len(eligiblePatterns) > 0 {
+		patterns = eligiblePatterns
+	}
 	candidates := make([]patternDefinition, 0, len(patterns))
 	for _, x := range patterns {
 		st := states[x.id]
@@ -1855,6 +1890,14 @@ func chooseSimulationPattern(patterns []patternDefinition, states map[string]*si
 	return best, review, probe, reason
 }
 
+func simulationCurriculumGate(center float64) int {
+	level := curriculumLevelForDifficulty(center)
+	if level >= 3 {
+		level = minCurriculumLevel(8, level+3)
+	}
+	return level
+}
+
 func simulationHealthFlags(r SimulationResult, cfg AdaptiveConfig) []string {
 	out := []string{}
 	if r.Metrics.DifficultyJitter > cfg.MaxSessionCenterStep*4 {
@@ -1880,6 +1923,9 @@ func simulationHealthFlags(r SimulationResult, cfg AdaptiveConfig) []string {
 	}
 	if r.Metrics.SkillUnlocks == 0 && r.Attempts > 100 {
 		out = append(out, "SIM_UNLOCK_STALLED")
+	}
+	if r.Metrics.CurriculumViolationCount > 0 || r.Metrics.PrerequisiteViolationCount > 0 || r.Metrics.D1AdvancedLeakageCount > 0 || r.Metrics.InstructionComplexityViolationCount > 0 {
+		out = append(out, "SIM_CURRICULUM_VIOLATION")
 	}
 	return out
 }

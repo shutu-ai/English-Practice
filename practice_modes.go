@@ -161,6 +161,10 @@ func (s *Server) fixedSelect(level float64, mode, scene string) (adaptiveCandida
 		dr.Close()
 	}
 	ability := learnerAbility(s.db)
+	readiness := map[string]bool{}
+	for patternID := range curriculumPatternMap() {
+		readiness[patternID] = s.curriculumReadiness(patternID, int(math.Round(level)))
+	}
 	rows, err := s.db.Query(`SELECT p.id,p.pattern,i.id,COALESCE(ps.skill_id,''),COALESCE(p.catalog_difficulty,p.difficulty),COALESCE(ls.mastery,COALESCE(pm.mastery,.25)),COALESCE(ls.retention,0),COALESCE(ls.attempt_count,0),COALESCE(ls.success_count,0),COALESCE(ls.state,'') FROM sentence_patterns p JOIN communication_intents i ON i.id=p.intent_id LEFT JOIN (SELECT pattern_id,MIN(skill_id) AS skill_id FROM pattern_skills GROUP BY pattern_id) ps ON ps.pattern_id=p.id LEFT JOIN learner_skill_state ls ON ls.pattern_id=p.id AND ls.user_id='default' LEFT JOIN pattern_mastery pm ON pm.pattern_id=p.id WHERE COALESCE(p.catalog_difficulty,p.difficulty)>=? AND COALESCE(p.catalog_difficulty,p.difficulty)<=?`, lower, upper)
 	if err != nil {
 		return adaptiveCandidate{}, err
@@ -174,6 +178,15 @@ func (s *Server) fixedSelect(level float64, mode, scene string) (adaptiveCandida
 		}
 		if len(constraint.PatternIDs) > 0 && !constraint.PatternIDs[x.ID] {
 			continue
+		}
+		curriculumLevel := int(math.Round(level))
+		if curriculumLevel < 1 {
+			curriculumLevel = 1
+		}
+		if mode != "assessment" {
+			if ok, _ := curriculumEligible(x.ID, curriculumLevel); !ok || !readiness[x.ID] {
+				continue
+			}
 		}
 		if mode == "weak" && (x.Attempts == 0 || x.Mastery >= cfg.WeakSkillThreshold) {
 			continue
@@ -205,7 +218,7 @@ func (s *Server) fixedSelect(level float64, mode, scene string) (adaptiveCandida
 		if review {
 			c.Reason = "fixed_level_review_due"
 		}
-		c.DecisionTrace = map[string]any{"difficulty_mode": DifficultyModeFixed, "fixed_difficulty": level, "fixed_band_lower": lower, "fixed_band_upper": upper, "difficulty_eligibility": true, "coverage_pressure": coveragePressure, "weakness_score": weak, "review_urgency": due[x.ID], "repeat_penalty": repeatPenalty, "candidate_score": score, "target_difficulty": level}
+		c.DecisionTrace = map[string]any{"difficulty_mode": DifficultyModeFixed, "fixed_difficulty": level, "fixed_band_lower": lower, "fixed_band_upper": upper, "difficulty_eligibility": true, "curriculum_level": curriculumLevel, "curriculum_eligibility": true, "prerequisite_readiness": true, "coverage_pressure": coveragePressure, "weakness_score": weak, "review_urgency": due[x.ID], "repeat_penalty": repeatPenalty, "candidate_score": score, "target_difficulty": level}
 		c.SceneID, c.SubsceneID = constraint.RootID, constraint.SubsceneID
 		c.ScopeRelaxed, c.RelaxationReason = constraint.ScopeRelaxed, constraint.RelaxationReason
 		c.SessionCenter, c.TargetDifficulty, c.LearnerAbility = level, level, ability

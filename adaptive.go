@@ -227,6 +227,14 @@ func seedAdaptiveData(db *sql.DB) error {
 		}
 	}
 	_, _ = db.Exec(`INSERT OR IGNORE INTO difficulty_state(scope,entity_id,difficulty,success_rate,updated_at) VALUES('global','default',3,.5,?)`, time.Now().UTC().Format(time.RFC3339))
+	if err := seedCurriculumData(db); err != nil {
+		return err
+	}
+	for _, curriculum := range curriculumPatternsSorted() {
+		if _, err := db.Exec(`UPDATE sentence_patterns SET curriculum_version=?,curriculum_level=? WHERE id=?`, curriculumVersion, curriculum.AppLevelMin, curriculum.PatternID); err != nil {
+			return err
+		}
+	}
 	return seedSceneHierarchy(db)
 }
 
@@ -410,6 +418,18 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 	}
 	var observedPatterns int
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM learner_skill_state WHERE user_id='default' AND attempt_count>0`).Scan(&observedPatterns)
+	curriculumGateLevel := curriculumLevelForDifficulty(diff)
+	// Higher-level probes are part of the adaptive system's evidence route.
+	// D1 remains a hard gate; from D3 upward, the bounded probe window may
+	// inspect up to three curriculum stages ahead without relabeling the
+	// learner's current level.
+	if curriculumGateLevel >= 3 {
+		curriculumGateLevel = minCurriculumLevel(8, curriculumGateLevel+3)
+	}
+	readiness := map[string]bool{}
+	for patternID := range curriculumPatternMap() {
+		readiness[patternID] = s.curriculumReadiness(patternID, curriculumGateLevel)
+	}
 	rows, err := s.db.Query(`SELECT p.id,p.pattern,i.id,COALESCE(ps.skill_id,''),COALESCE(p.catalog_difficulty,p.difficulty),COALESCE(ls.mastery,COALESCE(pm.mastery,.25)),COALESCE(ls.retention,0),COALESCE(ds.difficulty,COALESCE(p.catalog_difficulty,p.difficulty)),COALESCE(ls.current_difficulty,COALESCE(p.catalog_difficulty,p.difficulty)),COALESCE(ls.attempt_count,0),COALESCE(ls.success_count,0),COALESCE(ls.state,'') FROM sentence_patterns p JOIN communication_intents i ON i.id=p.intent_id LEFT JOIN (SELECT pattern_id,MIN(skill_id) AS skill_id FROM pattern_skills GROUP BY pattern_id) ps ON ps.pattern_id=p.id LEFT JOIN learner_skill_state ls ON ls.pattern_id=p.id AND ls.user_id='default' LEFT JOIN pattern_mastery pm ON pm.pattern_id=p.id LEFT JOIN difficulty_state ds ON ds.scope='pattern' AND ds.entity_id=p.id`)
 	if err != nil {
 		return adaptiveCandidate{}, err
@@ -424,6 +444,12 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 		}
 		if len(constraint.PatternIDs) > 0 && !constraint.PatternIDs[x.ID] {
 			continue
+		}
+		curriculumLevel := curriculumLevelForDifficulty(diff)
+		if mode != "assessment" {
+			if ok, _ := curriculumEligible(x.ID, curriculumGateLevel); !ok || !readiness[x.ID] {
+				continue
+			}
 		}
 		x.Difficulty = x.CatalogDifficulty
 		x.State = stateFromRow(x.Attempts, x.Correct, x.Mastery, x.State, cfg)
@@ -473,7 +499,7 @@ func (s *Server) adaptiveSelect(diff float64, mode, scene string) (adaptiveCandi
 		if len(recent) > 0 && recent[0] == x.ID {
 			recencyPenalty = 1
 		}
-		x.DecisionTrace = map[string]any{"candidate_score": 0.0, "review_urgency": urgency, "weakness_score": weak, "difficulty_fit": fit, "recency_penalty": recencyPenalty, "repeat_penalty": repeatPenalty, "diversity_bonus": div, "graph_readiness": 1.0, "probe_factor": 0.0}
+		x.DecisionTrace = map[string]any{"candidate_score": 0.0, "review_urgency": urgency, "weakness_score": weak, "difficulty_fit": fit, "recency_penalty": recencyPenalty, "repeat_penalty": repeatPenalty, "diversity_bonus": div, "graph_readiness": 1.0, "curriculum_level": curriculumLevel, "curriculum_eligibility": true, "prerequisite_readiness": true, "probe_factor": 0.0}
 		x.Score = cfg.CurrentZoneWeight*fit + cfg.WeakWeight*weak + cfg.ReviewWeight*urgency + div - repeatPenalty
 		if x.Attempts == 0 {
 			// New curriculum is explored deliberately. A strong learner can
@@ -700,8 +726,14 @@ func (s *Server) generateAIExercise(ctx context.Context, c adaptiveCandidate, sc
 	if value, ok := c.DecisionTrace["fixed_band_upper"].(float64); ok {
 		upper = value
 	}
-	sys := `Generate one English practice exercise as strict JSON only. Fields: chinese_prompt, target_pattern, scene, intent, estimated_difficulty, reference_answers (array of strings). Respect every constraint: target difficulty, allowed difficulty range, sentence length target, grammar complexity, maximum clause count, lexical complexity, scene, pattern, and intent. Do not exceed the specified difficulty band. Make a substantially different context from recent exercises and do not reveal the answer before the learner responds.`
-	user := fmt.Sprintf("pattern=%s skill=%s scene=%s intent=%s target_difficulty=%.1f allowed_difficulty_range=%.1f-%.1f sentence_length_target=%s grammar_complexity=%s max_clause_count=%d lexical_complexity=%s selection_reason=%s recent=%s", c.Pattern, c.Skill, scene, c.Intent, c.Difficulty, lower, upper, difficultySentenceLength(c.Difficulty), difficultyGrammarComplexity(c.Pattern), difficultyMaxClauses(c.Difficulty), difficultyLexicalComplexity(c.Difficulty), c.Reason, strings.Join(recent, " | "))
+	level := curriculumLevelForDifficulty(c.SessionCenter)
+	p, _ := curriculumPattern(c.ID)
+	if p.AppLevelMin > level {
+		level = p.AppLevelMin
+	}
+	envelope, _ := json.Marshal(curriculumEnvelope(level))
+	sys := `Generate one English practice exercise as strict JSON only. Fields: chinese_prompt, target_pattern, scene, intent, estimated_difficulty, reference_answers (array of strings). Respect every constraint: target difficulty, allowed difficulty range, sentence length target, grammar complexity, maximum clause count, lexical complexity, scene, pattern, intent, and the curriculum envelope. Do not exceed the specified difficulty band or introduce a higher-level target. Make a substantially different context from recent exercises and do not reveal the answer before the learner responds.`
+	user := fmt.Sprintf("pattern=%s skill=%s scene=%s intent=%s curriculum_level=D%d cefr_anchor=%s grammar_family=%s target_difficulty=%.1f allowed_difficulty_range=%.1f-%.1f sentence_length_target=%s grammar_complexity=%s max_clause_count=%d lexical_complexity=%s selection_reason=%s curriculum_envelope=%s recent=%s", c.Pattern, c.Skill, scene, c.Intent, level, p.CEFRAnchor, p.GrammarFamily, c.Difficulty, lower, upper, difficultySentenceLength(c.Difficulty), difficultyGrammarComplexity(c.Pattern), difficultyMaxClauses(c.Difficulty), difficultyLexicalComplexity(c.Difficulty), c.Reason, string(envelope), strings.Join(recent, " | "))
 	r, err := s.llm.Client(pc).Chat(ctx, ChatRequest{Messages: []ChatMessage{{Role: "system", Content: sys}, {Role: "user", Content: user}}, Temperature: pc.Temperature, MaxTokens: maxInt(pc.MaxTokens, 500), JSONMode: true})
 	if err != nil {
 		return exerciseSeed{}, "", 0
@@ -714,6 +746,9 @@ func (s *Server) generateAIExercise(ctx context.Context, c adaptiveCandidate, sc
 		Answers    []string `json:"reference_answers"`
 	}
 	if json.Unmarshal([]byte(strings.TrimSpace(r.Content)), &out) != nil || strings.TrimSpace(out.Prompt) == "" || out.Pattern == "" {
+		return exerciseSeed{}, "", 0
+	}
+	if check := (CurriculumComplianceValidator{DB: s.db}).Validate(p.AppLevelMin, c.ID, out.Prompt); !check.Passed {
 		return exerciseSeed{}, "", 0
 	}
 	if out.Pattern != c.Pattern {
@@ -996,13 +1031,15 @@ func (s *Server) generateExerciseForScene(ctx context.Context, diff float64, mod
 	c.DecisionTrace["selected_subscene"] = chosenSubscene
 	c.DecisionTrace["scope_relaxed"] = c.ScopeRelaxed
 	c.DecisionTrace["relaxation_reason"] = c.RelaxationReason
-	metaMap := map[string]any{"mode": mode, "difficulty_mode": prefs.DifficultyMode, "fixed_difficulty": prefs.FixedDifficulty, "training_focus": TrainingFocusPattern, "target_pattern_mode": "required", "target_pattern_present": true, "selection_reason": c.Reason, "is_review": c.Review, "is_probe": c.Probe, "is_new_skill": c.New, "generated_by": generatedBy, "reference_answers": seed.Answers, "target_difficulty": c.Difficulty, "realized_difficulty": realized, "difficulty_delta": math.Abs(realized - c.Difficulty), "difficulty_validation_status": validationStatus, "difficulty_validation_reason": validationReason, "difficulty_policy_version": cfg.DifficultyPolicyVersion, "normalized_chinese_hash": hash, "recent_contexts": recent, "review_timing": c.ReviewTiming, "scene_id": chosenScene, "subscene_id": chosenSubscene, "scope_relaxed": c.ScopeRelaxed, "relaxation_reason": c.RelaxationReason, "decision_trace_version": 4, "decision_trace": c.DecisionTrace}
+	patternMeta, _ := curriculumPattern(c.ID)
+	metaMap := map[string]any{"mode": mode, "difficulty_mode": prefs.DifficultyMode, "fixed_difficulty": prefs.FixedDifficulty, "training_focus": TrainingFocusPattern, "target_pattern_mode": "required", "target_pattern_present": true, "selection_reason": c.Reason, "is_review": c.Review, "is_probe": c.Probe, "is_new_skill": c.New, "generated_by": generatedBy, "reference_answers": seed.Answers, "target_difficulty": c.Difficulty, "realized_difficulty": realized, "difficulty_delta": math.Abs(realized - c.Difficulty), "difficulty_validation_status": validationStatus, "difficulty_validation_reason": validationReason, "difficulty_policy_version": cfg.DifficultyPolicyVersion, "curriculum_version": curriculumVersion, "curriculum_level": patternMeta.AppLevelMin, "cefr_anchor": patternMeta.CEFRAnchor, "grammar_family": patternMeta.GrammarFamily, "curriculum_instruction_complexity": patternMeta.InstructionComplexity, "normalized_chinese_hash": hash, "recent_contexts": recent, "review_timing": c.ReviewTiming, "scene_id": chosenScene, "subscene_id": chosenSubscene, "scope_relaxed": c.ScopeRelaxed, "relaxation_reason": c.RelaxationReason, "decision_trace_version": 5, "decision_trace": c.DecisionTrace}
 	meta, _ := json.Marshal(metaMap)
 	trace, _ := json.Marshal(c.DecisionTrace)
 	if _, err := s.db.Exec(`INSERT INTO exercises(id,chinese_prompt,pattern_id,scene_id,subscene_id,intent_id,difficulty,target_difficulty,realized_difficulty,difficulty_delta,difficulty_validation_status,difficulty_validation_reason,difficulty_policy_version,metadata_json,created_at,normalized_chinese_hash,generated_by,decision_trace_json,training_focus,difficulty_mode,fixed_difficulty,target_pattern_present) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, exID, seed.Prompt, c.ID, chosenScene, chosenSubscene, c.Intent, c.Difficulty, c.Difficulty, realized, math.Abs(realized-c.Difficulty), validationStatus, validationReason, cfg.DifficultyPolicyVersion, string(meta), time.Now().UTC().Format(time.RFC3339), hash, generatedBy, string(trace), TrainingFocusPattern, prefs.DifficultyMode, prefs.FixedDifficulty, 1); err != nil {
 		return nil, err
 	}
-	return map[string]any{"exercise_id": exID, "chinese_prompt": seed.Prompt, "target_pattern": c.Pattern, "pattern_id": c.ID, "scene_id": chosenScene, "subscene_id": chosenSubscene, "communication_intent": c.Intent, "difficulty": c.Difficulty, "target_difficulty": c.Difficulty, "realized_difficulty": realized, "difficulty_delta": math.Abs(realized - c.Difficulty), "difficulty_validation_status": validationStatus, "difficulty_validation_reason": validationReason, "difficulty_policy_version": cfg.DifficultyPolicyVersion, "selection_reason": c.Reason, "difficulty_mode": prefs.DifficultyMode, "fixed_difficulty": prefs.FixedDifficulty, "training_focus": TrainingFocusPattern, "target_pattern_enabled": true, "target_pattern_present": true, "is_review": c.Review, "is_probe": c.Probe, "is_new_skill": c.New, "generated_by": generatedBy, "scope_relaxed": c.ScopeRelaxed, "relaxation_reason": c.RelaxationReason, "reference_answers": seed.Answers, "decision_trace": c.DecisionTrace}, nil
+	_, _ = s.db.Exec(`UPDATE exercises SET curriculum_version=?,curriculum_level=? WHERE id=?`, curriculumVersion, patternMeta.AppLevelMin, exID)
+	return map[string]any{"exercise_id": exID, "chinese_prompt": seed.Prompt, "target_pattern": c.Pattern, "pattern_id": c.ID, "scene_id": chosenScene, "subscene_id": chosenSubscene, "communication_intent": c.Intent, "difficulty": c.Difficulty, "target_difficulty": c.Difficulty, "realized_difficulty": realized, "difficulty_delta": math.Abs(realized - c.Difficulty), "difficulty_validation_status": validationStatus, "difficulty_validation_reason": validationReason, "difficulty_policy_version": cfg.DifficultyPolicyVersion, "curriculum_version": curriculumVersion, "curriculum_level": patternMeta.AppLevelMin, "cefr_anchor": patternMeta.CEFRAnchor, "grammar_family": patternMeta.GrammarFamily, "curriculum_instruction_complexity": patternMeta.InstructionComplexity, "selection_reason": c.Reason, "difficulty_mode": prefs.DifficultyMode, "fixed_difficulty": prefs.FixedDifficulty, "training_focus": TrainingFocusPattern, "target_pattern_enabled": true, "target_pattern_present": true, "is_review": c.Review, "is_probe": c.Probe, "is_new_skill": c.New, "generated_by": generatedBy, "scope_relaxed": c.ScopeRelaxed, "relaxation_reason": c.RelaxationReason, "reference_answers": seed.Answers, "decision_trace": c.DecisionTrace}, nil
 }
 
 // Emergency selection is used only when the normal candidate query cannot
@@ -1031,8 +1068,21 @@ func (s *Server) generateExerciseEmergency(diff float64, mode, scene string) (ma
 	var previous string
 	_ = s.db.QueryRow(`SELECT e.pattern_id FROM attempts a JOIN exercises e ON e.id=a.exercise_id ORDER BY a.submitted_at DESC,a.id DESC LIMIT 1`).Scan(&previous)
 	chosen := candidates[0]
+	gateLevel := curriculumLevelForDifficulty(diff)
+	if gateLevel >= 3 {
+		gateLevel = minCurriculumLevel(8, gateLevel+3)
+	}
+	for _, candidate := range candidates {
+		if ok, _ := curriculumEligible(candidate.id, gateLevel); ok {
+			chosen = candidate
+			break
+		}
+	}
 	for _, x := range candidates {
 		if x.id != previous {
+			if ok, _ := curriculumEligible(x.id, gateLevel); !ok {
+				continue
+			}
 			chosen = x
 			break
 		}
@@ -1049,12 +1099,14 @@ func (s *Server) generateExerciseEmergency(diff float64, mode, scene string) (ma
 	cfg := difficultyConfig(s.adaptiveConfig())
 	lower, upper := sessionBand(diff, cfg)
 	target := clamp(diff, lower, upper)
-	meta, _ := json.Marshal(map[string]any{"mode": mode, "selection_reason": "recovery", "generated_by": "fallback", "normalized_chinese_hash": hash, "target_difficulty": target, "realized_difficulty": target, "difficulty_validation_status": "validated_fallback", "difficulty_policy_version": cfg.DifficultyPolicyVersion, "decision_trace": map[string]any{"learner_ability": learnerAbility(s.db), "session_center": diff, "target_difficulty": target, "realized_difficulty": target, "difficulty_adjustment_reason": "emergency_recovery"}})
+	patternMeta, _ := curriculumPattern(chosen.id)
+	meta, _ := json.Marshal(map[string]any{"mode": mode, "selection_reason": "recovery", "generated_by": "fallback", "curriculum_version": curriculumVersion, "curriculum_level": patternMeta.AppLevelMin, "cefr_anchor": patternMeta.CEFRAnchor, "grammar_family": patternMeta.GrammarFamily, "normalized_chinese_hash": hash, "target_difficulty": target, "realized_difficulty": target, "difficulty_validation_status": "validated_fallback", "difficulty_policy_version": cfg.DifficultyPolicyVersion, "decision_trace": map[string]any{"learner_ability": learnerAbility(s.db), "session_center": diff, "target_difficulty": target, "realized_difficulty": target, "difficulty_adjustment_reason": "emergency_recovery"}})
 	exID := id("exercise")
 	if _, err = s.db.Exec(`INSERT INTO exercises(id,chinese_prompt,pattern_id,scene_id,intent_id,difficulty,target_difficulty,realized_difficulty,difficulty_delta,difficulty_validation_status,difficulty_validation_reason,difficulty_policy_version,metadata_json,created_at,normalized_chinese_hash,generated_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, exID, prompt, chosen.id, chosenScene, chosen.intent, target, target, target, 0, "validated_fallback", "emergency_recovery", cfg.DifficultyPolicyVersion, string(meta), time.Now().UTC().Format(time.RFC3339), hash, "fallback"); err != nil {
 		return nil, err
 	}
-	return map[string]any{"exercise_id": exID, "chinese_prompt": prompt, "target_pattern": chosen.pattern, "pattern_id": chosen.id, "scene_id": chosenScene, "communication_intent": chosen.intent, "difficulty": target, "target_difficulty": target, "realized_difficulty": target, "difficulty_delta": 0.0, "difficulty_validation_status": "validated_fallback", "difficulty_policy_version": cfg.DifficultyPolicyVersion, "selection_reason": "recovery", "generated_by": "fallback"}, nil
+	_, _ = s.db.Exec(`UPDATE exercises SET curriculum_version=?,curriculum_level=? WHERE id=?`, curriculumVersion, patternMeta.AppLevelMin, exID)
+	return map[string]any{"exercise_id": exID, "chinese_prompt": prompt, "target_pattern": chosen.pattern, "pattern_id": chosen.id, "scene_id": chosenScene, "communication_intent": chosen.intent, "difficulty": target, "target_difficulty": target, "realized_difficulty": target, "difficulty_delta": 0.0, "difficulty_validation_status": "validated_fallback", "difficulty_policy_version": cfg.DifficultyPolicyVersion, "curriculum_version": curriculumVersion, "curriculum_level": patternMeta.AppLevelMin, "cefr_anchor": patternMeta.CEFRAnchor, "grammar_family": patternMeta.GrammarFamily, "selection_reason": "recovery", "generated_by": "fallback"}, nil
 }
 
 func (s *Server) adaptiveChooseScene(pattern string) string {
@@ -1152,7 +1204,7 @@ func (s *Server) populateAttemptMetadata(attempt string) error {
 	if focus == TrainingFocusFree {
 		targetPatternPresent = 0
 	}
-	_, err := s.db.Exec(`UPDATE attempts SET intent_id=(SELECT intent_id FROM exercises WHERE id=?),exercise_difficulty=(SELECT difficulty FROM exercises WHERE id=?),practice_mode=?,selection_reason=?,is_review=?,is_probe=?,is_new_skill=?,generated_by=?,normalized_chinese_hash=?,review_timing=?,target_difficulty=?,realized_difficulty=?,difficulty_delta=?,difficulty_validation_status=?,difficulty_validation_reason=?,difficulty_policy_version=?,difficulty_mode=?,fixed_difficulty=?,training_focus=?,target_pattern_present=? WHERE id=?`, exercise, exercise, mode, reason, boolInt(review), boolInt(probe), boolInt(newSkill), generated, hash, reviewTiming, target, realized, delta, validationStatus, validationReason, policyVersion, difficultyMode, fixedDifficulty, focus, targetPatternPresent, attempt)
+	_, err := s.db.Exec(`UPDATE attempts SET intent_id=(SELECT intent_id FROM exercises WHERE id=?),exercise_difficulty=(SELECT difficulty FROM exercises WHERE id=?),curriculum_version=(SELECT COALESCE(curriculum_version,'') FROM exercises WHERE id=?),curriculum_level=(SELECT COALESCE(curriculum_level,0) FROM exercises WHERE id=?),practice_mode=?,selection_reason=?,is_review=?,is_probe=?,is_new_skill=?,generated_by=?,normalized_chinese_hash=?,review_timing=?,target_difficulty=?,realized_difficulty=?,difficulty_delta=?,difficulty_validation_status=?,difficulty_validation_reason=?,difficulty_policy_version=?,difficulty_mode=?,fixed_difficulty=?,training_focus=?,target_pattern_present=? WHERE id=?`, exercise, exercise, exercise, exercise, mode, reason, boolInt(review), boolInt(probe), boolInt(newSkill), generated, hash, reviewTiming, target, realized, delta, validationStatus, validationReason, policyVersion, difficultyMode, fixedDifficulty, focus, targetPatternPresent, attempt)
 	return err
 }
 

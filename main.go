@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -431,6 +432,18 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "curriculum-live" {
+		if err := runCurriculumLiveCLI(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "curriculum-map" {
+		if err := runCurriculumMapCLI(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "calibration-report" {
 		if err := runCalibrationReportCLI(); err != nil {
 			log.Fatal(err)
@@ -503,6 +516,8 @@ func migrate(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS scene_intent_map (scene_id TEXT NOT NULL, intent_id TEXT NOT NULL, weight REAL NOT NULL DEFAULT 1, PRIMARY KEY(scene_id,intent_id), FOREIGN KEY(scene_id) REFERENCES scenes(id), FOREIGN KEY(intent_id) REFERENCES communication_intents(id))`,
 		`CREATE TABLE IF NOT EXISTS scene_skill_map (scene_id TEXT NOT NULL, skill_id TEXT NOT NULL, weight REAL NOT NULL DEFAULT 1, PRIMARY KEY(scene_id,skill_id), FOREIGN KEY(scene_id) REFERENCES scenes(id), FOREIGN KEY(skill_id) REFERENCES skills(id))`,
 		`CREATE TABLE IF NOT EXISTS scene_transfer_events (id TEXT PRIMARY KEY, pattern_id TEXT NOT NULL, previous_scene_count INTEGER NOT NULL, new_scene_id TEXT NOT NULL, transfer_before REAL NOT NULL, transfer_after REAL NOT NULL, intent_count INTEGER NOT NULL, created_at TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS curriculum_skills (skill_id TEXT PRIMARY KEY, curriculum_version TEXT NOT NULL, app_level INTEGER NOT NULL, cefr_anchor TEXT NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}')`,
+		`CREATE TABLE IF NOT EXISTS curriculum_patterns (pattern_id TEXT PRIMARY KEY, curriculum_version TEXT NOT NULL, display_name TEXT NOT NULL, app_level_min INTEGER NOT NULL, cefr_anchor TEXT NOT NULL, grammar_family TEXT NOT NULL, communication_functions_json TEXT NOT NULL DEFAULT '[]', prerequisites_json TEXT NOT NULL DEFAULT '[]', productive_complexity REAL NOT NULL, typical_contexts_json TEXT NOT NULL DEFAULT '[]', rationale TEXT NOT NULL DEFAULT '', confidence TEXT NOT NULL DEFAULT 'medium', instruction_complexity INTEGER NOT NULL DEFAULT 1, allowed_grammar_json TEXT NOT NULL DEFAULT '[]', not_yet_targetable_json TEXT NOT NULL DEFAULT '[]', metadata_json TEXT NOT NULL DEFAULT '{}')`,
 	}
 	for _, q := range stmts {
 		if _, err := db.Exec(q); err != nil {
@@ -600,6 +615,12 @@ func migrate(db *sql.DB) error {
 		{"scene_mastery", "intent_coverage", "REAL NOT NULL DEFAULT 0"},
 		{"scene_mastery", "transfer", "REAL NOT NULL DEFAULT 0"},
 		{"scene_mastery", "state", "TEXT NOT NULL DEFAULT 'UNKNOWN'"},
+		{"sentence_patterns", "curriculum_version", "TEXT NOT NULL DEFAULT ''"},
+		{"sentence_patterns", "curriculum_level", "INTEGER NOT NULL DEFAULT 0"},
+		{"exercises", "curriculum_version", "TEXT NOT NULL DEFAULT ''"},
+		{"exercises", "curriculum_level", "INTEGER NOT NULL DEFAULT 0"},
+		{"attempts", "curriculum_version", "TEXT NOT NULL DEFAULT ''"},
+		{"attempts", "curriculum_level", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := ensureColumn(db, c.table, c.name, c.definition); err != nil {
 			return err
@@ -1155,6 +1176,42 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 			out = append(out, map[string]any{"id": id, "name": name, "description": desc, "level": level, "mastery": mastery, "eligible": mastery >= cfg.MasteryThreshold || level <= 1})
 		}
 		jsonResp(w, 200, out)
+	})
+	mux.HandleFunc("/api/curriculum", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			jsonResp(w, 405, nil)
+			return
+		}
+		guides := make([]CurriculumLevelGuide, 0, 8)
+		for level := 1; level <= 8; level++ {
+			guides = append(guides, curriculumLevelGuide(level))
+		}
+		patterns := make([]map[string]any, 0, len(curriculumPatternMap()))
+		for _, pattern := range curriculumPatternsSorted() {
+			patterns = append(patterns, curriculumPatternJSON(pattern))
+		}
+		skills := make([]CurriculumSkill, 0, len(curriculumSkillCatalog()))
+		for _, skill := range curriculumSkillCatalog() {
+			skills = append(skills, skill)
+		}
+		sort.Slice(skills, func(i, j int) bool {
+			if skills[i].AppLevel == skills[j].AppLevel {
+				return skills[i].ID < skills[j].ID
+			}
+			return skills[i].AppLevel < skills[j].AppLevel
+		})
+		jsonResp(w, 200, map[string]any{"curriculum_version": curriculumVersion, "internal_scale": "D1-D8 productive difficulty", "cefr_note": "CEFR anchors are alignment hypotheses, not official equivalences or certification.", "levels": guides, "skills": skills, "patterns": patterns, "graph": curriculumGraphDiagnostics()})
+	})
+	mux.HandleFunc("/api/curriculum/patterns", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			jsonResp(w, 405, nil)
+			return
+		}
+		out := make([]map[string]any, 0, len(curriculumPatternMap()))
+		for _, pattern := range curriculumPatternsSorted() {
+			out = append(out, curriculumPatternJSON(pattern))
+		}
+		jsonResp(w, 200, map[string]any{"curriculum_version": curriculumVersion, "patterns": out})
 	})
 	mux.HandleFunc("/api/calibration/catalog", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
