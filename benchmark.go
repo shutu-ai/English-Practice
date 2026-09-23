@@ -1021,6 +1021,9 @@ func runBenchmarkCLI(args []string) error {
 		sub = args[0]
 		args = args[1:]
 	}
+	if sub == "v241" || sub == "live-curriculum" || sub == "weak-detection" || sub == "live-weak" {
+		return runV241CLI(sub, args)
+	}
 	fs := flag.NewFlagSet("benchmark", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	samples := fs.Int("samples", cfg.Samples, "curriculum/difficulty corpus samples")
