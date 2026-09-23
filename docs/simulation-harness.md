@@ -92,6 +92,13 @@ source, bounded prompt/response byte counts, and per-attempt generation source.
 Health flags are diagnostic only. They do not mutate calibration, difficulty,
 mastery, curriculum configuration, or CI configuration.
 
+The V2.4 benchmark is a separate measurement layer. Use `go run . benchmark
+curriculum`, `difficulty`, `adaptive`, or `all` for independent curriculum
+coverage, difficulty calibration, and hidden-ability adaptation reports. It
+uses ignored benchmark artifacts, keeps true ability outside the adaptive
+engine, and never changes production learning state. See the three benchmark
+documents in this directory for thresholds and interpretation.
+
 ## CI boundary
 
 Deterministic smoke tests are suitable for CI. Extended runs and all live AI

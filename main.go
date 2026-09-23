@@ -419,6 +419,12 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "benchmark" {
+		if err := runBenchmarkCLI(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "calibration-report" {
 		if err := runCalibrationReportCLI(); err != nil {
 			log.Fatal(err)

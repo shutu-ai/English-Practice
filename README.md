@@ -102,6 +102,23 @@ remain `PARTIAL` until separate learner/evaluator providers are explicitly
 injected and manually accepted; simulation and human real-use statuses are
 reported independently.
 
+## V2.4 Learning Benchmarks
+
+The independent benchmark harness measures common-life curriculum coverage,
+difficulty calibration, and adaptive estimation against hidden synthetic
+ability. It does not auto-tune production curriculum or learning policy:
+
+```powershell
+go run . benchmark all --samples 500 --attempts 1000 --seed 42 --format json --output .acceptance-data/v24-benchmark.json
+go run . benchmark curriculum --dry-run
+```
+
+See [`docs/curriculum-benchmark.md`](docs/curriculum-benchmark.md),
+[`docs/difficulty-benchmark.md`](docs/difficulty-benchmark.md), and
+[`docs/adaptive-benchmark.md`](docs/adaptive-benchmark.md). Deterministic
+benchmark smoke is CI-safe; live AI judges are manual, isolated, and
+cost-guarded.
+
 ## Data and backup
 
 SQLite migrations and seed data run on first start. Back up the SQLite file while the app is stopped, for example `Copy-Item data/english-practice.db backups/english-practice-$(Get-Date -Format yyyyMMdd).db`.
