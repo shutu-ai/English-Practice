@@ -273,7 +273,7 @@ func (g LLMExerciseGenerator) generateOnce(ctx context.Context, ex SimulationExe
 	spec := generationSpecFromExercise(ex)
 	user := fmt.Sprintf("Training context\nScene: %s\nSubscene: %s\nCommunication intent: %s\nTarget pattern skill: %s\nTarget difficulty: %.3f (%s)\n\nGeneration requirements\n- Write a realistic adult situation in Chinese that naturally calls for the target skill.\n- Make the intent clear without giving an English answer hint.\n- Keep the prompt concise and complete.\n- Write one high-quality English reference answer that fulfills the situation and demonstrates the target skill.\n\nOutput contract\nReturn exactly one JSON object with chinese_prompt and reference_answers.", spec.SceneID, spec.SubsceneID, spec.Intent, spec.Pattern, spec.TargetDifficulty, spec.DifficultyBand)
 	messages := []ChatMessage{{Role: "system", Content: system}, {Role: "user", Content: user}}
-	resp, err := g.Client.Chat(ctx, ChatRequest{Messages: messages, MaxTokens: maxTokens, JSONMode: true})
+	resp, err := g.Client.Chat(ctx, ChatRequest{Messages: messages, MaxTokens: maxTokens, JSONMode: true, ReasoningMode: g.ReasoningMode, ReasoningEffort: g.ReasoningEffort, RequestID: "generator-" + ex.ID})
 	responseDiag := GeneratorResponseDiagnostics{PromptBytes: chatPromptBytes(messages)}
 	if err != nil {
 		responseDiag = generatorResponseDiagnosticsFromError(responseDiag, err)
@@ -315,7 +315,7 @@ func (g LLMExerciseGenerator) repairOnce(ctx context.Context, ex SimulationExerc
 	repairSystem := "Return one corrected JSON object only using the minimal exercise contract. Do not include metadata, markdown, reasoning, explanations, or multiple objects."
 	repairUser := fmt.Sprintf("Invalid response:\n%s\n\nExpected schema:\n%s\n\nValidation error: %s\nTraining context remains authoritative: scene=%s, subscene=%s, intent=%s, target pattern=%s, target difficulty=%.3f.", raw, expected, validationErr, ex.SceneID, ex.SubsceneID, ex.Intent, ex.Pattern, ex.Difficulty)
 	messages := []ChatMessage{{Role: "system", Content: repairSystem}, {Role: "user", Content: repairUser}}
-	resp, err := g.Client.Chat(ctx, ChatRequest{Messages: messages, MaxTokens: maxTokens, JSONMode: true})
+	resp, err := g.Client.Chat(ctx, ChatRequest{Messages: messages, MaxTokens: maxTokens, JSONMode: true, ReasoningMode: g.ReasoningMode, ReasoningEffort: g.ReasoningEffort, RequestID: "generator-repair-" + ex.ID})
 	responseDiag := GeneratorResponseDiagnostics{PromptBytes: chatPromptBytes(messages)}
 	if err != nil {
 		responseDiag = generatorResponseDiagnosticsFromError(responseDiag, err)

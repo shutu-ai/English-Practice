@@ -290,6 +290,67 @@ func TestDeepSeekCompatibleAssistantContentExtraction(t *testing.T) {
 	}
 }
 
+func TestHTTPChatClientSendsExplicitReasoningOptionsOnlyWhenSelected(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("request was not JSON: %v", err)
+		}
+		thinking, ok := payload["thinking"].(map[string]any)
+		if !ok || thinking["type"] != "disabled" || payload["reasoning_effort"] != "none" {
+			t.Fatalf("role-specific reasoning options missing: %#v", payload)
+		}
+		if _, ok := payload["api_key"]; ok || strings.Contains(string(mustJSONBytes(payload)), "secret") {
+			t.Fatal("provider secret leaked into request payload")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"choices":[{"message":{"content":"I might be late."},"finish_reason":"stop"}]}`)
+	}))
+	defer server.Close()
+	client := HTTPChatClient{cfg: ProviderConfig{ID: "reasoning-provider", Type: "openai-compatible", BaseURL: server.URL, Model: "mock", APIKey: "secret", Timeout: 2, Enabled: true}}
+	resp, err := client.Chat(context.Background(), ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "reply"}}, MaxTokens: 64, ReasoningMode: "disabled", ReasoningEffort: "none"})
+	if err != nil || resp.Content != "I might be late." || requests != 1 {
+		t.Fatalf("reasoning option request failed: response=%#v err=%v", resp, err)
+	}
+
+	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		if _, ok := payload["thinking"]; ok || payload["reasoning_effort"] != nil {
+			t.Fatalf("inherit mode unexpectedly changed provider request: %#v", payload)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"choices":[{"message":{"content":"OK"},"finish_reason":"stop"}]}`)
+	}))
+	defer server2.Close()
+	client.cfg.BaseURL = server2.URL
+	if _, err := client.Chat(context.Background(), ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "reply"}}, MaxTokens: 64, ReasoningMode: "inherit"}); err != nil {
+		t.Fatalf("inherit reasoning mode failed: %v", err)
+	}
+}
+
+func mustJSONBytes(value any) []byte {
+	b, _ := json.Marshal(value)
+	return b
+}
+
+func TestLearnerPromptKeepsCompactPersonaAndRoleOption(t *testing.T) {
+	client := &recordingChatClient{response: "I might be late."}
+	_, err := (LLMLearnerSimulator{Client: client, MaxTokens: 64, ReasoningMode: "disabled"}).Answer(context.Background(), SimulationExercise{ID: "learner-contract", ChinesePrompt: "请说明你可能会迟到。", SceneID: "meeting", DifficultyBand: "appropriate"}, SimulatedLearnerState{PersonaID: "stable-intermediate", PersonaContext: "steady intermediate; patterns needing practice [conditional]", HistorySummary: strings.Repeat("previous answer ", 100)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := client.request
+	if request.ReasoningMode != "disabled" || len(request.Messages[1].Content) > 700 {
+		t.Fatalf("learner role options or compact prompt missing: %#v", request)
+	}
+	if !strings.Contains(request.Messages[1].Content, "patterns needing practice") || strings.Contains(strings.ToLower(request.Messages[1].Content), "reference answer") {
+		t.Fatalf("learner persona contract is wrong: %s", request.Messages[1].Content)
+	}
+}
+
 func TestGeneratorProviderRetryPolicyDoesNotBlindRetry4xx(t *testing.T) {
 	client := &sequenceChatClient{errors: []error{&ProviderError{Category: "provider_4xx", HTTPStatus: 400, Err: errors.New("bad request")}}}
 	g := LLMExerciseGenerator{Client: client, MaxTokens: 64}

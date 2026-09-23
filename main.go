@@ -21,7 +21,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 9
+const schemaVersion = 10
 
 type Server struct {
 	db     *sql.DB
@@ -43,8 +43,23 @@ type ChatRequest struct {
 	Temperature float64       `json:"temperature,omitempty"`
 	MaxTokens   int           `json:"max_tokens,omitempty"`
 	JSONMode    bool          `json:"json_mode,omitempty"`
-	AllowEmpty  bool          `json:"-"`
-	RequestID   string        `json:"-"`
+	// ReasoningMode and ReasoningEffort are role-specific provider options.
+	// "inherit"/empty leaves the provider default unchanged. The wire shape is
+	// the documented OpenAI-compatible thinking/reasoning_effort shape and is
+	// only sent when a caller explicitly selects a mode.
+	ReasoningMode   string `json:"-"`
+	ReasoningEffort string `json:"-"`
+	AllowEmpty      bool   `json:"-"`
+	RequestID       string `json:"-"`
+}
+
+// ProviderRequestOptions are role-specific overrides. Empty values mean
+// inherit the provider default, preserving existing provider records.
+type ProviderRequestOptions struct {
+	ReasoningMode   string
+	ReasoningEffort string
+	MaxTokens       int
+	Temperature     *float64
 }
 type ChatResponse struct {
 	Content          string        `json:"content"`
@@ -81,16 +96,19 @@ func (e *ProviderError) Error() string {
 func (e *ProviderError) Unwrap() error { return e.Err }
 
 type ProviderConfig struct {
-	ID          string  `json:"id"`
-	Name        string  `json:"name"`
-	Type        string  `json:"type"`
-	BaseURL     string  `json:"base_url"`
-	APIKey      string  `json:"api_key,omitempty"`
-	Model       string  `json:"model"`
-	Timeout     int     `json:"timeout"`
-	Temperature float64 `json:"temperature"`
-	MaxTokens   int     `json:"max_tokens"`
-	Enabled     bool    `json:"enabled"`
+	ID                       string  `json:"id"`
+	Name                     string  `json:"name"`
+	Type                     string  `json:"type"`
+	BaseURL                  string  `json:"base_url"`
+	APIKey                   string  `json:"api_key,omitempty"`
+	Model                    string  `json:"model"`
+	Timeout                  int     `json:"timeout"`
+	Temperature              float64 `json:"temperature"`
+	MaxTokens                int     `json:"max_tokens"`
+	Enabled                  bool    `json:"enabled"`
+	SupportsReasoningControl bool    `json:"supports_reasoning_control,omitempty"`
+	SupportsJSONMode         bool    `json:"supports_json_mode,omitempty"`
+	ExposesReasoningContent  bool    `json:"exposes_reasoning_content,omitempty"`
 }
 type LLMRegistry struct {
 	mu      sync.RWMutex
@@ -114,6 +132,28 @@ type HTTPChatClient struct {
 	ollama bool
 }
 
+func normalizeReasoningMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "enabled", "enable", "on", "thinking":
+		return "enabled"
+	case "disabled", "disable", "off", "non-thinking", "non_thinking", "none":
+		return "disabled"
+	case "inherit", "default", "":
+		return "inherit"
+	default:
+		return ""
+	}
+}
+
+func normalizeReasoningEffort(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "none", "low", "high", "max":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return ""
+	}
+}
+
 func (c HTTPChatClient) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
 	start := time.Now()
 	timeout := time.Duration(c.cfg.Timeout) * time.Second
@@ -123,6 +163,12 @@ func (c HTTPChatClient) Chat(ctx context.Context, req ChatRequest) (*ChatRespons
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	payload := map[string]any{"model": c.cfg.Model, "messages": req.Messages, "temperature": req.Temperature, "max_tokens": req.MaxTokens}
+	if mode := normalizeReasoningMode(req.ReasoningMode); mode != "" && mode != "inherit" {
+		payload["thinking"] = map[string]string{"type": mode}
+	}
+	if effort := normalizeReasoningEffort(req.ReasoningEffort); effort != "" {
+		payload["reasoning_effort"] = effort
+	}
 	if req.JSONMode {
 		payload["response_format"] = map[string]string{"type": "json_object"}
 	}
@@ -150,10 +196,15 @@ func (c HTTPChatClient) Chat(ctx context.Context, req ChatRequest) (*ChatRespons
 	if c.cfg.APIKey != "" {
 		request.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
 	}
-	resp, err := http.DefaultClient.Do(request)
+	// Context deadlines cover request cancellation, but a client-level timeout
+	// is also required for providers that keep an HTTP/2 response body open
+	// while no final content is emitted. Without it, io.ReadAll below can hold
+	// a role call beyond the simulation guard.
+	httpClient := &http.Client{Transport: http.DefaultTransport, Timeout: timeout}
+	resp, err := httpClient.Do(request)
 	if err != nil {
 		category := "provider_error"
-		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "deadline exceeded") {
+		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "deadline exceeded") || strings.Contains(strings.ToLower(err.Error()), "client.timeout") {
 			category = "timeout"
 		}
 		return nil, &ProviderError{Stage: "provider_http", Category: category, Latency: time.Since(start), Err: err}
@@ -484,6 +535,11 @@ func migrate(db *sql.DB) error {
 		}
 	}
 	for _, c := range []struct{ table, name, definition string }{
+		{"llm_providers", "supports_reasoning_control", "INTEGER NOT NULL DEFAULT 0"},
+		{"llm_providers", "supports_json_mode", "INTEGER NOT NULL DEFAULT 1"},
+		{"llm_providers", "exposes_reasoning_content", "INTEGER NOT NULL DEFAULT 1"},
+		{"llm_task_configs", "reasoning_mode", "TEXT NOT NULL DEFAULT 'inherit'"},
+		{"llm_task_configs", "reasoning_effort", "TEXT NOT NULL DEFAULT ''"},
 		{"evaluations", "more_natural", "TEXT NOT NULL DEFAULT ''"},
 		{"evaluations", "more_natural_needed", "INTEGER NOT NULL DEFAULT 0"},
 		{"evaluations", "alternative", "TEXT NOT NULL DEFAULT ''"},
@@ -647,18 +703,21 @@ func seed(db *sql.DB) error {
 }
 
 func loadProviders(s *Server) error {
-	rows, err := s.db.Query(`SELECT id,name,type,base_url,api_key,model,timeout,temperature,max_tokens,enabled FROM llm_providers`)
+	rows, err := s.db.Query(`SELECT id,name,type,base_url,api_key,model,timeout,temperature,max_tokens,enabled,supports_reasoning_control,supports_json_mode,exposes_reasoning_content FROM llm_providers`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var c ProviderConfig
-		var en int
-		if err := rows.Scan(&c.ID, &c.Name, &c.Type, &c.BaseURL, &c.APIKey, &c.Model, &c.Timeout, &c.Temperature, &c.MaxTokens, &en); err != nil {
+		var en, reasoningControl, jsonMode, reasoningContent int
+		if err := rows.Scan(&c.ID, &c.Name, &c.Type, &c.BaseURL, &c.APIKey, &c.Model, &c.Timeout, &c.Temperature, &c.MaxTokens, &en, &reasoningControl, &jsonMode, &reasoningContent); err != nil {
 			return err
 		}
 		c.Enabled = en == 1
+		c.SupportsReasoningControl = reasoningControl == 1
+		c.SupportsJSONMode = jsonMode == 1
+		c.ExposesReasoningContent = reasoningContent == 1
 		s.llm.configs[c.ID] = c
 	}
 	return rows.Err()
@@ -1208,7 +1267,7 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 			}
 			s.llm.mu.RUnlock()
 		}
-		_, err := s.db.Exec(`INSERT INTO llm_providers(id,name,type,base_url,api_key,model,timeout,temperature,max_tokens,enabled) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,type=excluded.type,base_url=excluded.base_url,api_key=CASE WHEN excluded.api_key='' THEN llm_providers.api_key ELSE excluded.api_key END,model=excluded.model,timeout=excluded.timeout,temperature=excluded.temperature,max_tokens=excluded.max_tokens,enabled=excluded.enabled`, c.ID, c.Name, c.Type, c.BaseURL, c.APIKey, c.Model, c.Timeout, c.Temperature, c.MaxTokens, boolInt(c.Enabled))
+		_, err := s.db.Exec(`INSERT INTO llm_providers(id,name,type,base_url,api_key,model,timeout,temperature,max_tokens,enabled,supports_reasoning_control,supports_json_mode,exposes_reasoning_content) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,type=excluded.type,base_url=excluded.base_url,api_key=CASE WHEN excluded.api_key='' THEN llm_providers.api_key ELSE excluded.api_key END,model=excluded.model,timeout=excluded.timeout,temperature=excluded.temperature,max_tokens=excluded.max_tokens,enabled=excluded.enabled,supports_reasoning_control=excluded.supports_reasoning_control,supports_json_mode=excluded.supports_json_mode,exposes_reasoning_content=excluded.exposes_reasoning_content`, c.ID, c.Name, c.Type, c.BaseURL, c.APIKey, c.Model, c.Timeout, c.Temperature, c.MaxTokens, boolInt(c.Enabled), boolInt(c.SupportsReasoningControl), boolInt(c.SupportsJSONMode), boolInt(c.ExposesReasoningContent))
 		if err != nil {
 			jsonResp(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -1243,7 +1302,7 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 	})
 	mux.HandleFunc("/api/task-configs", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
-			rows, err := s.db.Query("SELECT task_type,provider_id,model,temperature,max_tokens FROM llm_task_configs ORDER BY task_type")
+			rows, err := s.db.Query("SELECT task_type,provider_id,model,temperature,max_tokens,reasoning_mode,reasoning_effort FROM llm_task_configs ORDER BY task_type")
 			if err != nil {
 				jsonResp(w, 500, map[string]string{"error": err.Error()})
 				return
@@ -1251,27 +1310,32 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 			defer rows.Close()
 			out := []map[string]any{}
 			for rows.Next() {
-				var task, provider, model string
+				var task, provider, model, reasoningMode, reasoningEffort string
 				var temp float64
 				var max int
-				_ = rows.Scan(&task, &provider, &model, &temp, &max)
-				out = append(out, map[string]any{"task_type": task, "provider_id": provider, "model": model, "temperature": temp, "max_tokens": max})
+				_ = rows.Scan(&task, &provider, &model, &temp, &max, &reasoningMode, &reasoningEffort)
+				out = append(out, map[string]any{"task_type": task, "provider_id": provider, "model": model, "temperature": temp, "max_tokens": max, "reasoning_mode": reasoningMode, "reasoning_effort": reasoningEffort})
 			}
 			jsonResp(w, 200, out)
 			return
 		}
 		var cfg struct {
-			TaskType    string  `json:"task_type"`
-			ProviderID  string  `json:"provider_id"`
-			Model       string  `json:"model"`
-			Temperature float64 `json:"temperature"`
-			MaxTokens   int     `json:"max_tokens"`
+			TaskType        string  `json:"task_type"`
+			ProviderID      string  `json:"provider_id"`
+			Model           string  `json:"model"`
+			Temperature     float64 `json:"temperature"`
+			MaxTokens       int     `json:"max_tokens"`
+			ReasoningMode   string  `json:"reasoning_mode"`
+			ReasoningEffort string  `json:"reasoning_effort"`
 		}
 		if err := decode(r, &cfg); err != nil || cfg.TaskType == "" || cfg.ProviderID == "" {
 			jsonResp(w, 400, map[string]string{"error": "task_type and provider_id are required"})
 			return
 		}
-		_, err := s.db.Exec(`INSERT INTO llm_task_configs(task_type,provider_id,model,temperature,max_tokens) VALUES(?,?,?,?,?) ON CONFLICT(task_type) DO UPDATE SET provider_id=excluded.provider_id,model=excluded.model,temperature=excluded.temperature,max_tokens=excluded.max_tokens`, cfg.TaskType, cfg.ProviderID, cfg.Model, cfg.Temperature, cfg.MaxTokens)
+		if cfg.ReasoningMode == "" {
+			cfg.ReasoningMode = "inherit"
+		}
+		_, err := s.db.Exec(`INSERT INTO llm_task_configs(task_type,provider_id,model,temperature,max_tokens,reasoning_mode,reasoning_effort) VALUES(?,?,?,?,?,?,?) ON CONFLICT(task_type) DO UPDATE SET provider_id=excluded.provider_id,model=excluded.model,temperature=excluded.temperature,max_tokens=excluded.max_tokens,reasoning_mode=excluded.reasoning_mode,reasoning_effort=excluded.reasoning_effort`, cfg.TaskType, cfg.ProviderID, cfg.Model, cfg.Temperature, cfg.MaxTokens, cfg.ReasoningMode, cfg.ReasoningEffort)
 		if err != nil {
 			jsonResp(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -1331,21 +1395,27 @@ const (
 )
 
 type EvaluationDiagnostics struct {
-	RequestID       string `json:"request_id"`
-	Provider        string `json:"provider"`
-	ProviderType    string `json:"provider_type"`
-	Model           string `json:"model"`
-	HTTPStatus      int    `json:"http_status,omitempty"`
-	LatencyMS       int64  `json:"latency_ms,omitempty"`
-	FailureStage    string `json:"failure_stage,omitempty"`
-	ErrorCategory   string `json:"error_category,omitempty"`
-	SchemaError     string `json:"schema_error,omitempty"`
-	ResponseShape   string `json:"response_shape,omitempty"`
-	RetryCount      int    `json:"retry_count"`
-	ProviderCalls   int    `json:"provider_calls"`
-	RepairAttempted bool   `json:"repair_attempted"`
-	FreshRetry      bool   `json:"fresh_retry"`
-	Success         bool   `json:"success"`
+	RequestID        string `json:"request_id"`
+	Provider         string `json:"provider"`
+	ProviderType     string `json:"provider_type"`
+	Model            string `json:"model"`
+	HTTPStatus       int    `json:"http_status,omitempty"`
+	LatencyMS        int64  `json:"latency_ms,omitempty"`
+	FailureStage     string `json:"failure_stage,omitempty"`
+	ErrorCategory    string `json:"error_category,omitempty"`
+	SchemaError      string `json:"schema_error,omitempty"`
+	ResponseShape    string `json:"response_shape,omitempty"`
+	ContentSource    string `json:"content_source,omitempty"`
+	FinishReason     string `json:"finish_reason,omitempty"`
+	ReasoningPresent bool   `json:"reasoning_present,omitempty"`
+	ResponseBytes    int    `json:"response_bytes,omitempty"`
+	ContentBytes     int    `json:"content_bytes,omitempty"`
+	PromptBytes      int    `json:"prompt_bytes,omitempty"`
+	RetryCount       int    `json:"retry_count"`
+	ProviderCalls    int    `json:"provider_calls"`
+	RepairAttempted  bool   `json:"repair_attempted"`
+	FreshRetry       bool   `json:"fresh_retry"`
+	Success          bool   `json:"success"`
 }
 
 var evaluationErrorTypes = map[string]string{
@@ -2123,10 +2193,14 @@ func (s *Server) reevaluateAttempt(ctx context.Context, attempt string) (map[str
 }
 
 func (s *Server) evaluate(ctx context.Context, prompt, pattern, answer string) (Eval, string, string, EvaluationDiagnostics, error) {
-	return s.evaluateWithProvider(ctx, prompt, pattern, answer, "")
+	return s.evaluateWithProviderOptions(ctx, prompt, pattern, answer, "", ProviderRequestOptions{})
 }
 
 func (s *Server) evaluateWithProvider(ctx context.Context, prompt, pattern, answer, providerID string) (Eval, string, string, EvaluationDiagnostics, error) {
+	return s.evaluateWithProviderOptions(ctx, prompt, pattern, answer, providerID, ProviderRequestOptions{})
+}
+
+func (s *Server) evaluateWithProviderOptions(ctx context.Context, prompt, pattern, answer, providerID string, options ProviderRequestOptions) (Eval, string, string, EvaluationDiagnostics, error) {
 	s.llm.mu.RLock()
 	var c ProviderConfig
 	for _, x := range s.llm.configs {
@@ -2153,7 +2227,7 @@ func (s *Server) evaluateWithProvider(ctx context.Context, prompt, pattern, answ
 			targetPattern = label
 		}
 	}
-	baseMessages := []ChatMessage{{Role: "system", Content: "Evaluate an English learner answer. Return exactly one JSON object in the assistant content; do not include reasoning or prose. The object must have verdict (string), meaning_score (number), grammar_score (number), naturalness_score (number), pattern_score (number), target_pattern_match (string), target_pattern_score (number), errors (array), suggested_answer (string), explanation_zh (string), and may include more_natural_needed (boolean), more_natural (string), and alternative (string). verdict must be exactly one of: correct, mostly_correct, needs_improvement, incorrect. Scores must be numbers from 0 to 1. target_pattern_match must be exactly one of: exact, semantic_equivalent, partial, not_matched. Do not require literal use of the target phrase. Accept natural semantic equivalents when they genuinely demonstrate the same grammatical or discourse function. Do not accept a merely similar overall meaning if the target grammatical/discourse skill was not demonstrated. Decide in this order: meaning, communication intent, grammar, naturalness, target pattern function. Use errors:[] when there are no errors. Every error object must contain all three string fields: type, severity, and explanation. Each error type must be one of meaning, tense, article, preposition, word_order, modal, condition, agreement, word_choice, missing_information, extra_information, unnatural_expression, target_pattern_missing, register, other. Each severity must be minor, moderate, or major. The suggested_answer must preserve and demonstrate the target pattern. Do not rewrite an already correct and natural answer merely to produce a different sentence: set more_natural_needed=false and more_natural to an empty string. Only provide more_natural when it is a meaningful improvement; use alternative for a useful but not strictly better rephrasing."}, {Role: "user", Content: fmt.Sprintf("Prompt: %s\nTarget pattern expression: %s\nTarget pattern ID: %s\nAnswer: %s", prompt, targetPattern, pattern, answer)}}
+	baseMessages := []ChatMessage{{Role: "system", Content: "Evaluate an English learner answer. You may reason internally, but after reasoning always return the final evaluation as one complete JSON object in the assistant's final content. Never leave final content empty and never return reasoning as the evaluation. Do not include prose or markdown outside JSON. The object must have verdict (string), meaning_score (number), grammar_score (number), naturalness_score (number), pattern_score (number), target_pattern_match (string), target_pattern_score (number), errors (array), suggested_answer (string), explanation_zh (string), and may include more_natural_needed (boolean), more_natural (string), and alternative (string). verdict must be exactly one of: correct, mostly_correct, needs_improvement, incorrect. Scores must be numbers from 0 to 1. target_pattern_match must be exactly one of: exact, semantic_equivalent, partial, not_matched. Do not require literal use of the target phrase. Accept natural semantic equivalents when they genuinely demonstrate the same grammatical or discourse function. Do not accept a merely similar overall meaning if the target grammatical/discourse skill was not demonstrated. Decide in this order: meaning, communication intent, grammar, naturalness, target pattern function. Use errors:[] when there are no errors. Every error object must contain all three string fields: type, severity, and explanation. Each error type must be one of meaning, tense, article, preposition, word_order, modal, condition, agreement, word_choice, missing_information, extra_information, unnatural_expression, target_pattern_missing, register, other. Each severity must be minor, moderate, or major. The suggested_answer must preserve and demonstrate the target pattern. Do not rewrite an already correct and natural answer merely to produce a different sentence: set more_natural_needed=false and more_natural to an empty string. Only provide more_natural when it is a meaningful improvement; use alternative for a useful but not strictly better rephrasing."}, {Role: "user", Content: fmt.Sprintf("Original evaluation context\nPrompt: %s\nTarget pattern expression: %s\nTarget pattern ID: %s\nLearner answer: %s", prompt, targetPattern, pattern, answer)}}
 	jsonMode := true
 	const maxEvaluationAttempts = 3
 	lastInvalidResponse := ""
@@ -2174,7 +2248,11 @@ func (s *Server) evaluateWithProvider(ctx context.Context, prompt, pattern, answ
 		if !jsonMode {
 			messages = append(messages, ChatMessage{Role: "system", Content: "This provider does not support native JSON response mode. Return only the JSON object in the assistant content."})
 		}
+		diagnostics.PromptBytes = chatPromptBytes(messages)
 		maxTokens := c.MaxTokens
+		if options.MaxTokens > 0 {
+			maxTokens = options.MaxTokens
+		}
 		if maxTokens < 1200 {
 			maxTokens = 1200
 		}
@@ -2184,7 +2262,11 @@ func (s *Server) evaluateWithProvider(ctx context.Context, prompt, pattern, answ
 		if attempt > 1 {
 			maxTokens *= 2
 		}
-		resp, err := s.llm.Client(c).Chat(ctx, ChatRequest{Messages: messages, Temperature: c.Temperature, MaxTokens: maxTokens, JSONMode: jsonMode, RequestID: diagnostics.RequestID})
+		temperature := c.Temperature
+		if options.Temperature != nil {
+			temperature = *options.Temperature
+		}
+		resp, err := s.llm.Client(c).Chat(ctx, ChatRequest{Messages: messages, Temperature: temperature, MaxTokens: maxTokens, JSONMode: jsonMode, ReasoningMode: options.ReasoningMode, ReasoningEffort: options.ReasoningEffort, RequestID: diagnostics.RequestID})
 		diagnostics.ProviderCalls++
 		diagnostics.RetryCount = attempt
 		if err != nil {
@@ -2215,6 +2297,11 @@ func (s *Server) evaluateWithProvider(ctx context.Context, prompt, pattern, answ
 		diagnostics.HTTPStatus = resp.HTTPStatus
 		diagnostics.LatencyMS = resp.Latency.Milliseconds()
 		diagnostics.ResponseShape = resp.ResponseShape
+		diagnostics.ContentSource = resp.ContentSource
+		diagnostics.FinishReason = resp.FinishReason
+		diagnostics.ReasoningPresent = resp.ReasoningPresent
+		diagnostics.ResponseBytes = resp.ResponseBytes
+		diagnostics.ContentBytes = len(resp.Content)
 		ev, parseErr := normalizeEvalContent(resp.Content)
 		if parseErr == nil {
 			reconcileTargetPattern(&ev, pattern, targetPattern, answer)

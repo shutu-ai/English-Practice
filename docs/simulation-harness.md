@@ -1,6 +1,6 @@
 # Simulation & Acceptance Harness
 
-V2.3.5 includes the V2.3.1 deterministic simulation layer for regression and a separately
+V2.3.6 includes the V2.3.1 deterministic simulation layer for regression and a separately
 defined AI learner adapter for manual acceptance. Simulation is not human
 real-use validation: it can expose selection, difficulty, memory, scene,
 transfer, repetition, and curriculum problems, but it cannot establish that a
@@ -66,13 +66,22 @@ retention / transfer trajectories, scene coverage/mastery, transfer events,
 skill unlock events, health flags, and the complete attempt trace when JSON is
 requested.
 
-V2.3.5 Full-AI reports additionally separate requested chains, generator
+V2.3.6 Full-AI reports additionally separate requested chains, generator
 acceptance, learner initial/retry/final-failure outcomes, evaluator
 initial/repair/retry/final-failure outcomes, complete chains, chain outcome,
 failure taxonomy, provider call counts, and full-chain completion rate. A
 provider failure is a system failure and is never counted as an incorrect
 learner answer. See [provider-reliability.md](provider-reliability.md) for the
 role contracts, bounded retry policy, and state mutation boundary.
+
+Role-specific reasoning controls are available for live acceptance runs:
+`--learner-reasoning-mode`, `--learner-reasoning-effort`,
+`--evaluator-reasoning-mode`, `--evaluator-reasoning-effort`,
+`--generator-reasoning-mode`, and `--generator-reasoning-effort`. `inherit`
+preserves the provider default; explicit `disabled`/`none` or enabled effort
+is sent only for that role. Acceptance diagnostics record bounded prompt,
+response, content-source, finish-reason, and reasoning-presence metadata
+without persisting raw provider responses.
 
 Generator reports additionally include the contract version, provider request
 count, initial provider success/failure, structural/semantic/adapter extraction

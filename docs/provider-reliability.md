@@ -4,11 +4,18 @@ The simulation harness keeps provider failures separate from learner behavior.
 All provider calls use the shared OpenAI-compatible response adapter, while
 each role retains its own output contract and recovery policy.
 
-| Role | Output contract | Recovery |
-| --- | --- | --- |
-| Generator | Minimal JSON containing `chinese_prompt`; application metadata remains authoritative | bounded repair, fresh retry, then application fallback |
-| Learner | One plain English answer sentence | one fresh retry for transient, empty, reasoning-only, timeout, or 5xx failures |
-| Evaluator | Validated structured evaluation with verdict, scores, target-pattern match, feedback, and error taxonomy | deterministic JSON extraction, one schema repair, then one fresh evaluation retry |
+| Role | Output contract | Reasoning policy | Recovery |
+| --- | --- | --- | --- |
+| Generator | Minimal JSON containing `chinese_prompt`; application metadata remains authoritative | inherit provider setting by default; V2.3.4 behavior is frozen | bounded repair, fresh retry, then application fallback |
+| Learner | One plain English answer sentence | explicitly selectable `inherit`/`disabled`/`enabled`; acceptance uses disabled when supported | one fresh retry for transient, empty, reasoning-only, timeout, or 5xx failures |
+| Evaluator | Validated structured evaluation with verdict, scores, target-pattern match, feedback, and error taxonomy | reasoning may remain enabled/reduced, but final JSON content is mandatory | deterministic JSON extraction, one schema repair, then one fresh evaluation retry |
+
+Role-specific options are carried by `ChatRequest` and can be selected by the
+simulation CLI or task configuration without creating another provider record.
+Empty/`inherit` options preserve existing provider behavior. The DeepSeek API
+documents `thinking.type` (`enabled`/`disabled`) and `reasoning_effort`
+(`none`/`low`/`high`/`max`); the adapter emits those fields only when a role
+explicitly selects them.
 
 ## Provider envelope
 
@@ -34,7 +41,10 @@ prompt receives the bounded invalid response and schema error, but never treats
 the previous verdict as authoritative. A fresh retry reconstructs the request
 from the original exercise, learner answer, target pattern, and intent.
 
-Every provider call is counted by the simulation guard. There is no unbounded
+The evaluator prompt explicitly requires a final JSON object after any internal
+reasoning. A reasoning-only evaluator response triggers a fresh finalization
+retry from the original exercise/answer context; hidden reasoning is never fed
+back into repair prompts. Every provider call is counted by the simulation guard. There is no unbounded
 `while invalid` loop.
 
 ## State mutation boundary

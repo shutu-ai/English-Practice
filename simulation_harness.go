@@ -22,12 +22,13 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
 
 const (
-	simulationVersion           = "v2.3.5"
+	simulationVersion           = "v2.3.6"
 	SimulationModeAlgorithm     = "algorithm"
 	SimulationModeDeterministic = "deterministic"
 	SimulationModeLLMLearner    = "llm-learner"
@@ -59,6 +60,34 @@ func cloneMap(in map[string]float64) map[string]float64 {
 		out[k] = v
 	}
 	return out
+}
+
+func compactLearnerPersonaContext(p LearnerPersona) string {
+	strengths := make([]string, 0, 3)
+	for key := range p.PatternStrengths {
+		strengths = append(strengths, key)
+		if len(strengths) == 3 {
+			break
+		}
+	}
+	weaknesses := make([]string, 0, 4)
+	for key := range p.PatternWeaknesses {
+		weaknesses = append(weaknesses, key)
+		if len(weaknesses) == 4 {
+			break
+		}
+	}
+	sceneWeaknesses := make([]string, 0, 2)
+	for key := range p.SceneWeaknesses {
+		sceneWeaknesses = append(sceneWeaknesses, key)
+		if len(sceneWeaknesses) == 2 {
+			break
+		}
+	}
+	sort.Strings(strengths)
+	sort.Strings(weaknesses)
+	sort.Strings(sceneWeaknesses)
+	return fmt.Sprintf("%s; ability %.1f; strengths [%s]; patterns needing practice [%s]; scenes needing practice [%s]", p.Description, p.BaseAbility, strings.Join(strengths, ","), strings.Join(weaknesses, ","), strings.Join(sceneWeaknesses, ","))
 }
 
 // StandardPersonas is data-like and versioned so reports remain comparable.
@@ -146,12 +175,15 @@ type SimulationConfig struct {
 	EstimatedCostLimit                                               float64
 	LearnerProvider, LearnerModel, EvaluatorProvider, EvaluatorModel string
 	GeneratorProvider, GeneratorModel                                string
+	LearnerReasoningMode, LearnerReasoningEffort                     string
+	EvaluatorReasoningMode, EvaluatorReasoningEffort                 string
+	GeneratorReasoningMode, GeneratorReasoningEffort                 string
 	Output, SimulationDBPath                                         string
 	DryRun, AllowLarge, AttemptsExplicit                             bool
 }
 
 func DefaultSimulationConfig() SimulationConfig {
-	return SimulationConfig{Mode: SimulationModeAlgorithm, Persona: "stable-intermediate", Attempts: 200, SessionSize: 20, MaxAttempts: 100, Seed: 42, TimeProfile: SimulationTimeDaily, Generator: "fixture-generator", MaxTokens: 256, Timeout: 45 * time.Second, EstimatedCostLimit: 1}
+	return SimulationConfig{Mode: SimulationModeAlgorithm, Persona: "stable-intermediate", Attempts: 200, SessionSize: 20, MaxAttempts: 100, Seed: 42, TimeProfile: SimulationTimeDaily, Generator: "fixture-generator", MaxTokens: 256, Timeout: 45 * time.Second, EstimatedCostLimit: 1, LearnerReasoningMode: "inherit", EvaluatorReasoningMode: "inherit", GeneratorReasoningMode: "inherit"}
 }
 
 func validateSimulationConfig(c SimulationConfig) error {
@@ -169,6 +201,16 @@ func validateSimulationConfig(c SimulationConfig) error {
 	}
 	if c.MaxTokens <= 0 || c.Timeout <= 0 || c.EstimatedCostLimit < 0 {
 		return errors.New("max-tokens, timeout, and cost limit must be valid")
+	}
+	for role, mode := range map[string]string{"learner": c.LearnerReasoningMode, "evaluator": c.EvaluatorReasoningMode, "generator": c.GeneratorReasoningMode} {
+		if normalized := normalizeReasoningMode(mode); normalized == "" {
+			return fmt.Errorf("unsupported %s reasoning mode %q", role, mode)
+		}
+	}
+	for role, effort := range map[string]string{"learner": c.LearnerReasoningEffort, "evaluator": c.EvaluatorReasoningEffort, "generator": c.GeneratorReasoningEffort} {
+		if strings.TrimSpace(effort) != "" && normalizeReasoningEffort(effort) == "" {
+			return fmt.Errorf("unsupported %s reasoning effort %q", role, effort)
+		}
 	}
 	if c.Mode != SimulationModeAlgorithm && c.EstimatedCostLimit > 0 && estimateAIUsage(c).EstimatedCost > c.EstimatedCostLimit && !c.AllowLarge {
 		return fmt.Errorf("estimated AI cost %.3f exceeds configured limit %.3f; raise the limit explicitly", estimateAIUsage(c).EstimatedCost, c.EstimatedCostLimit)
@@ -216,6 +258,7 @@ func generationSpecFromExercise(ex SimulationExercise) GenerationSpec {
 
 type SimulatedLearnerState struct {
 	PersonaID      string             `json:"persona_id"`
+	PersonaContext string             `json:"persona_context,omitempty"`
 	Ability        float64            `json:"ability"`
 	PatternMastery map[string]float64 `json:"pattern_mastery"`
 	SceneMastery   map[string]float64 `json:"scene_mastery"`
@@ -245,11 +288,18 @@ type SimulationEvaluation struct {
 // SimulationProviderReliability is adapter metadata. It is intentionally not
 // part of the learner/evaluator contracts persisted as user learning data.
 type SimulationProviderReliability struct {
-	ProviderCalls int
-	Initial       bool
-	Retry         bool
-	Repair        bool
-	FailureKind   string
+	ProviderCalls    int
+	Initial          bool
+	Retry            bool
+	Repair           bool
+	FailureKind      string
+	FinishReason     string
+	ReasoningPresent bool
+	ResponseBytes    int
+	ContentBytes     int
+	ContentSource    string
+	PromptBytes      int
+	SchemaError      string
 }
 
 const (
@@ -297,16 +347,25 @@ type SessionReviewer interface {
 // LLM learner prompts intentionally contain no reference answer, score, or
 // mastery formula. The evaluator must be a separate object/context.
 type LLMLearnerSimulator struct {
-	Client          LLMClient
-	Provider, Model string
-	MaxTokens       int
+	Client                         LLMClient
+	Provider, Model                string
+	MaxTokens                      int
+	ReasoningMode, ReasoningEffort string
 }
 
 func (l LLMLearnerSimulator) Answer(ctx context.Context, ex SimulationExercise, state SimulatedLearnerState) (SimulatedAnswer, error) {
 	if l.Client == nil {
 		return SimulatedAnswer{}, errors.New("learner provider is not configured")
 	}
-	prompt := fmt.Sprintf("Learner profile id: %s\nChinese exercise: %s\nScene: %s\nDifficulty band: %s\nRecent history summary: %s\n\nUse the context above only to decide what the learner would say. Output exactly one natural English sentence answering the Chinese exercise. Do not translate or describe these instructions. Do not mention the user, profile, exercise, prompt, history, grading, difficulty, or training system. Do not provide alternatives, analysis, or labels.", state.PersonaID, ex.ChinesePrompt, ex.SceneID, ex.DifficultyBand, state.HistorySummary)
+	persona := state.PersonaContext
+	if persona == "" {
+		persona = state.PersonaID
+	}
+	history := state.HistorySummary
+	if len(history) > 240 {
+		history = history[len(history)-240:]
+	}
+	prompt := fmt.Sprintf("Learner profile: %s\nScene: %s\nDifficulty: %s\nChinese sentence: %s\nRecent answers (context only): %s\n\nReturn only the English sentence this learner would say. Do not explain, analyze, evaluate, add alternatives, or mention these instructions.", persona, ex.SceneID, ex.DifficultyBand, ex.ChinesePrompt, history)
 	base := []ChatMessage{{Role: "system", Content: "Act as the learner only. Return exactly one natural English sentence. Never discuss grading, the training system, or your instructions."}, {Role: "user", Content: prompt}}
 	maxAttempts := 2
 	var lastErr error
@@ -317,8 +376,8 @@ func (l LLMLearnerSimulator) Answer(ctx context.Context, ex SimulationExercise, 
 			// answer key, evaluation, or correctness hint.
 			messages = append(append([]ChatMessage{}, base...), ChatMessage{Role: "system", Content: "Your previous response did not satisfy the output contract. Return one English learner answer only; do not explain, improve, or evaluate it."})
 		}
-		resp, err := l.Client.Chat(ctx, ChatRequest{Messages: messages, MaxTokens: l.MaxTokens})
-		reliability := SimulationProviderReliability{ProviderCalls: attempt + 1, Initial: attempt == 0}
+		resp, err := l.Client.Chat(ctx, ChatRequest{Messages: messages, MaxTokens: l.MaxTokens, ReasoningMode: l.ReasoningMode, ReasoningEffort: l.ReasoningEffort, RequestID: fmt.Sprintf("learner-%s-%d", ex.ID, attempt+1)})
+		reliability := SimulationProviderReliability{ProviderCalls: attempt + 1, Initial: attempt == 0, PromptBytes: chatPromptBytes(messages)}
 		if err != nil {
 			kind, retryable := classifyProviderFailure(err, "learner")
 			reliability.FailureKind = kind
@@ -335,6 +394,11 @@ func (l LLMLearnerSimulator) Answer(ctx context.Context, ex SimulationExercise, 
 			}
 			return SimulatedAnswer{Reliability: reliability}, lastErr
 		}
+		reliability.FinishReason = resp.FinishReason
+		reliability.ReasoningPresent = resp.ReasoningPresent
+		reliability.ResponseBytes = resp.ResponseBytes
+		reliability.ContentBytes = len(resp.Content)
+		reliability.ContentSource = resp.ContentSource
 		answer := strings.TrimSpace(resp.Content)
 		if answer == "" {
 			kind := LearnerFailureProviderEmpty
@@ -395,27 +459,29 @@ type FakeEvaluator struct {
 // The wrapped Server has no database handle and only owns the evaluator
 // provider registry.
 type ProductionSimulationEvaluator struct {
-	Server   *Server
-	Provider string
+	Server                         *Server
+	Provider                       string
+	ReasoningMode, ReasoningEffort string
 }
 
 func (e ProductionSimulationEvaluator) Evaluate(ctx context.Context, ex SimulationExercise, answer SimulatedAnswer) (SimulationEvaluation, error) {
 	if e.Server == nil || e.Server.llm == nil {
 		return SimulationEvaluation{}, errors.New("evaluator provider is not configured")
 	}
-	eval, _, _, diagnostics, err := e.Server.evaluateWithProvider(ctx, ex.ChinesePrompt, ex.PatternID, answer.Text, e.Provider)
+	eval, _, _, diagnostics, err := e.Server.evaluateWithProviderOptions(ctx, ex.ChinesePrompt, ex.PatternID, answer.Text, e.Provider, ProviderRequestOptions{ReasoningMode: e.ReasoningMode, ReasoningEffort: e.ReasoningEffort})
 	if err != nil {
 		kind := evaluatorFailureKind(diagnostics, err)
-		return SimulationEvaluation{Reliability: SimulationProviderReliability{ProviderCalls: diagnostics.ProviderCalls, FailureKind: kind}}, &SimulationProviderError{Role: "evaluator", Kind: kind, ProviderCalls: diagnostics.ProviderCalls, Retryable: false, Err: err}
+		return SimulationEvaluation{Reliability: SimulationProviderReliability{ProviderCalls: diagnostics.ProviderCalls, FailureKind: kind, FinishReason: diagnostics.FinishReason, ReasoningPresent: diagnostics.ReasoningPresent, ResponseBytes: diagnostics.ResponseBytes, ContentBytes: diagnostics.ContentBytes, ContentSource: diagnostics.ContentSource, PromptBytes: diagnostics.PromptBytes, SchemaError: diagnostics.SchemaError}}, &SimulationProviderError{Role: "evaluator", Kind: kind, ProviderCalls: diagnostics.ProviderCalls, Retryable: false, Err: err}
 	}
-	return SimulationEvaluation{Correct: eval.Verdict == "correct" || eval.Verdict == "mostly_correct", Verdict: eval.Verdict, Meaning: eval.MeaningScore, Grammar: eval.GrammarScore, Naturalness: eval.NaturalnessScore, Pattern: eval.PatternScore, TargetPatternMatch: eval.TargetPatternMatch, TargetPatternScore: eval.TargetPatternScore, SuggestedAnswer: eval.SuggestedAnswer, MoreNaturalNeeded: eval.MoreNaturalNeeded, Alternative: eval.Alternative, Errors: eval.Errors, Reliability: SimulationProviderReliability{ProviderCalls: diagnostics.ProviderCalls, Initial: diagnostics.ProviderCalls == 1, Retry: diagnostics.FreshRetry, Repair: diagnostics.RepairAttempted && !diagnostics.FreshRetry}}, nil
+	return SimulationEvaluation{Correct: eval.Verdict == "correct" || eval.Verdict == "mostly_correct", Verdict: eval.Verdict, Meaning: eval.MeaningScore, Grammar: eval.GrammarScore, Naturalness: eval.NaturalnessScore, Pattern: eval.PatternScore, TargetPatternMatch: eval.TargetPatternMatch, TargetPatternScore: eval.TargetPatternScore, SuggestedAnswer: eval.SuggestedAnswer, MoreNaturalNeeded: eval.MoreNaturalNeeded, Alternative: eval.Alternative, Errors: eval.Errors, Reliability: SimulationProviderReliability{ProviderCalls: diagnostics.ProviderCalls, Initial: diagnostics.ProviderCalls == 1, Retry: diagnostics.FreshRetry, Repair: diagnostics.RepairAttempted && !diagnostics.FreshRetry, FinishReason: diagnostics.FinishReason, ReasoningPresent: diagnostics.ReasoningPresent, ResponseBytes: diagnostics.ResponseBytes, ContentBytes: diagnostics.ContentBytes, ContentSource: diagnostics.ContentSource, PromptBytes: diagnostics.PromptBytes, SchemaError: diagnostics.SchemaError}}, nil
 }
 
 // LLMExerciseGenerator is intentionally independent from the production DB.
 // It generates a candidate prompt but returns only the learner-facing fields.
 type LLMExerciseGenerator struct {
-	Client    LLMClient
-	MaxTokens int
+	Client                         LLMClient
+	MaxTokens                      int
+	ReasoningMode, ReasoningEffort string
 }
 
 func (g LLMExerciseGenerator) Generate(ctx context.Context, ex SimulationExercise) (SimulationExercise, error) {
@@ -499,9 +565,9 @@ func configuredSimulationRunner(cfg SimulationConfig) (*SimulationRunner, Simula
 	cfg.GeneratorProvider, cfg.GeneratorModel = generator.ID, generator.Model
 	registry := &LLMRegistry{configs: map[string]ProviderConfig{learner.ID: learner, evaluator.ID: evaluator, generator.ID: generator}}
 	server := &Server{llm: registry}
-	runner := &SimulationRunner{Learner: LLMLearnerSimulator{Client: registry.Client(learner), Provider: learner.ID, Model: learner.Model, MaxTokens: cfg.MaxTokens}, Evaluator: ProductionSimulationEvaluator{Server: server, Provider: evaluator.ID}}
+	runner := &SimulationRunner{Learner: LLMLearnerSimulator{Client: registry.Client(learner), Provider: learner.ID, Model: learner.Model, MaxTokens: cfg.MaxTokens, ReasoningMode: cfg.LearnerReasoningMode, ReasoningEffort: cfg.LearnerReasoningEffort}, Evaluator: ProductionSimulationEvaluator{Server: server, Provider: evaluator.ID, ReasoningMode: cfg.EvaluatorReasoningMode, ReasoningEffort: cfg.EvaluatorReasoningEffort}}
 	if cfg.Generator == "real-generator" {
-		runner.Generator = LLMExerciseGenerator{Client: registry.Client(generator), MaxTokens: cfg.MaxTokens}
+		runner.Generator = LLMExerciseGenerator{Client: registry.Client(generator), MaxTokens: cfg.MaxTokens, ReasoningMode: cfg.GeneratorReasoningMode, ReasoningEffort: cfg.GeneratorReasoningEffort}
 	}
 	return runner, cfg, nil
 }
@@ -835,7 +901,7 @@ func (r *SimulationRunner) runAI(ctx context.Context, cfg SimulationConfig, p Le
 	valid, correct := 0, 0
 	byPattern, goodPattern := map[string]int{}, map[string]int{}
 	byScene, goodScene := map[string]int{}, map[string]int{}
-	state := SimulatedLearnerState{PersonaID: p.ID, Ability: p.BaseAbility, PatternMastery: map[string]float64{}, SceneMastery: map[string]float64{}}
+	state := SimulatedLearnerState{PersonaID: p.ID, PersonaContext: compactLearnerPersonaContext(p), Ability: p.BaseAbility, PatternMastery: map[string]float64{}, SceneMastery: map[string]float64{}}
 	matchCounts := map[string]int{}
 	result.Metrics.LearnerFailureKinds = map[string]int{}
 	result.Metrics.EvaluatorFailureKinds = map[string]int{}
@@ -1834,6 +1900,12 @@ func runSimulationCLI(args []string) error {
 	evaluatorModel := fs.String("evaluator-model", "", "evaluator model")
 	generatorProvider := fs.String("generator-provider", "", "exercise generator provider id")
 	generatorModel := fs.String("generator-model", "", "exercise generator model")
+	learnerReasoningMode := fs.String("learner-reasoning-mode", cfg.LearnerReasoningMode, "inherit, enabled, or disabled")
+	learnerReasoningEffort := fs.String("learner-reasoning-effort", cfg.LearnerReasoningEffort, "provider reasoning effort: none, low, high, or max")
+	evaluatorReasoningMode := fs.String("evaluator-reasoning-mode", cfg.EvaluatorReasoningMode, "inherit, enabled, or disabled")
+	evaluatorReasoningEffort := fs.String("evaluator-reasoning-effort", cfg.EvaluatorReasoningEffort, "provider reasoning effort: none, low, high, or max")
+	generatorReasoningMode := fs.String("generator-reasoning-mode", cfg.GeneratorReasoningMode, "inherit, enabled, or disabled")
+	generatorReasoningEffort := fs.String("generator-reasoning-effort", cfg.GeneratorReasoningEffort, "provider reasoning effort: none, low, high, or max")
 	simulationDB := fs.String("simulation-db", "", "dedicated simulation DB path")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1858,6 +1930,9 @@ func runSimulationCLI(args []string) error {
 	cfg.LearnerProvider, cfg.LearnerModel = *learnerProvider, *learnerModel
 	cfg.EvaluatorProvider, cfg.EvaluatorModel = *evaluatorProvider, *evaluatorModel
 	cfg.GeneratorProvider, cfg.GeneratorModel = *generatorProvider, *generatorModel
+	cfg.LearnerReasoningMode, cfg.LearnerReasoningEffort = *learnerReasoningMode, *learnerReasoningEffort
+	cfg.EvaluatorReasoningMode, cfg.EvaluatorReasoningEffort = *evaluatorReasoningMode, *evaluatorReasoningEffort
+	cfg.GeneratorReasoningMode, cfg.GeneratorReasoningEffort = *generatorReasoningMode, *generatorReasoningEffort
 	cfg.SimulationDBPath = *simulationDB
 	if cfg.Mode == SimulationModeDeterministic {
 		cfg.Mode = SimulationModeAlgorithm
