@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	simulationVersion           = "v2.3.1"
+	simulationVersion           = "v2.3.3"
 	SimulationModeAlgorithm     = "algorithm"
 	SimulationModeDeterministic = "deterministic"
 	SimulationModeLLMLearner    = "llm-learner"
@@ -322,52 +322,8 @@ type LLMExerciseGenerator struct {
 }
 
 func (g LLMExerciseGenerator) Generate(ctx context.Context, ex SimulationExercise) (SimulationExercise, error) {
-	if g.Client == nil {
-		return SimulationExercise{}, errors.New("exercise generator provider is not configured")
-	}
-	maxTokens := g.MaxTokens
-	if maxTokens <= 0 {
-		maxTokens = 512
-	}
-	system := "Generate one English practice exercise as strict JSON only. Return chinese_prompt, target_pattern, scene, intent, estimated_difficulty, and reference_answers. Keep the requested scene and target pattern exactly. estimated_difficulty MUST be a numeric value from 1 to 8 inclusive and should fit the requested difficulty band. Use the requested intent exactly. Do not include explanations or any text outside the JSON object."
-	user := fmt.Sprintf("Target scene: %s\nTarget subscene: %s\nTarget pattern: %s\nIntent: %s\nDifficulty band: %s", ex.SceneID, ex.SubsceneID, ex.Pattern, ex.Intent, ex.DifficultyBand)
-	resp, err := g.Client.Chat(ctx, ChatRequest{Messages: []ChatMessage{{Role: "system", Content: system}, {Role: "user", Content: user}}, MaxTokens: maxTokens, JSONMode: true})
-	if err != nil {
-		return SimulationExercise{}, err
-	}
-	clean, err := stripJSONFence(resp.Content)
-	if err != nil {
-		return SimulationExercise{}, err
-	}
-	var generated struct {
-		ChinesePrompt string  `json:"chinese_prompt"`
-		TargetPattern string  `json:"target_pattern"`
-		Scene         string  `json:"scene"`
-		Intent        string  `json:"intent"`
-		Difficulty    float64 `json:"estimated_difficulty"`
-	}
-	if err := json.Unmarshal([]byte(clean), &generated); err != nil {
-		return SimulationExercise{}, fmt.Errorf("invalid generator response: %w", err)
-	}
-	if strings.TrimSpace(generated.ChinesePrompt) == "" {
-		return SimulationExercise{}, errors.New("generator returned an empty prompt")
-	}
-	if generated.Scene != "" && generated.Scene != ex.SceneID {
-		return SimulationExercise{}, fmt.Errorf("generator scene mismatch: got %s, want %s", generated.Scene, ex.SceneID)
-	}
-	if generated.Intent != "" && generated.Intent != ex.Intent {
-		return SimulationExercise{}, fmt.Errorf("generator intent mismatch: got %s, want %s", generated.Intent, ex.Intent)
-	}
-	if generated.TargetPattern != "" && generated.TargetPattern != ex.Pattern && generated.TargetPattern != ex.PatternID {
-		return SimulationExercise{}, fmt.Errorf("generator target pattern mismatch: got %s, want %s", generated.TargetPattern, ex.Pattern)
-	}
-	if generated.Difficulty <= 0 {
-		generated.Difficulty = ex.Difficulty
-	}
-	if generated.Difficulty < 1 || generated.Difficulty > 8 {
-		return SimulationExercise{}, fmt.Errorf("generator difficulty out of range: %.3f", generated.Difficulty)
-	}
-	return SimulationExercise{ID: ex.ID, ChinesePrompt: generated.ChinesePrompt, PatternID: ex.PatternID, Pattern: ex.Pattern, SceneID: ex.SceneID, SubsceneID: ex.SubsceneID, Intent: ex.Intent, DifficultyBand: ex.DifficultyBand, Difficulty: generated.Difficulty}, nil
+	generated, _, err := g.GenerateDetailed(ctx, ex)
+	return generated, err
 }
 
 func simulationProviderDBPath() string {
@@ -461,23 +417,24 @@ func (f FakeEvaluator) Evaluate(context.Context, SimulationExercise, SimulatedAn
 }
 
 type SimulationAttempt struct {
-	Index              int                  `json:"index"`
-	Session            int                  `json:"session"`
-	VirtualTime        time.Time            `json:"virtual_time"`
-	Exercise           SimulationExercise   `json:"exercise"`
-	Correct            bool                 `json:"correct"`
-	Review             bool                 `json:"review"`
-	Probe              bool                 `json:"probe"`
-	NewSkill           bool                 `json:"new_skill"`
-	Reason             string               `json:"reason"`
-	ErrorKind          string               `json:"error_kind,omitempty"`
-	TargetDifficulty   float64              `json:"target_difficulty"`
-	RealizedDifficulty float64              `json:"realized_difficulty"`
-	EffectiveAbility   float64              `json:"effective_ability"`
-	SuccessProbability float64              `json:"success_probability"`
-	Answer             string               `json:"answer,omitempty"`
-	Verdict            string               `json:"verdict"`
-	Evaluation         SimulationEvaluation `json:"evaluation,omitempty"`
+	Index              int                   `json:"index"`
+	Session            int                   `json:"session"`
+	VirtualTime        time.Time             `json:"virtual_time"`
+	Exercise           SimulationExercise    `json:"exercise"`
+	Correct            bool                  `json:"correct"`
+	Review             bool                  `json:"review"`
+	Probe              bool                  `json:"probe"`
+	NewSkill           bool                  `json:"new_skill"`
+	Reason             string                `json:"reason"`
+	ErrorKind          string                `json:"error_kind,omitempty"`
+	TargetDifficulty   float64               `json:"target_difficulty"`
+	RealizedDifficulty float64               `json:"realized_difficulty"`
+	EffectiveAbility   float64               `json:"effective_ability"`
+	SuccessProbability float64               `json:"success_probability"`
+	Answer             string                `json:"answer,omitempty"`
+	Verdict            string                `json:"verdict"`
+	Evaluation         SimulationEvaluation  `json:"evaluation,omitempty"`
+	Generation         GenerationDiagnostics `json:"generation,omitempty"`
 }
 
 type SkillUnlockEvent struct {
@@ -489,51 +446,73 @@ type SkillUnlockEvent struct {
 }
 
 type SimulationMetrics struct {
-	OverallAccuracy                  float64            `json:"overall_accuracy"`
-	AccuracyByDifficulty             map[string]float64 `json:"accuracy_by_difficulty,omitempty"`
-	AccuracyByPattern                map[string]float64 `json:"accuracy_by_pattern,omitempty"`
-	AccuracyByScene                  map[string]float64 `json:"accuracy_by_scene,omitempty"`
-	DifficultyJitter                 float64            `json:"difficulty_jitter"`
-	MaxAdjacentDifficultyJump        float64            `json:"max_adjacent_difficulty_jump"`
-	ProductiveZoneRatio              float64            `json:"productive_zone_ratio"`
-	ExactRepeatRate                  float64            `json:"exact_repeat_rate"`
-	NormalizedExactDuplicateRate     float64            `json:"normalized_exact_duplicate_rate"`
-	SamePatternSpacing               float64            `json:"same_pattern_spacing"`
-	WeakSkillExposure                float64            `json:"weak_skill_exposure"`
-	ReviewHitRate                    float64            `json:"review_hit_rate"`
-	ProbeRatio                       float64            `json:"probe_ratio"`
-	ProbeSuccessRate                 float64            `json:"probe_success_rate"`
-	UnknownToObserved                float64            `json:"unknown_to_observed"`
-	FoundationExposureRatio          float64            `json:"foundation_exposure_ratio"`
-	MaxConsecutiveSamePattern        int                `json:"max_consecutive_same_pattern"`
-	SkillUnlocks                     int                `json:"skill_unlocks"`
-	SceneCoverage                    map[string]float64 `json:"scene_coverage"`
-	SceneMastery                     map[string]float64 `json:"scene_mastery"`
-	TransferEvents                   int                `json:"transfer_events"`
-	AcquisitionTrajectory            []float64          `json:"acquisition_trajectory"`
-	RetentionTrajectory              []float64          `json:"retention_trajectory"`
-	TransferTrajectory               []float64          `json:"transfer_trajectory"`
-	SessionDifficultyTrajectory      []float64          `json:"session_difficulty_trajectory"`
-	LearnerAbilityTrajectory         []float64          `json:"learner_ability_trajectory"`
-	MemoryIntervalBefore             []float64          `json:"memory_interval_before,omitempty"`
-	MemoryIntervalAfter              []float64          `json:"memory_interval_after,omitempty"`
-	SystemFailures                   int                `json:"system_failures"`
-	ReviewDue                        int                `json:"review_due"`
-	ReviewServed                     int                `json:"review_served"`
-	ProbeCount                       int                `json:"probe_count"`
-	UniquePatterns                   int                `json:"unique_patterns"`
-	UniqueIntents                    int                `json:"unique_intents"`
-	SceneMismatchCount               int                `json:"scene_mismatch_count"`
-	ScopeRelaxationCount             int                `json:"scope_relaxation_count"`
-	PatternMatchCounts               map[string]int     `json:"pattern_match_counts,omitempty"`
-	GeneratorExactDuplicateRate      float64            `json:"generator_exact_duplicate_rate"`
-	GeneratorNormalizedDuplicateRate float64            `json:"generator_normalized_duplicate_rate"`
-	GeneratorSceneMismatchCount      int                `json:"generator_scene_mismatch_count"`
-	GeneratorDifficultyRejects       int                `json:"generator_difficulty_rejects"`
-	AdaptiveStateUpdates             int                `json:"adaptive_state_updates"`
-	AdaptiveNextExerciseReplans      int                `json:"adaptive_next_exercise_replans"`
-	TargetDifficultyTrajectory       []float64          `json:"target_difficulty_trajectory"`
-	RealizedDifficultyTrajectory     []float64          `json:"realized_difficulty_trajectory"`
+	OverallAccuracy                   float64            `json:"overall_accuracy"`
+	AccuracyByDifficulty              map[string]float64 `json:"accuracy_by_difficulty,omitempty"`
+	AccuracyByPattern                 map[string]float64 `json:"accuracy_by_pattern,omitempty"`
+	AccuracyByScene                   map[string]float64 `json:"accuracy_by_scene,omitempty"`
+	DifficultyJitter                  float64            `json:"difficulty_jitter"`
+	MaxAdjacentDifficultyJump         float64            `json:"max_adjacent_difficulty_jump"`
+	ProductiveZoneRatio               float64            `json:"productive_zone_ratio"`
+	ExactRepeatRate                   float64            `json:"exact_repeat_rate"`
+	NormalizedExactDuplicateRate      float64            `json:"normalized_exact_duplicate_rate"`
+	SamePatternSpacing                float64            `json:"same_pattern_spacing"`
+	WeakSkillExposure                 float64            `json:"weak_skill_exposure"`
+	ReviewHitRate                     float64            `json:"review_hit_rate"`
+	ProbeRatio                        float64            `json:"probe_ratio"`
+	ProbeSuccessRate                  float64            `json:"probe_success_rate"`
+	UnknownToObserved                 float64            `json:"unknown_to_observed"`
+	FoundationExposureRatio           float64            `json:"foundation_exposure_ratio"`
+	MaxConsecutiveSamePattern         int                `json:"max_consecutive_same_pattern"`
+	SkillUnlocks                      int                `json:"skill_unlocks"`
+	SceneCoverage                     map[string]float64 `json:"scene_coverage"`
+	SceneMastery                      map[string]float64 `json:"scene_mastery"`
+	TransferEvents                    int                `json:"transfer_events"`
+	AcquisitionTrajectory             []float64          `json:"acquisition_trajectory"`
+	RetentionTrajectory               []float64          `json:"retention_trajectory"`
+	TransferTrajectory                []float64          `json:"transfer_trajectory"`
+	SessionDifficultyTrajectory       []float64          `json:"session_difficulty_trajectory"`
+	LearnerAbilityTrajectory          []float64          `json:"learner_ability_trajectory"`
+	MemoryIntervalBefore              []float64          `json:"memory_interval_before,omitempty"`
+	MemoryIntervalAfter               []float64          `json:"memory_interval_after,omitempty"`
+	SystemFailures                    int                `json:"system_failures"`
+	ReviewDue                         int                `json:"review_due"`
+	ReviewServed                      int                `json:"review_served"`
+	ProbeCount                        int                `json:"probe_count"`
+	UniquePatterns                    int                `json:"unique_patterns"`
+	UniqueIntents                     int                `json:"unique_intents"`
+	SceneMismatchCount                int                `json:"scene_mismatch_count"`
+	ScopeRelaxationCount              int                `json:"scope_relaxation_count"`
+	PatternMatchCounts                map[string]int     `json:"pattern_match_counts,omitempty"`
+	GeneratorExactDuplicateRate       float64            `json:"generator_exact_duplicate_rate"`
+	GeneratorNormalizedDuplicateRate  float64            `json:"generator_normalized_duplicate_rate"`
+	GeneratorInitialCalls             int                `json:"generator_initial_calls"`
+	GeneratorInitialSuccesses         int                `json:"generator_initial_successes"`
+	GeneratorRepairAttempts           int                `json:"generator_repair_attempts"`
+	GeneratorRepairSuccesses          int                `json:"generator_repair_successes"`
+	GeneratorFreshRetryAttempts       int                `json:"generator_fresh_retry_attempts"`
+	GeneratorFreshRetrySuccesses      int                `json:"generator_fresh_retry_successes"`
+	GeneratorFallbackCount            int                `json:"generator_fallback_count"`
+	GeneratorFinalDeliveryCount       int                `json:"generator_final_delivery_count"`
+	GeneratorInitialSuccessRate       float64            `json:"generator_initial_success_rate"`
+	GeneratorRepairRate               float64            `json:"generator_repair_rate"`
+	GeneratorRetryRate                float64            `json:"generator_retry_rate"`
+	GeneratorFallbackRate             float64            `json:"generator_fallback_rate"`
+	GeneratorFinalDeliveryRate        float64            `json:"generator_final_delivery_rate"`
+	GeneratorFailureKinds             map[string]int     `json:"generator_failure_kinds,omitempty"`
+	GeneratorEmptyResponseCount       int                `json:"generator_empty_response_count"`
+	GeneratorMalformedJSONCount       int                `json:"generator_malformed_json_count"`
+	GeneratorTruncatedJSONCount       int                `json:"generator_truncated_json_count"`
+	GeneratorTimeoutCount             int                `json:"generator_timeout_count"`
+	GeneratorSchemaInvalidCount       int                `json:"generator_schema_invalid_count"`
+	GeneratorConstraintViolationCount int                `json:"generator_constraint_violation_count"`
+	GeneratorSceneMismatchCount       int                `json:"generator_scene_mismatch_count"`
+	GeneratorDifficultyRejects        int                `json:"generator_difficulty_rejects"`
+	AdaptiveStateUpdates              int                `json:"adaptive_state_updates"`
+	AdaptiveNextExerciseReplans       int                `json:"adaptive_next_exercise_replans"`
+	AdaptiveReplanEligible            int                `json:"adaptive_replan_eligible"`
+	AdaptiveReplanMisses              int                `json:"adaptive_replan_misses"`
+	TargetDifficultyTrajectory        []float64          `json:"target_difficulty_trajectory"`
+	RealizedDifficultyTrajectory      []float64          `json:"realized_difficulty_trajectory"`
 }
 
 type SimulationResult struct {
@@ -576,6 +555,7 @@ type AIUsage struct {
 	InputTokens    int     `json:"input_tokens"`
 	OutputTokens   int     `json:"output_tokens"`
 	EstimatedCost  float64 `json:"estimated_cost"`
+	CostStatus     string  `json:"cost_status"`
 	Status         string  `json:"status"`
 }
 
@@ -750,20 +730,42 @@ func (r *SimulationRunner) runAI(ctx context.Context, cfg SimulationConfig, p Le
 		a := &result.AttemptsTrace[i]
 		ex := a.Exercise
 		if r.Generator != nil {
-			result.AI.GeneratorCalls++
-			generated, err := r.Generator.Generate(ctx, ex)
-			if err != nil {
-				a.ErrorKind, a.Verdict = "generator_failure", "system_failure"
-				if strings.Contains(strings.ToLower(err.Error()), "difficulty") {
-					result.Metrics.GeneratorDifficultyRejects++
-				}
-				if strings.Contains(strings.ToLower(err.Error()), "scene mismatch") {
-					result.Metrics.GeneratorSceneMismatchCount++
-				}
-				continue
+			generated, generation, err := generateSimulationExercise(ctx, r.Generator, ex)
+			result.AI.GeneratorCalls += generation.ProviderCalls
+			result.Metrics.GeneratorInitialCalls += generation.InitialCalls
+			if generation.InitialSuccess {
+				result.Metrics.GeneratorInitialSuccesses++
 			}
-			ex = generated
-			a.Exercise = generated
+			result.Metrics.GeneratorRepairAttempts += generation.RepairAttempts
+			result.Metrics.GeneratorFreshRetryAttempts += generation.FreshRetries
+			if generation.FinalSource == "repaired" {
+				result.Metrics.GeneratorRepairSuccesses++
+			}
+			if generation.FinalSource == "regenerated" {
+				result.Metrics.GeneratorFreshRetrySuccesses++
+			}
+			if result.Metrics.GeneratorFailureKinds == nil {
+				result.Metrics.GeneratorFailureKinds = map[string]int{}
+			}
+			for _, kind := range generation.FailureKinds {
+				result.Metrics.GeneratorFailureKinds[string(kind)]++
+				recordGeneratorFailureMetric(&result.Metrics, kind)
+			}
+			a.Generation = generation
+			if err != nil {
+				// A generation failure is not a learner failure. The bounded
+				// scene-aware fallback keeps the attempt deliverable while the
+				// diagnostics preserve the provider failure taxonomy.
+				result.Metrics.GeneratorFallbackCount++
+				a.Generation.FallbackUsed = true
+				a.Generation.FinalSource = "fallback"
+				ex = fallbackSimulationExercise(ex)
+				a.Exercise = ex
+			} else {
+				ex = generated
+				a.Exercise = generated
+			}
+			result.Metrics.GeneratorFinalDeliveryCount++
 		}
 		promptCounts[ex.ChinesePrompt]++
 		normalizedPromptCounts[strings.ToLower(strings.Join(strings.Fields(ex.ChinesePrompt), " "))]++
@@ -829,7 +831,12 @@ func (r *SimulationRunner) runAI(ctx context.Context, cfg SimulationConfig, p Le
 			aiRecentPatterns = aiRecentPatterns[len(aiRecentPatterns)-aiCfg.RecentPatternWindow:]
 		}
 		nextIndex := i + 1
-		if nextIndex < len(result.AttemptsTrace) && len(aiPatterns) > 0 {
+		if nextIndex < len(result.AttemptsTrace) {
+			result.Metrics.AdaptiveReplanEligible++
+			if len(aiPatterns) == 0 {
+				result.Metrics.AdaptiveReplanMisses++
+				continue
+			}
 			if nextIndex%cfg.SessionSize == 0 {
 				aiCenter = simClamp(aiCenter+(aiAbility-aiCenter)*.08, 1, 8)
 			}
@@ -847,6 +854,8 @@ func (r *SimulationRunner) runAI(ctx context.Context, cfg SimulationConfig, p Le
 				result.AttemptsTrace[nextIndex].TargetDifficulty = target
 				result.AttemptsTrace[nextIndex].RealizedDifficulty = realized
 				result.Metrics.AdaptiveNextExerciseReplans++
+			} else {
+				result.Metrics.AdaptiveReplanMisses++
 			}
 		}
 	}
@@ -857,6 +866,10 @@ func (r *SimulationRunner) runAI(ctx context.Context, cfg SimulationConfig, p Le
 	}
 	result.AI.TotalCalls = result.AI.LearnerCalls + result.AI.EvaluatorCalls + result.AI.GeneratorCalls
 	result.AI.Status = "executed with separated learner/evaluator adapters"
+	if result.AI.InputTokens == 0 && result.AI.OutputTokens == 0 {
+		result.AI.CostStatus = "unavailable: provider did not return token usage"
+		result.AI.EstimatedCost = 0
+	}
 	if valid > 0 {
 		result.Metrics.OverallAccuracy = float64(correct) / float64(valid)
 	} else {
@@ -886,6 +899,16 @@ func (r *SimulationRunner) runAI(ctx context.Context, cfg SimulationConfig, p Le
 	result.Metrics.PatternMatchCounts = matchCounts
 	result.Metrics.GeneratorExactDuplicateRate = duplicateRate(promptCounts)
 	result.Metrics.GeneratorNormalizedDuplicateRate = duplicateRate(normalizedPromptCounts)
+	initialCalls := float64(result.Metrics.GeneratorInitialCalls)
+	if initialCalls > 0 {
+		result.Metrics.GeneratorInitialSuccessRate = float64(result.Metrics.GeneratorInitialSuccesses) / initialCalls
+		result.Metrics.GeneratorRepairRate = float64(result.Metrics.GeneratorRepairSuccesses) / initialCalls
+		result.Metrics.GeneratorRetryRate = float64(result.Metrics.GeneratorRepairAttempts+result.Metrics.GeneratorFreshRetryAttempts) / initialCalls
+	}
+	if cfg.Attempts > 0 {
+		result.Metrics.GeneratorFallbackRate = float64(result.Metrics.GeneratorFallbackCount) / float64(cfg.Attempts)
+		result.Metrics.GeneratorFinalDeliveryRate = float64(result.Metrics.GeneratorFinalDeliveryCount) / float64(cfg.Attempts)
+	}
 	if r.Reviewer != nil {
 		if _, err := r.Reviewer.Review(ctx, result.AttemptsTrace); err != nil {
 			result.HealthFlags = append(result.HealthFlags, "SIM_REVIEWER_FAILURE")
@@ -972,9 +995,11 @@ func RunSimulation(ctx context.Context, cfg SimulationConfig) (SimulationResult,
 func estimateAIUsage(c SimulationConfig) AIUsage {
 	calls := c.Attempts * 2
 	if c.Generator == "real-generator" {
-		calls += c.Attempts
+		// Generator reliability allows one repair and one fresh generation
+		// retry. Cost guards must reserve the full bounded retry budget.
+		calls += c.Attempts * generatorMaxProviderCalls
 	}
-	return AIUsage{LearnerCalls: c.Attempts, EvaluatorCalls: c.Attempts, GeneratorCalls: calls - 2*c.Attempts, TotalCalls: calls, EstimatedCost: float64(calls) * .002}
+	return AIUsage{LearnerCalls: c.Attempts, EvaluatorCalls: c.Attempts, GeneratorCalls: calls - 2*c.Attempts, TotalCalls: calls, EstimatedCost: float64(calls) * .002, CostStatus: "estimated"}
 }
 
 func duplicateRate(counts map[string]int) float64 {
@@ -1418,6 +1443,7 @@ func writeSimulationReport(w io.Writer, result SimulationResult, jsonOutput bool
 		return enc.Encode(result)
 	}
 	fmt.Fprintf(w, "Simulation %s\nPersona: %s\nMode: %s\nAttempts: %d\nSessions: %d\nMax allowed attempts: %d\nLearner provider/model: %s / %s\nEvaluator provider/model: %s / %s\nGenerator mode/provider/model: %s / %s / %s\nPlanned/actual LLM calls: %d\nEstimated cost: %.3f\nSystem failures: %d\nAdaptive state updates/replans: %d/%d\nPattern matches: %v\nGenerator duplicate exact/normalized: %.1f%%/%.1f%%\nGenerator scene mismatch/difficulty rejects: %d/%d\nAccuracy: %.1f%%\nDifficulty jitter: %.3f\nMax jump: %.3f\nWeak exposure: %.1f%%\nReview due/served/hit: %d/%d/%.1f%%\nProbe count/ratio/success: %d/%.1f%%/%.1f%%\nUnique patterns/intents: %d/%d\nFoundation exposure: %.1f%%\nTransfer events: %d\nHealth flags: %s\n", result.SimulationVersion, result.Persona, result.Mode, result.Attempts, result.Sessions, result.MaxAllowedAttempts, result.LearnerProvider, result.LearnerModel, result.EvaluatorProvider, result.EvaluatorModel, result.GeneratorMode, result.GeneratorProvider, result.GeneratorModel, result.AI.TotalCalls, result.AI.EstimatedCost, result.Metrics.SystemFailures, result.Metrics.AdaptiveStateUpdates, result.Metrics.AdaptiveNextExerciseReplans, result.Metrics.PatternMatchCounts, result.Metrics.GeneratorExactDuplicateRate*100, result.Metrics.GeneratorNormalizedDuplicateRate*100, result.Metrics.GeneratorSceneMismatchCount, result.Metrics.GeneratorDifficultyRejects, result.Metrics.OverallAccuracy*100, result.Metrics.DifficultyJitter, result.Metrics.MaxAdjacentDifficultyJump, result.Metrics.WeakSkillExposure*100, result.Metrics.ReviewDue, result.Metrics.ReviewServed, result.Metrics.ReviewHitRate*100, result.Metrics.ProbeCount, result.Metrics.ProbeRatio*100, result.Metrics.ProbeSuccessRate*100, result.Metrics.UniquePatterns, result.Metrics.UniqueIntents, result.Metrics.FoundationExposureRatio*100, result.Metrics.TransferEvents, strings.Join(result.HealthFlags, ", "))
+	fmt.Fprintf(w, "Cost status: %s\nAdaptive replan eligible/misses: %d/%d\nGenerator initial success/repair success/fresh retry success/fallback: %d/%d/%d/%d\nGenerator delivery/initial success/repair/retry/fallback rates: %.1f%%/%.1f%%/%.1f%%/%.1f%%/%.1f%%\nGenerator failure kinds: %v\n", result.AI.CostStatus, result.Metrics.AdaptiveReplanEligible, result.Metrics.AdaptiveReplanMisses, result.Metrics.GeneratorInitialSuccesses, result.Metrics.GeneratorRepairSuccesses, result.Metrics.GeneratorFreshRetrySuccesses, result.Metrics.GeneratorFallbackCount, result.Metrics.GeneratorFinalDeliveryRate*100, result.Metrics.GeneratorInitialSuccessRate*100, result.Metrics.GeneratorRepairRate*100, result.Metrics.GeneratorRetryRate*100, result.Metrics.GeneratorFallbackRate*100, result.Metrics.GeneratorFailureKinds)
 	return nil
 }
 

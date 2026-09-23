@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -126,6 +127,24 @@ type recordingChatClient struct {
 	err      error
 }
 
+type sequenceChatClient struct {
+	responses []string
+	errors    []error
+	requests  []ChatRequest
+}
+
+func (c *sequenceChatClient) Chat(_ context.Context, req ChatRequest) (*ChatResponse, error) {
+	c.requests = append(c.requests, req)
+	index := len(c.requests) - 1
+	if index < len(c.errors) && c.errors[index] != nil {
+		return nil, c.errors[index]
+	}
+	if index >= len(c.responses) {
+		return nil, errors.New("sequence client exhausted")
+	}
+	return &ChatResponse{Content: c.responses[index], Provider: "fake", Model: "fake-model"}, nil
+}
+
 type acceptanceFakeGenerator struct {
 	calls int
 }
@@ -142,6 +161,120 @@ func (c *recordingChatClient) Chat(_ context.Context, req ChatRequest) (*ChatRes
 		return nil, c.err
 	}
 	return &ChatResponse{Content: c.response, Provider: "fake", Model: "fake-model"}, nil
+}
+
+func validGeneratorJSON(prompt string) string {
+	return fmt.Sprintf(`{"chinese_prompt":%q,"reference_answers":["I would review the plan first."]}`, prompt)
+}
+
+func generatorTestExercise() SimulationExercise {
+	return SimulationExercise{ID: "generator-test", ChinesePrompt: "", PatternID: "having-said-that", Pattern: "Having said that, ...", SceneID: "meeting", SubsceneID: "weekly-review", Intent: "contrast", DifficultyBand: "challenging", Difficulty: 6.5}
+}
+
+func TestGeneratorReliabilityRepairsMalformedAndRetriesEmpty(t *testing.T) {
+	malformed := &sequenceChatClient{responses: []string{`{"chinese_prompt":`, validGeneratorJSON("修复后的会议练习")}}
+	g := LLMExerciseGenerator{Client: malformed, MaxTokens: 64}
+	exercise, diag, err := g.GenerateDetailed(context.Background(), generatorTestExercise())
+	if err != nil || exercise.ChinesePrompt != "修复后的会议练习" {
+		t.Fatalf("malformed response was not repaired: exercise=%#v diag=%#v err=%v", exercise, diag, err)
+	}
+	if diag.ProviderCalls != 2 || diag.RepairAttempts != 1 || diag.FinalSource != "repaired" || diag.FailureKinds[0] != GeneratorFailureTruncatedJSON {
+		t.Fatalf("unexpected repair diagnostics: %#v", diag)
+	}
+
+	empty := &sequenceChatClient{responses: []string{"", validGeneratorJSON("fresh generation")}}
+	g = LLMExerciseGenerator{Client: empty, MaxTokens: 64}
+	exercise, diag, err = g.GenerateDetailed(context.Background(), generatorTestExercise())
+	if err != nil || exercise.ChinesePrompt != "fresh generation" {
+		t.Fatalf("empty response was not fresh-retried: exercise=%#v diag=%#v err=%v", exercise, diag, err)
+	}
+	if diag.ProviderCalls != 2 || diag.RepairAttempts != 0 || diag.FreshRetries != 1 || diag.FinalSource != "regenerated" || diag.FailureKinds[0] != GeneratorFailureEmptyResponse {
+		t.Fatalf("unexpected empty-response diagnostics: %#v", diag)
+	}
+}
+
+func TestGeneratorReliabilityRejectsMetadataAndFreshRegenerates(t *testing.T) {
+	client := &sequenceChatClient{responses: []string{
+		`{"chinese_prompt":"错误场景","scene":"travel"}`,
+		validGeneratorJSON("正确会议练习"),
+	}}
+	g := LLMExerciseGenerator{Client: client, MaxTokens: 64}
+	exercise, diag, err := g.GenerateDetailed(context.Background(), generatorTestExercise())
+	if err != nil || exercise.SceneID != "meeting" || exercise.ChinesePrompt != "正确会议练习" {
+		t.Fatalf("metadata mismatch was not regenerated: exercise=%#v diag=%#v err=%v", exercise, diag, err)
+	}
+	if diag.ProviderCalls != 2 || diag.RepairAttempts != 0 || diag.FreshRetries != 1 || diag.FinalSource != "regenerated" || diag.FailureKinds[0] != GeneratorFailureSceneMismatch {
+		t.Fatalf("metadata mismatch used the wrong retry path: %#v", diag)
+	}
+}
+
+func TestGeneratorStructuredOutputAcceptsFenceAndClassifiesSchema(t *testing.T) {
+	ex := generatorTestExercise()
+	fenced := "leading text\n```json\n" + validGeneratorJSON("fenced exercise") + "\n```\ntrailing text"
+	parsed, err := parseGeneratedExercise(fenced, ex)
+	if err != nil || parsed.ChinesePrompt != "fenced exercise" {
+		t.Fatalf("safe fenced extraction failed: %#v %v", parsed, err)
+	}
+	parsed, err = parseGeneratedExercise(`{"chinese_prompt":"trailing comma",}`, ex)
+	if err != nil || parsed.ChinesePrompt != "trailing comma" {
+		t.Fatalf("deterministic trailing-comma repair failed: %#v %v", parsed, err)
+	}
+	_, err = parseGeneratedExercise(`{"scene":"meeting"}`, ex)
+	if generatorFailureKind(err) != GeneratorFailureSchemaInvalid {
+		t.Fatalf("missing required field was not schema_invalid: %v", err)
+	}
+	_, err = parseGeneratedExercise(`{"chinese_prompt":}`, ex)
+	if generatorFailureKind(err) != GeneratorFailureMalformedJSON {
+		t.Fatalf("complete malformed JSON was not malformed_json: %v", err)
+	}
+	_, err = parseGeneratedExercise(`{"chinese_prompt":"truncated"`, ex)
+	if generatorFailureKind(err) != GeneratorFailureTruncatedJSON {
+		t.Fatalf("truncated JSON was not truncated_json: %v", err)
+	}
+}
+
+func TestGeneratorProviderRetryPolicyDoesNotBlindRetry4xx(t *testing.T) {
+	client := &sequenceChatClient{errors: []error{&ProviderError{Category: "provider_4xx", HTTPStatus: 400, Err: errors.New("bad request")}}}
+	g := LLMExerciseGenerator{Client: client, MaxTokens: 64}
+	_, diag, err := g.GenerateDetailed(context.Background(), generatorTestExercise())
+	if generatorFailureKind(err) != GeneratorFailureProviderError || diag.ProviderCalls != 1 || diag.FreshRetries != 0 || diag.RepairAttempts != 0 {
+		t.Fatalf("4xx provider error was retried blindly: diag=%#v err=%v", diag, err)
+	}
+}
+
+type exhaustedDetailedGenerator struct{}
+
+func (exhaustedDetailedGenerator) Generate(context.Context, SimulationExercise) (SimulationExercise, error) {
+	return SimulationExercise{}, errors.New("unused basic generator path")
+}
+
+func (exhaustedDetailedGenerator) GenerateDetailed(context.Context, SimulationExercise) (SimulationExercise, GenerationDiagnostics, error) {
+	d := GenerationDiagnostics{GenerationID: "exhausted", InitialCalls: 1, ProviderCalls: 3, FailureKinds: []GeneratorFailureKind{GeneratorFailureTruncatedJSON, GeneratorFailureSchemaInvalid}}
+	d.LastFailureKind = GeneratorFailureSchemaInvalid
+	return SimulationExercise{}, d, generatorFailure(GeneratorFailureSchemaInvalid, errors.New("all retries exhausted"))
+}
+
+func TestGeneratorFallbackDoesNotCreateLearnerFailureOrDoubleUpdate(t *testing.T) {
+	runner := &SimulationRunner{
+		Generator: exhaustedDetailedGenerator{},
+		Learner:   FakeLearner{AnswerText: "Having said that, we should wait."},
+		Evaluator: FakeEvaluator{Result: SimulationEvaluation{Correct: true, Verdict: "correct", Meaning: .9, Grammar: .9, Naturalness: .9, Pattern: .9, TargetPatternMatch: TargetPatternExact, TargetPatternScore: 1}},
+	}
+	c := simulationTestConfig("stable-intermediate", 1)
+	c.Mode, c.Generator, c.Scene = SimulationModeFullAI, "real-generator", "meeting"
+	r, err := runner.Run(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Metrics.GeneratorFallbackCount != 1 || r.Metrics.GeneratorFinalDeliveryCount != 1 || r.Metrics.SystemFailures != 0 {
+		t.Fatalf("fallback polluted delivery/system metrics: %#v", r.Metrics)
+	}
+	if r.Metrics.AdaptiveStateUpdates != 1 || r.AI.LearnerCalls != 1 || r.AI.EvaluatorCalls != 1 {
+		t.Fatalf("fallback caused duplicate or missing state transition: usage=%#v metrics=%#v", r.AI, r.Metrics)
+	}
+	if r.AttemptsTrace[0].Generation.FinalSource != "fallback" || r.AttemptsTrace[0].Generation.FallbackUsed != true {
+		t.Fatalf("fallback source was not recorded: %#v", r.AttemptsTrace[0].Generation)
+	}
 }
 
 func TestLLMLearnerAdapterSeparatesPromptAndHandlesFailures(t *testing.T) {
@@ -251,6 +384,9 @@ func TestFullAIChainRunsGeneratorLearnerEvaluatorAndStateUpdate(t *testing.T) {
 	}
 	if r.Metrics.AdaptiveStateUpdates != 4 || r.Metrics.AdaptiveNextExerciseReplans == 0 || r.Metrics.PatternMatchCounts[TargetPatternSemanticEquivalent] != 4 {
 		t.Fatalf("full-AI adaptive state or semantic evidence not recorded: %#v", r.Metrics)
+	}
+	if r.Metrics.AdaptiveReplanEligible != 3 || r.Metrics.AdaptiveNextExerciseReplans != 3 || r.Metrics.AdaptiveReplanMisses != 0 {
+		t.Fatalf("replan counters are ambiguous or inconsistent: %#v", r.Metrics)
 	}
 }
 
