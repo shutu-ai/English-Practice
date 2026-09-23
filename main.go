@@ -47,21 +47,29 @@ type ChatRequest struct {
 	RequestID   string        `json:"-"`
 }
 type ChatResponse struct {
-	Content       string        `json:"content"`
-	Provider      string        `json:"provider,omitempty"`
-	Model         string        `json:"model,omitempty"`
-	Latency       time.Duration `json:"-"`
-	HTTPStatus    int           `json:"-"`
-	ResponseShape string        `json:"-"`
+	Content          string        `json:"content"`
+	Provider         string        `json:"provider,omitempty"`
+	Model            string        `json:"model,omitempty"`
+	ContentSource    string        `json:"-"`
+	FinishReason     string        `json:"-"`
+	ReasoningPresent bool          `json:"-"`
+	ResponseBytes    int           `json:"-"`
+	Latency          time.Duration `json:"-"`
+	HTTPStatus       int           `json:"-"`
+	ResponseShape    string        `json:"-"`
 }
 
 type ProviderError struct {
-	Stage         string
-	Category      string
-	HTTPStatus    int
-	Latency       time.Duration
-	ResponseShape string
-	Err           error
+	Stage            string
+	Category         string
+	HTTPStatus       int
+	Latency          time.Duration
+	ResponseShape    string
+	ContentSource    string
+	FinishReason     string
+	ReasoningPresent bool
+	ResponseBytes    int
+	Err              error
 }
 
 func (e *ProviderError) Error() string {
@@ -159,14 +167,19 @@ func (c HTTPChatClient) Chat(ctx context.Context, req ChatRequest) (*ChatRespons
 		}
 		return nil, &ProviderError{Stage: "provider_http", Category: category, HTTPStatus: resp.StatusCode, Latency: time.Since(start), ResponseShape: responseShape(body), Err: fmt.Errorf("provider returned %s", resp.Status)}
 	}
-	content, shape, err := extractAssistantContent(body)
+	content, meta, err := extractAssistantContentDetailed(body)
 	if err != nil {
-		if req.AllowEmpty && strings.Contains(err.Error(), "provider response has no assistant content") {
-			return &ChatResponse{Provider: c.cfg.ID, Model: c.cfg.Model, Latency: time.Since(start), HTTPStatus: resp.StatusCode, ResponseShape: shape}, nil
+		category := "invalid_provider_envelope"
+		var extractionErr *AssistantContentError
+		if errors.As(err, &extractionErr) && extractionErr.Category != "" {
+			category = extractionErr.Category
 		}
-		return nil, &ProviderError{Stage: "content_extraction", Category: "invalid_provider_envelope", HTTPStatus: resp.StatusCode, Latency: time.Since(start), ResponseShape: shape, Err: err}
+		if req.AllowEmpty && (category == "provider_empty" || category == "reasoning_only") {
+			return &ChatResponse{Provider: c.cfg.ID, Model: c.cfg.Model, Latency: time.Since(start), HTTPStatus: resp.StatusCode, ResponseShape: meta.ResponseShape, ContentSource: meta.ContentSource, FinishReason: meta.FinishReason, ReasoningPresent: meta.ReasoningPresent, ResponseBytes: len(body)}, nil
+		}
+		return nil, &ProviderError{Stage: "content_extraction", Category: category, HTTPStatus: resp.StatusCode, Latency: time.Since(start), ResponseShape: meta.ResponseShape, ContentSource: meta.ContentSource, FinishReason: meta.FinishReason, ReasoningPresent: meta.ReasoningPresent, ResponseBytes: len(body), Err: err}
 	}
-	return &ChatResponse{Content: content, Provider: c.cfg.ID, Model: c.cfg.Model, Latency: time.Since(start), HTTPStatus: resp.StatusCode, ResponseShape: shape}, nil
+	return &ChatResponse{Content: content, Provider: c.cfg.ID, Model: c.cfg.Model, ContentSource: meta.ContentSource, FinishReason: meta.FinishReason, ReasoningPresent: meta.ReasoningPresent, ResponseBytes: len(body), Latency: time.Since(start), HTTPStatus: resp.StatusCode, ResponseShape: meta.ResponseShape}, nil
 }
 
 func responseShape(body []byte) string {
@@ -212,44 +225,118 @@ func responseShape(body []byte) string {
 	}
 }
 
+type AssistantContentMeta struct {
+	ResponseShape    string
+	ContentSource    string
+	FinishReason     string
+	ReasoningPresent bool
+}
+
+type AssistantContentError struct {
+	Category string
+	Err      error
+}
+
+func (e *AssistantContentError) Error() string {
+	if e == nil || e.Err == nil {
+		return "assistant content extraction failed"
+	}
+	return e.Err.Error()
+}
+
+func (e *AssistantContentError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// extractAssistantContent keeps the historical helper contract for callers and
+// tests. The HTTP adapter uses the detailed form so diagnostics can distinguish
+// provider-empty, reasoning-only, and extraction failures without persisting raw
+// provider content.
 func extractAssistantContent(body []byte) (string, string, error) {
+	content, meta, err := extractAssistantContentDetailed(body)
+	return content, meta.ResponseShape, err
+}
+
+func extractAssistantContentDetailed(body []byte) (string, AssistantContentMeta, error) {
+	meta := AssistantContentMeta{ResponseShape: responseShape(body)}
 	var root map[string]any
 	if err := json.Unmarshal(body, &root); err != nil {
-		return "", "invalid_json", fmt.Errorf("invalid provider envelope JSON: %w", err)
+		meta.ResponseShape = "invalid_json"
+		return "", meta, &AssistantContentError{Category: "invalid_provider_envelope", Err: fmt.Errorf("invalid provider envelope JSON: %w", err)}
 	}
 	if v, ok := root["response"].(string); ok && strings.TrimSpace(v) != "" {
-		return v, "response", nil
+		meta.ContentSource = "response"
+		return v, meta, nil
 	}
 	if v, ok := root["output_text"].(string); ok && strings.TrimSpace(v) != "" {
-		return v, "output_text", nil
+		meta.ContentSource = "output_text"
+		return v, meta, nil
 	}
 	if message, ok := root["message"].(map[string]any); ok {
+		meta.ReasoningPresent = nonEmptyString(message["reasoning_content"])
 		if content, ok := contentString(message["content"]); ok {
-			return content, "message.content", nil
+			meta.ContentSource = "message.content"
+			return content, meta, nil
 		}
 	}
 	if v, ok := root["content"].(string); ok && strings.TrimSpace(v) != "" {
-		return v, "content", nil
+		meta.ContentSource = "content"
+		return v, meta, nil
 	}
 	if choices, ok := root["choices"].([]any); ok && len(choices) > 0 {
 		if choice, ok := choices[0].(map[string]any); ok {
+			if finish, ok := choice["finish_reason"].(string); ok {
+				meta.FinishReason = finish
+			}
 			if msg, ok := choice["message"].(map[string]any); ok {
+				meta.ReasoningPresent = nonEmptyString(msg["reasoning_content"])
 				if content, ok := contentString(msg["content"]); ok {
-					return content, "choices.message.content", nil
+					meta.ContentSource = "choices.message.content"
+					return content, meta, nil
 				}
-				// Some reasoning providers put the only assistant text in
-				// reasoning_content. It still goes through strict JSON parsing;
-				// prose or incomplete reasoning is rejected by normalizeEvalContent.
-				if content, ok := contentString(msg["reasoning_content"]); ok {
-					return content, "choices.message.reasoning_content", nil
+				if rawContent, exists := msg["content"]; exists && !recognizedEmptyContent(rawContent) {
+					return "", meta, &AssistantContentError{Category: "adapter_extraction_empty", Err: errors.New("assistant message content exists but has no extractable text")}
+				}
+				for key, value := range msg {
+					if key != "role" && key != "content" && key != "reasoning_content" && key != "tool_calls" && nonEmptyString(value) {
+						return "", meta, &AssistantContentError{Category: "valid_content_wrong_field", Err: fmt.Errorf("assistant text was returned in unsupported field %q", key)}
+					}
 				}
 			}
 			if content, ok := contentString(choice["text"]); ok {
-				return content, "choices.text", nil
+				meta.ContentSource = "choices.text"
+				return content, meta, nil
 			}
 		}
 	}
-	return "", responseShape(body), errors.New("provider response has no assistant content")
+	category := "provider_empty"
+	message := "provider response has no final assistant content"
+	if meta.ReasoningPresent {
+		category = "reasoning_only"
+		message = "provider response contains reasoning but no final assistant content"
+	}
+	return "", meta, &AssistantContentError{Category: category, Err: errors.New(message)}
+}
+
+func nonEmptyString(v any) bool {
+	s, ok := v.(string)
+	return ok && strings.TrimSpace(s) != ""
+}
+
+func recognizedEmptyContent(v any) bool {
+	if v == nil {
+		return true
+	}
+	if s, ok := v.(string); ok {
+		return strings.TrimSpace(s) == ""
+	}
+	if parts, ok := v.([]any); ok {
+		return len(parts) == 0
+	}
+	return false
 }
 
 func contentString(v any) (string, bool) {

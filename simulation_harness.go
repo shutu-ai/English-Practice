@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	simulationVersion           = "v2.3.3"
+	simulationVersion           = "v2.3.4"
 	SimulationModeAlgorithm     = "algorithm"
 	SimulationModeDeterministic = "deterministic"
 	SimulationModeLLMLearner    = "llm-learner"
@@ -192,6 +192,26 @@ func validateSimulationConfig(c SimulationConfig) error {
 type SimulationExercise struct {
 	ID, ChinesePrompt, PatternID, Pattern, SceneID, SubsceneID, Intent, DifficultyBand string
 	Difficulty                                                                         float64
+	ReferenceAnswers                                                                   []string `json:"reference_answers,omitempty"`
+}
+
+// GenerationSpec is application-owned selection context. It is passed to the
+// provider as context, then bound back onto the exercise after linguistic
+// content is accepted; the provider never becomes authoritative for these
+// fields.
+type GenerationSpec struct {
+	ExerciseID       string  `json:"exercise_id"`
+	SceneID          string  `json:"scene_id"`
+	SubsceneID       string  `json:"subscene_id,omitempty"`
+	Intent           string  `json:"intent"`
+	PatternID        string  `json:"pattern_id"`
+	Pattern          string  `json:"pattern"`
+	TargetDifficulty float64 `json:"target_difficulty"`
+	DifficultyBand   string  `json:"difficulty_band"`
+}
+
+func generationSpecFromExercise(ex SimulationExercise) GenerationSpec {
+	return GenerationSpec{ExerciseID: ex.ID, SceneID: ex.SceneID, SubsceneID: ex.SubsceneID, Intent: ex.Intent, PatternID: ex.PatternID, Pattern: ex.Pattern, TargetDifficulty: ex.Difficulty, DifficultyBand: ex.DifficultyBand}
 }
 
 type SimulatedLearnerState struct {
@@ -446,105 +466,115 @@ type SkillUnlockEvent struct {
 }
 
 type SimulationMetrics struct {
-	OverallAccuracy                   float64            `json:"overall_accuracy"`
-	AccuracyByDifficulty              map[string]float64 `json:"accuracy_by_difficulty,omitempty"`
-	AccuracyByPattern                 map[string]float64 `json:"accuracy_by_pattern,omitempty"`
-	AccuracyByScene                   map[string]float64 `json:"accuracy_by_scene,omitempty"`
-	DifficultyJitter                  float64            `json:"difficulty_jitter"`
-	MaxAdjacentDifficultyJump         float64            `json:"max_adjacent_difficulty_jump"`
-	ProductiveZoneRatio               float64            `json:"productive_zone_ratio"`
-	ExactRepeatRate                   float64            `json:"exact_repeat_rate"`
-	NormalizedExactDuplicateRate      float64            `json:"normalized_exact_duplicate_rate"`
-	SamePatternSpacing                float64            `json:"same_pattern_spacing"`
-	WeakSkillExposure                 float64            `json:"weak_skill_exposure"`
-	ReviewHitRate                     float64            `json:"review_hit_rate"`
-	ProbeRatio                        float64            `json:"probe_ratio"`
-	ProbeSuccessRate                  float64            `json:"probe_success_rate"`
-	UnknownToObserved                 float64            `json:"unknown_to_observed"`
-	FoundationExposureRatio           float64            `json:"foundation_exposure_ratio"`
-	MaxConsecutiveSamePattern         int                `json:"max_consecutive_same_pattern"`
-	SkillUnlocks                      int                `json:"skill_unlocks"`
-	SceneCoverage                     map[string]float64 `json:"scene_coverage"`
-	SceneMastery                      map[string]float64 `json:"scene_mastery"`
-	TransferEvents                    int                `json:"transfer_events"`
-	AcquisitionTrajectory             []float64          `json:"acquisition_trajectory"`
-	RetentionTrajectory               []float64          `json:"retention_trajectory"`
-	TransferTrajectory                []float64          `json:"transfer_trajectory"`
-	SessionDifficultyTrajectory       []float64          `json:"session_difficulty_trajectory"`
-	LearnerAbilityTrajectory          []float64          `json:"learner_ability_trajectory"`
-	MemoryIntervalBefore              []float64          `json:"memory_interval_before,omitempty"`
-	MemoryIntervalAfter               []float64          `json:"memory_interval_after,omitempty"`
-	SystemFailures                    int                `json:"system_failures"`
-	ReviewDue                         int                `json:"review_due"`
-	ReviewServed                      int                `json:"review_served"`
-	ProbeCount                        int                `json:"probe_count"`
-	UniquePatterns                    int                `json:"unique_patterns"`
-	UniqueIntents                     int                `json:"unique_intents"`
-	SceneMismatchCount                int                `json:"scene_mismatch_count"`
-	ScopeRelaxationCount              int                `json:"scope_relaxation_count"`
-	PatternMatchCounts                map[string]int     `json:"pattern_match_counts,omitempty"`
-	GeneratorExactDuplicateRate       float64            `json:"generator_exact_duplicate_rate"`
-	GeneratorNormalizedDuplicateRate  float64            `json:"generator_normalized_duplicate_rate"`
-	GeneratorInitialCalls             int                `json:"generator_initial_calls"`
-	GeneratorInitialSuccesses         int                `json:"generator_initial_successes"`
-	GeneratorRepairAttempts           int                `json:"generator_repair_attempts"`
-	GeneratorRepairSuccesses          int                `json:"generator_repair_successes"`
-	GeneratorFreshRetryAttempts       int                `json:"generator_fresh_retry_attempts"`
-	GeneratorFreshRetrySuccesses      int                `json:"generator_fresh_retry_successes"`
-	GeneratorFallbackCount            int                `json:"generator_fallback_count"`
-	GeneratorFinalDeliveryCount       int                `json:"generator_final_delivery_count"`
-	GeneratorInitialSuccessRate       float64            `json:"generator_initial_success_rate"`
-	GeneratorRepairRate               float64            `json:"generator_repair_rate"`
-	GeneratorRetryRate                float64            `json:"generator_retry_rate"`
-	GeneratorFallbackRate             float64            `json:"generator_fallback_rate"`
-	GeneratorFinalDeliveryRate        float64            `json:"generator_final_delivery_rate"`
-	GeneratorFailureKinds             map[string]int     `json:"generator_failure_kinds,omitempty"`
-	GeneratorEmptyResponseCount       int                `json:"generator_empty_response_count"`
-	GeneratorMalformedJSONCount       int                `json:"generator_malformed_json_count"`
-	GeneratorTruncatedJSONCount       int                `json:"generator_truncated_json_count"`
-	GeneratorTimeoutCount             int                `json:"generator_timeout_count"`
-	GeneratorSchemaInvalidCount       int                `json:"generator_schema_invalid_count"`
-	GeneratorConstraintViolationCount int                `json:"generator_constraint_violation_count"`
-	GeneratorSceneMismatchCount       int                `json:"generator_scene_mismatch_count"`
-	GeneratorDifficultyRejects        int                `json:"generator_difficulty_rejects"`
-	AdaptiveStateUpdates              int                `json:"adaptive_state_updates"`
-	AdaptiveNextExerciseReplans       int                `json:"adaptive_next_exercise_replans"`
-	AdaptiveReplanEligible            int                `json:"adaptive_replan_eligible"`
-	AdaptiveReplanMisses              int                `json:"adaptive_replan_misses"`
-	TargetDifficultyTrajectory        []float64          `json:"target_difficulty_trajectory"`
-	RealizedDifficultyTrajectory      []float64          `json:"realized_difficulty_trajectory"`
+	OverallAccuracy                       float64            `json:"overall_accuracy"`
+	AccuracyByDifficulty                  map[string]float64 `json:"accuracy_by_difficulty,omitempty"`
+	AccuracyByPattern                     map[string]float64 `json:"accuracy_by_pattern,omitempty"`
+	AccuracyByScene                       map[string]float64 `json:"accuracy_by_scene,omitempty"`
+	DifficultyJitter                      float64            `json:"difficulty_jitter"`
+	MaxAdjacentDifficultyJump             float64            `json:"max_adjacent_difficulty_jump"`
+	ProductiveZoneRatio                   float64            `json:"productive_zone_ratio"`
+	ExactRepeatRate                       float64            `json:"exact_repeat_rate"`
+	NormalizedExactDuplicateRate          float64            `json:"normalized_exact_duplicate_rate"`
+	SamePatternSpacing                    float64            `json:"same_pattern_spacing"`
+	WeakSkillExposure                     float64            `json:"weak_skill_exposure"`
+	ReviewHitRate                         float64            `json:"review_hit_rate"`
+	ProbeRatio                            float64            `json:"probe_ratio"`
+	ProbeSuccessRate                      float64            `json:"probe_success_rate"`
+	UnknownToObserved                     float64            `json:"unknown_to_observed"`
+	FoundationExposureRatio               float64            `json:"foundation_exposure_ratio"`
+	MaxConsecutiveSamePattern             int                `json:"max_consecutive_same_pattern"`
+	SkillUnlocks                          int                `json:"skill_unlocks"`
+	SceneCoverage                         map[string]float64 `json:"scene_coverage"`
+	SceneMastery                          map[string]float64 `json:"scene_mastery"`
+	TransferEvents                        int                `json:"transfer_events"`
+	AcquisitionTrajectory                 []float64          `json:"acquisition_trajectory"`
+	RetentionTrajectory                   []float64          `json:"retention_trajectory"`
+	TransferTrajectory                    []float64          `json:"transfer_trajectory"`
+	SessionDifficultyTrajectory           []float64          `json:"session_difficulty_trajectory"`
+	LearnerAbilityTrajectory              []float64          `json:"learner_ability_trajectory"`
+	MemoryIntervalBefore                  []float64          `json:"memory_interval_before,omitempty"`
+	MemoryIntervalAfter                   []float64          `json:"memory_interval_after,omitempty"`
+	SystemFailures                        int                `json:"system_failures"`
+	ReviewDue                             int                `json:"review_due"`
+	ReviewServed                          int                `json:"review_served"`
+	ProbeCount                            int                `json:"probe_count"`
+	UniquePatterns                        int                `json:"unique_patterns"`
+	UniqueIntents                         int                `json:"unique_intents"`
+	SceneMismatchCount                    int                `json:"scene_mismatch_count"`
+	ScopeRelaxationCount                  int                `json:"scope_relaxation_count"`
+	PatternMatchCounts                    map[string]int     `json:"pattern_match_counts,omitempty"`
+	GeneratorExactDuplicateRate           float64            `json:"generator_exact_duplicate_rate"`
+	GeneratorNormalizedDuplicateRate      float64            `json:"generator_normalized_duplicate_rate"`
+	GeneratorInitialCalls                 int                `json:"generator_initial_calls"`
+	GeneratorInitialSuccesses             int                `json:"generator_initial_successes"`
+	GeneratorRepairAttempts               int                `json:"generator_repair_attempts"`
+	GeneratorRepairSuccesses              int                `json:"generator_repair_successes"`
+	GeneratorFreshRetryAttempts           int                `json:"generator_fresh_retry_attempts"`
+	GeneratorFreshRetrySuccesses          int                `json:"generator_fresh_retry_successes"`
+	GeneratorFallbackCount                int                `json:"generator_fallback_count"`
+	GeneratorFinalDeliveryCount           int                `json:"generator_final_delivery_count"`
+	GeneratorInitialSuccessRate           float64            `json:"generator_initial_success_rate"`
+	GeneratorRepairRate                   float64            `json:"generator_repair_rate"`
+	GeneratorRetryRate                    float64            `json:"generator_retry_rate"`
+	GeneratorFallbackRate                 float64            `json:"generator_fallback_rate"`
+	GeneratorFinalDeliveryRate            float64            `json:"generator_final_delivery_rate"`
+	GeneratorFailureKinds                 map[string]int     `json:"generator_failure_kinds,omitempty"`
+	GeneratorEmptyResponseCount           int                `json:"generator_empty_response_count"`
+	GeneratorMalformedJSONCount           int                `json:"generator_malformed_json_count"`
+	GeneratorTruncatedJSONCount           int                `json:"generator_truncated_json_count"`
+	GeneratorTimeoutCount                 int                `json:"generator_timeout_count"`
+	GeneratorSchemaInvalidCount           int                `json:"generator_schema_invalid_count"`
+	GeneratorConstraintViolationCount     int                `json:"generator_constraint_violation_count"`
+	GeneratorSceneMismatchCount           int                `json:"generator_scene_mismatch_count"`
+	GeneratorDifficultyRejects            int                `json:"generator_difficulty_rejects"`
+	GeneratorRequests                     int                `json:"generator_requests"`
+	GeneratorInitialFailures              int                `json:"generator_initial_failures"`
+	GeneratorStructuralFailures           int                `json:"generator_structural_failures"`
+	GeneratorSemanticFailures             int                `json:"generator_semantic_failures"`
+	GeneratorAdapterExtractionFailures    int                `json:"generator_adapter_extraction_failures"`
+	GeneratorProviderEmptyCount           int                `json:"generator_provider_empty_count"`
+	GeneratorReasoningOnlyCount           int                `json:"generator_reasoning_only_count"`
+	GeneratorDeterministicRepairSuccesses int                `json:"generator_deterministic_repair_successes"`
+	GeneratorLLMRepairSuccesses           int                `json:"generator_llm_repair_successes"`
+	AdaptiveStateUpdates                  int                `json:"adaptive_state_updates"`
+	AdaptiveNextExerciseReplans           int                `json:"adaptive_next_exercise_replans"`
+	AdaptiveReplanEligible                int                `json:"adaptive_replan_eligible"`
+	AdaptiveReplanMisses                  int                `json:"adaptive_replan_misses"`
+	TargetDifficultyTrajectory            []float64          `json:"target_difficulty_trajectory"`
+	RealizedDifficultyTrajectory          []float64          `json:"realized_difficulty_trajectory"`
 }
 
 type SimulationResult struct {
-	SimulationVersion       string              `json:"simulation_version"`
-	Persona                 string              `json:"persona"`
-	PersonaVersion          string              `json:"persona_version"`
-	Mode                    string              `json:"mode"`
-	Seed                    int64               `json:"seed"`
-	Attempts                int                 `json:"attempts"`
-	Sessions                int                 `json:"sessions"`
-	VirtualDays             float64             `json:"virtual_days"`
-	Provider                string              `json:"provider,omitempty"`
-	Model                   string              `json:"model,omitempty"`
-	LearnerProvider         string              `json:"learner_provider,omitempty"`
-	LearnerModel            string              `json:"learner_model,omitempty"`
-	EvaluatorProvider       string              `json:"evaluator_provider,omitempty"`
-	EvaluatorModel          string              `json:"evaluator_model,omitempty"`
-	GeneratorProvider       string              `json:"generator_provider,omitempty"`
-	GeneratorModel          string              `json:"generator_model,omitempty"`
-	GeneratorMode           string              `json:"generator_mode"`
-	MaxAllowedAttempts      int                 `json:"max_allowed_attempts"`
-	PolicyVersion           string              `json:"policy_version"`
-	DifficultyPolicyVersion string              `json:"difficulty_policy_version"`
-	StartedAt               time.Time           `json:"started_at"`
-	CompletedAt             time.Time           `json:"completed_at"`
-	DryRun                  bool                `json:"dry_run"`
-	Metrics                 SimulationMetrics   `json:"metrics"`
-	HealthFlags             []string            `json:"health_flags"`
-	UnlockEvents            []SkillUnlockEvent  `json:"unlock_events,omitempty"`
-	AttemptsTrace           []SimulationAttempt `json:"attempts_trace,omitempty"`
-	Manifest                map[string]any      `json:"manifest"`
-	AI                      AIUsage             `json:"ai_usage"`
+	SimulationVersion        string              `json:"simulation_version"`
+	Persona                  string              `json:"persona"`
+	PersonaVersion           string              `json:"persona_version"`
+	Mode                     string              `json:"mode"`
+	Seed                     int64               `json:"seed"`
+	Attempts                 int                 `json:"attempts"`
+	Sessions                 int                 `json:"sessions"`
+	VirtualDays              float64             `json:"virtual_days"`
+	Provider                 string              `json:"provider,omitempty"`
+	Model                    string              `json:"model,omitempty"`
+	LearnerProvider          string              `json:"learner_provider,omitempty"`
+	LearnerModel             string              `json:"learner_model,omitempty"`
+	EvaluatorProvider        string              `json:"evaluator_provider,omitempty"`
+	EvaluatorModel           string              `json:"evaluator_model,omitempty"`
+	GeneratorProvider        string              `json:"generator_provider,omitempty"`
+	GeneratorModel           string              `json:"generator_model,omitempty"`
+	GeneratorMode            string              `json:"generator_mode"`
+	GeneratorContractVersion string              `json:"generator_contract_version,omitempty"`
+	MaxAllowedAttempts       int                 `json:"max_allowed_attempts"`
+	PolicyVersion            string              `json:"policy_version"`
+	DifficultyPolicyVersion  string              `json:"difficulty_policy_version"`
+	StartedAt                time.Time           `json:"started_at"`
+	CompletedAt              time.Time           `json:"completed_at"`
+	DryRun                   bool                `json:"dry_run"`
+	Metrics                  SimulationMetrics   `json:"metrics"`
+	HealthFlags              []string            `json:"health_flags"`
+	UnlockEvents             []SkillUnlockEvent  `json:"unlock_events,omitempty"`
+	AttemptsTrace            []SimulationAttempt `json:"attempts_trace,omitempty"`
+	Manifest                 map[string]any      `json:"manifest"`
+	AI                       AIUsage             `json:"ai_usage"`
 }
 
 type AIUsage struct {
@@ -665,7 +695,7 @@ func (r *SimulationRunner) Run(ctx context.Context, cfg SimulationConfig) (Simul
 		return SimulationResult{}, err
 	}
 	started := time.Now().UTC()
-	result := SimulationResult{SimulationVersion: simulationVersion, Persona: persona.ID, PersonaVersion: persona.Version, Mode: cfg.Mode, Seed: cfg.Seed, PolicyVersion: "adaptive-v2.3", DifficultyPolicyVersion: difficultyPolicyVersion, StartedAt: started, LearnerProvider: cfg.LearnerProvider, LearnerModel: cfg.LearnerModel, EvaluatorProvider: cfg.EvaluatorProvider, EvaluatorModel: cfg.EvaluatorModel, GeneratorProvider: cfg.GeneratorProvider, GeneratorModel: cfg.GeneratorModel, GeneratorMode: cfg.Generator, MaxAllowedAttempts: cfg.MaxAttempts, DryRun: cfg.DryRun, Manifest: map[string]any{"config": cfg, "persona": persona, "seed": cfg.Seed, "virtual_time_profile": cfg.TimeProfile, "database": "isolated-simulation-store"}}
+	result := SimulationResult{SimulationVersion: simulationVersion, Persona: persona.ID, PersonaVersion: persona.Version, Mode: cfg.Mode, Seed: cfg.Seed, PolicyVersion: "adaptive-v2.3", DifficultyPolicyVersion: difficultyPolicyVersion, StartedAt: started, LearnerProvider: cfg.LearnerProvider, LearnerModel: cfg.LearnerModel, EvaluatorProvider: cfg.EvaluatorProvider, EvaluatorModel: cfg.EvaluatorModel, GeneratorProvider: cfg.GeneratorProvider, GeneratorModel: cfg.GeneratorModel, GeneratorMode: cfg.Generator, GeneratorContractVersion: generatorContractVersion, MaxAllowedAttempts: cfg.MaxAttempts, DryRun: cfg.DryRun, Manifest: map[string]any{"config": cfg, "persona": persona, "seed": cfg.Seed, "virtual_time_profile": cfg.TimeProfile, "database": "isolated-simulation-store", "generator_contract_version": generatorContractVersion}}
 	if cfg.DryRun {
 		result.Attempts = cfg.Attempts
 		result.Sessions = (cfg.Attempts + cfg.SessionSize - 1) / cfg.SessionSize
@@ -732,9 +762,12 @@ func (r *SimulationRunner) runAI(ctx context.Context, cfg SimulationConfig, p Le
 		if r.Generator != nil {
 			generated, generation, err := generateSimulationExercise(ctx, r.Generator, ex)
 			result.AI.GeneratorCalls += generation.ProviderCalls
+			result.Metrics.GeneratorRequests += generation.ProviderCalls
 			result.Metrics.GeneratorInitialCalls += generation.InitialCalls
 			if generation.InitialSuccess {
 				result.Metrics.GeneratorInitialSuccesses++
+			} else if generation.InitialCalls > 0 {
+				result.Metrics.GeneratorInitialFailures++
 			}
 			result.Metrics.GeneratorRepairAttempts += generation.RepairAttempts
 			result.Metrics.GeneratorFreshRetryAttempts += generation.FreshRetries
@@ -743,6 +776,14 @@ func (r *SimulationRunner) runAI(ctx context.Context, cfg SimulationConfig, p Le
 			}
 			if generation.FinalSource == "regenerated" {
 				result.Metrics.GeneratorFreshRetrySuccesses++
+			}
+			if generation.FinalSource == "repaired" {
+				result.Metrics.GeneratorLLMRepairSuccesses++
+			}
+			for _, response := range generation.Responses {
+				if response.DeterministicRepair {
+					result.Metrics.GeneratorDeterministicRepairSuccesses++
+				}
 			}
 			if result.Metrics.GeneratorFailureKinds == nil {
 				result.Metrics.GeneratorFailureKinds = map[string]int{}
@@ -1442,8 +1483,8 @@ func writeSimulationReport(w io.Writer, result SimulationResult, jsonOutput bool
 		enc.SetIndent("", "  ")
 		return enc.Encode(result)
 	}
-	fmt.Fprintf(w, "Simulation %s\nPersona: %s\nMode: %s\nAttempts: %d\nSessions: %d\nMax allowed attempts: %d\nLearner provider/model: %s / %s\nEvaluator provider/model: %s / %s\nGenerator mode/provider/model: %s / %s / %s\nPlanned/actual LLM calls: %d\nEstimated cost: %.3f\nSystem failures: %d\nAdaptive state updates/replans: %d/%d\nPattern matches: %v\nGenerator duplicate exact/normalized: %.1f%%/%.1f%%\nGenerator scene mismatch/difficulty rejects: %d/%d\nAccuracy: %.1f%%\nDifficulty jitter: %.3f\nMax jump: %.3f\nWeak exposure: %.1f%%\nReview due/served/hit: %d/%d/%.1f%%\nProbe count/ratio/success: %d/%.1f%%/%.1f%%\nUnique patterns/intents: %d/%d\nFoundation exposure: %.1f%%\nTransfer events: %d\nHealth flags: %s\n", result.SimulationVersion, result.Persona, result.Mode, result.Attempts, result.Sessions, result.MaxAllowedAttempts, result.LearnerProvider, result.LearnerModel, result.EvaluatorProvider, result.EvaluatorModel, result.GeneratorMode, result.GeneratorProvider, result.GeneratorModel, result.AI.TotalCalls, result.AI.EstimatedCost, result.Metrics.SystemFailures, result.Metrics.AdaptiveStateUpdates, result.Metrics.AdaptiveNextExerciseReplans, result.Metrics.PatternMatchCounts, result.Metrics.GeneratorExactDuplicateRate*100, result.Metrics.GeneratorNormalizedDuplicateRate*100, result.Metrics.GeneratorSceneMismatchCount, result.Metrics.GeneratorDifficultyRejects, result.Metrics.OverallAccuracy*100, result.Metrics.DifficultyJitter, result.Metrics.MaxAdjacentDifficultyJump, result.Metrics.WeakSkillExposure*100, result.Metrics.ReviewDue, result.Metrics.ReviewServed, result.Metrics.ReviewHitRate*100, result.Metrics.ProbeCount, result.Metrics.ProbeRatio*100, result.Metrics.ProbeSuccessRate*100, result.Metrics.UniquePatterns, result.Metrics.UniqueIntents, result.Metrics.FoundationExposureRatio*100, result.Metrics.TransferEvents, strings.Join(result.HealthFlags, ", "))
-	fmt.Fprintf(w, "Cost status: %s\nAdaptive replan eligible/misses: %d/%d\nGenerator initial success/repair success/fresh retry success/fallback: %d/%d/%d/%d\nGenerator delivery/initial success/repair/retry/fallback rates: %.1f%%/%.1f%%/%.1f%%/%.1f%%/%.1f%%\nGenerator failure kinds: %v\n", result.AI.CostStatus, result.Metrics.AdaptiveReplanEligible, result.Metrics.AdaptiveReplanMisses, result.Metrics.GeneratorInitialSuccesses, result.Metrics.GeneratorRepairSuccesses, result.Metrics.GeneratorFreshRetrySuccesses, result.Metrics.GeneratorFallbackCount, result.Metrics.GeneratorFinalDeliveryRate*100, result.Metrics.GeneratorInitialSuccessRate*100, result.Metrics.GeneratorRepairRate*100, result.Metrics.GeneratorRetryRate*100, result.Metrics.GeneratorFallbackRate*100, result.Metrics.GeneratorFailureKinds)
+	fmt.Fprintf(w, "Simulation %s\nPersona: %s\nMode: %s\nAttempts: %d\nSessions: %d\nMax allowed attempts: %d\nLearner provider/model: %s / %s\nEvaluator provider/model: %s / %s\nGenerator mode/provider/model: %s / %s / %s\nGenerator contract: %s\nPlanned/actual LLM calls: %d\nEstimated cost: %.3f\nSystem failures: %d\nAdaptive state updates/replans: %d/%d\nPattern matches: %v\nGenerator duplicate exact/normalized: %.1f%%/%.1f%%\nGenerator scene mismatch/difficulty rejects: %d/%d\nAccuracy: %.1f%%\nDifficulty jitter: %.3f\nMax jump: %.3f\nWeak exposure: %.1f%%\nReview due/served/hit: %d/%d/%.1f%%\nProbe count/ratio/success: %d/%.1f%%/%.1f%%\nUnique patterns/intents: %d/%d\nFoundation exposure: %.1f%%\nTransfer events: %d\nHealth flags: %s\n", result.SimulationVersion, result.Persona, result.Mode, result.Attempts, result.Sessions, result.MaxAllowedAttempts, result.LearnerProvider, result.LearnerModel, result.EvaluatorProvider, result.EvaluatorModel, result.GeneratorMode, result.GeneratorProvider, result.GeneratorModel, result.GeneratorContractVersion, result.AI.TotalCalls, result.AI.EstimatedCost, result.Metrics.SystemFailures, result.Metrics.AdaptiveStateUpdates, result.Metrics.AdaptiveNextExerciseReplans, result.Metrics.PatternMatchCounts, result.Metrics.GeneratorExactDuplicateRate*100, result.Metrics.GeneratorNormalizedDuplicateRate*100, result.Metrics.GeneratorSceneMismatchCount, result.Metrics.GeneratorDifficultyRejects, result.Metrics.OverallAccuracy*100, result.Metrics.DifficultyJitter, result.Metrics.MaxAdjacentDifficultyJump, result.Metrics.WeakSkillExposure*100, result.Metrics.ReviewDue, result.Metrics.ReviewServed, result.Metrics.ReviewHitRate*100, result.Metrics.ProbeCount, result.Metrics.ProbeRatio*100, result.Metrics.ProbeSuccessRate*100, result.Metrics.UniquePatterns, result.Metrics.UniqueIntents, result.Metrics.FoundationExposureRatio*100, result.Metrics.TransferEvents, strings.Join(result.HealthFlags, ", "))
+	fmt.Fprintf(w, "Cost status: %s\nAdaptive replan eligible/misses: %d/%d\nGenerator requests/initial success/failure: %d/%d/%d\nGenerator structural/semantic/adapter failures: %d/%d/%d\nGenerator provider-empty/reasoning-only: %d/%d\nGenerator deterministic repair/LLM repair: %d/%d\nGenerator initial success/repair success/fresh retry success/fallback: %d/%d/%d/%d\nGenerator delivery/initial success/repair/retry/fallback rates: %.1f%%/%.1f%%/%.1f%%/%.1f%%/%.1f%%\nGenerator failure kinds: %v\n", result.AI.CostStatus, result.Metrics.AdaptiveReplanEligible, result.Metrics.AdaptiveReplanMisses, result.Metrics.GeneratorRequests, result.Metrics.GeneratorInitialSuccesses, result.Metrics.GeneratorInitialFailures, result.Metrics.GeneratorStructuralFailures, result.Metrics.GeneratorSemanticFailures, result.Metrics.GeneratorAdapterExtractionFailures, result.Metrics.GeneratorProviderEmptyCount, result.Metrics.GeneratorReasoningOnlyCount, result.Metrics.GeneratorDeterministicRepairSuccesses, result.Metrics.GeneratorLLMRepairSuccesses, result.Metrics.GeneratorInitialSuccesses, result.Metrics.GeneratorRepairSuccesses, result.Metrics.GeneratorFreshRetrySuccesses, result.Metrics.GeneratorFallbackCount, result.Metrics.GeneratorFinalDeliveryRate*100, result.Metrics.GeneratorInitialSuccessRate*100, result.Metrics.GeneratorRepairRate*100, result.Metrics.GeneratorRetryRate*100, result.Metrics.GeneratorFallbackRate*100, result.Metrics.GeneratorFailureKinds)
 	return nil
 }
 

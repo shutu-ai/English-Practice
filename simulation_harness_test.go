@@ -164,7 +164,7 @@ func (c *recordingChatClient) Chat(_ context.Context, req ChatRequest) (*ChatRes
 }
 
 func validGeneratorJSON(prompt string) string {
-	return fmt.Sprintf(`{"chinese_prompt":%q,"reference_answers":["I would review the plan first."]}`, prompt)
+	return fmt.Sprintf(`{"chinese_prompt":%q}`, prompt)
 }
 
 func generatorTestExercise() SimulationExercise {
@@ -172,20 +172,20 @@ func generatorTestExercise() SimulationExercise {
 }
 
 func TestGeneratorReliabilityRepairsMalformedAndRetriesEmpty(t *testing.T) {
-	malformed := &sequenceChatClient{responses: []string{`{"chinese_prompt":`, validGeneratorJSON("修复后的会议练习")}}
+	malformed := &sequenceChatClient{responses: []string{`{"chinese_prompt":`, validGeneratorJSON("项目会议中的修复后保留意见练习")}}
 	g := LLMExerciseGenerator{Client: malformed, MaxTokens: 64}
 	exercise, diag, err := g.GenerateDetailed(context.Background(), generatorTestExercise())
-	if err != nil || exercise.ChinesePrompt != "修复后的会议练习" {
+	if err != nil || exercise.ChinesePrompt != "项目会议中的修复后保留意见练习" {
 		t.Fatalf("malformed response was not repaired: exercise=%#v diag=%#v err=%v", exercise, diag, err)
 	}
 	if diag.ProviderCalls != 2 || diag.RepairAttempts != 1 || diag.FinalSource != "repaired" || diag.FailureKinds[0] != GeneratorFailureTruncatedJSON {
 		t.Fatalf("unexpected repair diagnostics: %#v", diag)
 	}
 
-	empty := &sequenceChatClient{responses: []string{"", validGeneratorJSON("fresh generation")}}
+	empty := &sequenceChatClient{responses: []string{"", validGeneratorJSON("项目会议中的新的保留意见练习")}}
 	g = LLMExerciseGenerator{Client: empty, MaxTokens: 64}
 	exercise, diag, err = g.GenerateDetailed(context.Background(), generatorTestExercise())
-	if err != nil || exercise.ChinesePrompt != "fresh generation" {
+	if err != nil || exercise.ChinesePrompt != "项目会议中的新的保留意见练习" {
 		t.Fatalf("empty response was not fresh-retried: exercise=%#v diag=%#v err=%v", exercise, diag, err)
 	}
 	if diag.ProviderCalls != 2 || diag.RepairAttempts != 0 || diag.FreshRetries != 1 || diag.FinalSource != "regenerated" || diag.FailureKinds[0] != GeneratorFailureEmptyResponse {
@@ -193,30 +193,29 @@ func TestGeneratorReliabilityRepairsMalformedAndRetriesEmpty(t *testing.T) {
 	}
 }
 
-func TestGeneratorReliabilityRejectsMetadataAndFreshRegenerates(t *testing.T) {
+func TestGeneratorReliabilityBindsApplicationMetadataAndIgnoresLegacyFields(t *testing.T) {
 	client := &sequenceChatClient{responses: []string{
-		`{"chinese_prompt":"错误场景","scene":"travel"}`,
-		validGeneratorJSON("正确会议练习"),
+		`{"chinese_prompt":"项目会议中的真实保留意见练习","scene":"travel","intent":"wrong","pattern":"wrong","target_difficulty":1}`,
 	}}
 	g := LLMExerciseGenerator{Client: client, MaxTokens: 64}
 	exercise, diag, err := g.GenerateDetailed(context.Background(), generatorTestExercise())
-	if err != nil || exercise.SceneID != "meeting" || exercise.ChinesePrompt != "正确会议练习" {
-		t.Fatalf("metadata mismatch was not regenerated: exercise=%#v diag=%#v err=%v", exercise, diag, err)
+	if err != nil || exercise.SceneID != "meeting" || exercise.Intent != "contrast" || exercise.PatternID != "having-said-that" || exercise.Difficulty != 6.5 || exercise.ChinesePrompt != "项目会议中的真实保留意见练习" {
+		t.Fatalf("application metadata was not authoritative: exercise=%#v diag=%#v err=%v", exercise, diag, err)
 	}
-	if diag.ProviderCalls != 2 || diag.RepairAttempts != 0 || diag.FreshRetries != 1 || diag.FinalSource != "regenerated" || diag.FailureKinds[0] != GeneratorFailureSceneMismatch {
-		t.Fatalf("metadata mismatch used the wrong retry path: %#v", diag)
+	if diag.ProviderCalls != 1 || !diag.InitialSuccess || diag.FinalSource != "real" || diag.ContractVersion != generatorContractVersion {
+		t.Fatalf("legacy metadata should not force a retry: %#v", diag)
 	}
 }
 
 func TestGeneratorStructuredOutputAcceptsFenceAndClassifiesSchema(t *testing.T) {
 	ex := generatorTestExercise()
-	fenced := "leading text\n```json\n" + validGeneratorJSON("fenced exercise") + "\n```\ntrailing text"
+	fenced := "leading text\n```json\n" + validGeneratorJSON("项目会议中的带代码围栏保留意见练习") + "\n```\ntrailing text"
 	parsed, err := parseGeneratedExercise(fenced, ex)
-	if err != nil || parsed.ChinesePrompt != "fenced exercise" {
+	if err != nil || parsed.ChinesePrompt != "项目会议中的带代码围栏保留意见练习" {
 		t.Fatalf("safe fenced extraction failed: %#v %v", parsed, err)
 	}
-	parsed, err = parseGeneratedExercise(`{"chinese_prompt":"trailing comma",}`, ex)
-	if err != nil || parsed.ChinesePrompt != "trailing comma" {
+	parsed, err = parseGeneratedExercise(`{"chinese_prompt":"项目会议中的尾随逗号保留意见练习",}`, ex)
+	if err != nil || parsed.ChinesePrompt != "项目会议中的尾随逗号保留意见练习" {
 		t.Fatalf("deterministic trailing-comma repair failed: %#v %v", parsed, err)
 	}
 	_, err = parseGeneratedExercise(`{"scene":"meeting"}`, ex)
@@ -230,6 +229,64 @@ func TestGeneratorStructuredOutputAcceptsFenceAndClassifiesSchema(t *testing.T) 
 	_, err = parseGeneratedExercise(`{"chinese_prompt":"truncated"`, ex)
 	if generatorFailureKind(err) != GeneratorFailureTruncatedJSON {
 		t.Fatalf("truncated JSON was not truncated_json: %v", err)
+	}
+}
+
+func TestMinimalGeneratorContractBindsMetadataAndReferenceAnswers(t *testing.T) {
+	if !promptSupportsIntent("contrast", "项目会议中的保留意见") {
+		t.Fatal("contrast intent hints were not recognized")
+	}
+	ex := generatorTestExercise()
+	parsed, err := parseGeneratedExercise(`{"chinese_prompt":"请在项目会议中委婉表达你的保留意见。","reference_answers":["I see your point, but I still have some concerns."]}`, ex)
+	if err != nil {
+		t.Fatalf("minimal contract was rejected: %v", err)
+	}
+	if parsed.SceneID != ex.SceneID || parsed.SubsceneID != ex.SubsceneID || parsed.Intent != ex.Intent || parsed.PatternID != ex.PatternID || parsed.Difficulty != ex.Difficulty {
+		t.Fatalf("application-owned metadata was not bound from the spec: %#v", parsed)
+	}
+	if len(parsed.ReferenceAnswers) != 1 || parsed.ReferenceAnswers[0] == "" {
+		t.Fatalf("reference answer was not retained: %#v", parsed.ReferenceAnswers)
+	}
+	if _, err := parseGeneratedExercise(`{"chinese_prompt":"会议中的平衡意见练习","scene":"travel","intent":"travel","pattern":"wrong","target_difficulty":1}`, ex); err != nil {
+		t.Fatalf("legacy provider metadata should be ignored by the minimal contract: %v", err)
+	}
+	if _, err := parseGeneratedExercise(`{"chinese_prompt":"会议练习，使用 Having said that, ..."}`, ex); generatorFailureKind(err) != GeneratorFailureConstraintViolation {
+		t.Fatalf("answer leakage was not rejected semantically: %v", err)
+	}
+}
+
+func TestDeepSeekCompatibleAssistantContentExtraction(t *testing.T) {
+	finalJSON := `{"chinese_prompt":"请在会议中表达一个平衡意见。"}`
+	encodedFinal, _ := json.Marshal(finalJSON)
+	finalContent := string(encodedFinal)
+	tests := []struct {
+		name       string
+		body       string
+		wantSource string
+		wantKind   string
+		wantReason bool
+	}{
+		{name: "normal content", body: `{"choices":[{"message":{"role":"assistant","content":` + finalContent + `},"finish_reason":"stop"}]}`, wantSource: "choices.message.content"},
+		{name: "content plus reasoning", body: `{"choices":[{"message":{"role":"assistant","content":` + finalContent + `,"reasoning_content":"internal reasoning"},"finish_reason":"stop"}]}`, wantSource: "choices.message.content", wantReason: true},
+		{name: "reasoning only", body: `{"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"internal reasoning"},"finish_reason":"length"}]}`, wantKind: "reasoning_only", wantReason: true},
+		{name: "provider empty", body: `{"choices":[{"message":{"role":"assistant","content":null},"finish_reason":"stop"}]}`, wantKind: "provider_empty"},
+		{name: "wrong field", body: `{"choices":[{"message":{"role":"assistant","answer":` + finalContent + `},"finish_reason":"stop"}]}`, wantKind: "valid_content_wrong_field"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content, meta, err := extractAssistantContentDetailed([]byte(tt.body))
+			if tt.wantKind != "" {
+				var extractionErr *AssistantContentError
+				if err == nil || !errors.As(err, &extractionErr) || extractionErr.Category != tt.wantKind {
+					t.Fatalf("unexpected extraction result: content=%q meta=%#v err=%v", content, meta, err)
+				}
+			} else if err != nil || content == "" || meta.ContentSource != tt.wantSource {
+				t.Fatalf("unexpected successful extraction: content=%q meta=%#v err=%v", content, meta, err)
+			}
+			if meta.ReasoningPresent != tt.wantReason {
+				t.Fatalf("reasoning presence mismatch: got=%v want=%v", meta.ReasoningPresent, tt.wantReason)
+			}
+		})
 	}
 }
 

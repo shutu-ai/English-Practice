@@ -1,6 +1,6 @@
 # Simulation & Acceptance Harness
 
-V2.3.1 adds a deterministic simulation layer for regression and a separately
+V2.3.4 includes the V2.3.1 deterministic simulation layer for regression and a separately
 defined AI learner adapter for manual acceptance. Simulation is not human
 real-use validation: it can expose selection, difficulty, memory, scene,
 transfer, repetition, and curriculum problems, but it cannot establish that a
@@ -31,6 +31,15 @@ The learner receives only the Chinese exercise, scene, difficulty band,
 persona, and history summary. Reference answers, scores, desired answers, and
 mastery formulas are evaluator-owned and must not be placed in that prompt.
 
+Full-AI exercise generation uses `generator-contract-v2`. The adaptive selector
+owns scene, subscene, intent, target pattern, and target difficulty through a
+`GenerationSpec`; the provider returns only bounded linguistic content
+(`chinese_prompt` and optional `reference_answers`). The application binds the
+authoritative metadata after validation. DeepSeek/OpenAI-compatible extraction
+uses `choices[0].message.content` and never promotes `reasoning_content` to the
+final answer. See [generator-contract.md](generator-contract.md) for the contract,
+diagnostic taxonomy, and finish-reason handling.
+
 ## CLI
 
 ```powershell
@@ -57,6 +66,12 @@ retention / transfer trajectories, scene coverage/mastery, transfer events,
 skill unlock events, health flags, and the complete attempt trace when JSON is
 requested.
 
+Generator reports additionally include the contract version, provider request
+count, initial provider success/failure, structural/semantic/adapter extraction
+failure counts, provider-empty/reasoning-only counts, deterministic and LLM repair
+successes, fresh retries, fallback use, final delivery, finish reason, content
+source, bounded prompt/response byte counts, and per-attempt generation source.
+
 Health flags are diagnostic only. They do not mutate calibration, difficulty,
 mastery, curriculum configuration, or CI configuration.
 
@@ -64,4 +79,3 @@ mastery, curriculum configuration, or CI configuration.
 
 Deterministic smoke tests are suitable for CI. Extended runs and all live AI
 provider calls are manual acceptance work and must not be a PR CI dependency.
-
