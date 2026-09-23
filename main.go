@@ -1565,6 +1565,13 @@ func normalizeErrorType(value string) (string, error) {
 		v = "agreement"
 	case "word_choice_error":
 		v = "word_choice"
+	case "spelling", "spelling_error", "vocabulary", "vocabulary_error":
+		// Keep provider-specific surface labels in the stable persisted taxonomy.
+		v = "word_choice"
+	case "grammar", "grammar_error", "punctuation", "punctuation_error", "capitalization", "capitalization_error":
+		v = "other"
+	case "fluency", "fluency_error", "naturalness_error":
+		v = "unnatural_expression"
 	case "unnatural", "unnatural_error":
 		v = "unnatural_expression"
 	case "targetpatternmissing", "target_pattern_error":

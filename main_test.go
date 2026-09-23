@@ -244,6 +244,10 @@ func TestStructuredOutputNormalization(t *testing.T) {
 	if err != nil || len(aliased.Errors) != 1 || aliased.Errors[0]["type"] != "meaning" || aliased.Errors[0]["severity"] != "minor" {
 		t.Fatalf("known provider aliases were not normalized: %#v err=%v", aliased, err)
 	}
+	spelling, err := normalizeEvalContent(`{"verdict":"needs_improvement","meaning_score":0.8,"grammar_score":0.7,"naturalness_score":0.6,"pattern_score":0.5,"errors":[{"type":"spelling","severity":"minor","explanation":"Check the spelling."}],"suggested_answer":"x","explanation_zh":"x"}`)
+	if err != nil || len(spelling.Errors) != 1 || spelling.Errors[0]["type"] != "word_choice" {
+		t.Fatalf("spelling provider error was not normalized: %#v err=%v", spelling, err)
+	}
 	if eval, err := normalizeEvalContent(`{"verdict":"correct","meaning_score":0.8,"grammar_score":0.8,"naturalness_score":0.8,"pattern_score":0.8,"errors":[{"type":"meaning","level":"low","description":"x"}],"suggested_answer":"x","explanation_zh":"x"}`); err != nil || eval.Errors[0]["explanation"] != "x" {
 		t.Fatalf("error field aliases were not normalized: %#v err=%v", eval, err)
 	}
