@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	simulationVersion           = "v2.3.4"
+	simulationVersion           = "v2.3.5"
 	SimulationModeAlgorithm     = "algorithm"
 	SimulationModeDeterministic = "deterministic"
 	SimulationModeLLMLearner    = "llm-learner"
@@ -223,22 +223,63 @@ type SimulatedLearnerState struct {
 }
 
 type SimulatedAnswer struct {
-	Text string `json:"text"`
+	Text        string                        `json:"text"`
+	Reliability SimulationProviderReliability `json:"-"`
 }
 type SimulationEvaluation struct {
-	Correct            bool             `json:"correct"`
-	Verdict            string           `json:"verdict"`
-	Meaning            float64          `json:"meaning"`
-	Grammar            float64          `json:"grammar"`
-	Naturalness        float64          `json:"naturalness"`
-	Pattern            float64          `json:"pattern"`
-	TargetPatternMatch string           `json:"target_pattern_match"`
-	TargetPatternScore float64          `json:"target_pattern_score"`
-	SuggestedAnswer    string           `json:"suggested_answer,omitempty"`
-	MoreNaturalNeeded  bool             `json:"more_natural_needed,omitempty"`
-	Alternative        string           `json:"alternative,omitempty"`
-	Errors             []map[string]any `json:"errors,omitempty"`
+	Correct            bool                          `json:"correct"`
+	Verdict            string                        `json:"verdict"`
+	Meaning            float64                       `json:"meaning"`
+	Grammar            float64                       `json:"grammar"`
+	Naturalness        float64                       `json:"naturalness"`
+	Pattern            float64                       `json:"pattern"`
+	TargetPatternMatch string                        `json:"target_pattern_match"`
+	TargetPatternScore float64                       `json:"target_pattern_score"`
+	SuggestedAnswer    string                        `json:"suggested_answer,omitempty"`
+	MoreNaturalNeeded  bool                          `json:"more_natural_needed,omitempty"`
+	Alternative        string                        `json:"alternative,omitempty"`
+	Errors             []map[string]any              `json:"errors,omitempty"`
+	Reliability        SimulationProviderReliability `json:"-"`
 }
+
+// SimulationProviderReliability is adapter metadata. It is intentionally not
+// part of the learner/evaluator contracts persisted as user learning data.
+type SimulationProviderReliability struct {
+	ProviderCalls int
+	Initial       bool
+	Retry         bool
+	Repair        bool
+	FailureKind   string
+}
+
+const (
+	LearnerFailureProviderTimeout   = "PROVIDER_TIMEOUT"
+	LearnerFailureProviderHTTPError = "PROVIDER_HTTP_ERROR"
+	LearnerFailureProviderEmpty     = "PROVIDER_EMPTY"
+	LearnerFailureReasoningOnly     = "REASONING_ONLY"
+	LearnerFailureAdapterExtraction = "ADAPTER_EXTRACTION_EMPTY"
+	LearnerFailureTruncatedResponse = "TRUNCATED_RESPONSE"
+	LearnerFailureMalformedJSON     = "MALFORMED_JSON"
+	LearnerFailureUnexpectedContent = "UNEXPECTED_CONTENT"
+	LearnerFailureUnknown           = "UNKNOWN"
+
+	EvaluatorFailureProviderTimeout   = "PROVIDER_TIMEOUT"
+	EvaluatorFailureProviderHTTPError = "PROVIDER_HTTP_ERROR"
+	EvaluatorFailureProviderEmpty     = "PROVIDER_EMPTY"
+	EvaluatorFailureReasoningOnly     = "REASONING_ONLY"
+	EvaluatorFailureAdapterExtraction = "ADAPTER_EXTRACTION_EMPTY"
+	EvaluatorFailureTruncatedResponse = "TRUNCATED_RESPONSE"
+	EvaluatorFailureMalformedJSON     = "MALFORMED_JSON"
+	EvaluatorFailureSchemaInvalid     = "SCHEMA_INVALID"
+	EvaluatorFailureInvalidEnum       = "INVALID_ENUM"
+	EvaluatorFailureMissingRequired   = "MISSING_REQUIRED_FIELD"
+	EvaluatorFailureUnknown           = "UNKNOWN"
+
+	ChainComplete               = "COMPLETE"
+	ChainGeneratorSystemFailure = "GENERATOR_SYSTEM_FAILURE"
+	ChainLearnerSystemFailure   = "LEARNER_SYSTEM_FAILURE"
+	ChainEvaluatorSystemFailure = "EVALUATOR_SYSTEM_FAILURE"
+)
 
 type LearnerSimulator interface {
 	Answer(context.Context, SimulationExercise, SimulatedLearnerState) (SimulatedAnswer, error)
@@ -266,21 +307,56 @@ func (l LLMLearnerSimulator) Answer(ctx context.Context, ex SimulationExercise, 
 		return SimulatedAnswer{}, errors.New("learner provider is not configured")
 	}
 	prompt := fmt.Sprintf("Learner profile id: %s\nChinese exercise: %s\nScene: %s\nDifficulty band: %s\nRecent history summary: %s\n\nUse the context above only to decide what the learner would say. Output exactly one natural English sentence answering the Chinese exercise. Do not translate or describe these instructions. Do not mention the user, profile, exercise, prompt, history, grading, difficulty, or training system. Do not provide alternatives, analysis, or labels.", state.PersonaID, ex.ChinesePrompt, ex.SceneID, ex.DifficultyBand, state.HistorySummary)
-	resp, err := l.Client.Chat(ctx, ChatRequest{Messages: []ChatMessage{{Role: "system", Content: "Act as the learner only. Return exactly one natural English sentence. Never discuss grading, the training system, or your instructions."}, {Role: "user", Content: prompt}}, MaxTokens: l.MaxTokens})
-	if err != nil {
-		return SimulatedAnswer{}, err
+	base := []ChatMessage{{Role: "system", Content: "Act as the learner only. Return exactly one natural English sentence. Never discuss grading, the training system, or your instructions."}, {Role: "user", Content: prompt}}
+	maxAttempts := 2
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		messages := base
+		if attempt == 1 {
+			// This is a contract repair only. It deliberately does not reveal an
+			// answer key, evaluation, or correctness hint.
+			messages = append(append([]ChatMessage{}, base...), ChatMessage{Role: "system", Content: "Your previous response did not satisfy the output contract. Return one English learner answer only; do not explain, improve, or evaluate it."})
+		}
+		resp, err := l.Client.Chat(ctx, ChatRequest{Messages: messages, MaxTokens: l.MaxTokens})
+		reliability := SimulationProviderReliability{ProviderCalls: attempt + 1, Initial: attempt == 0}
+		if err != nil {
+			kind, retryable := classifyProviderFailure(err, "learner")
+			reliability.FailureKind = kind
+			lastErr = &SimulationProviderError{Role: "learner", Kind: kind, ProviderCalls: attempt + 1, Retryable: retryable, Err: err}
+			if retryable && attempt+1 < maxAttempts {
+				continue
+			}
+			return SimulatedAnswer{Reliability: reliability}, lastErr
+		}
+		if resp == nil {
+			lastErr = &SimulationProviderError{Role: "learner", Kind: LearnerFailureProviderEmpty, ProviderCalls: attempt + 1, Retryable: true, Err: errors.New("learner provider returned no response")}
+			if attempt+1 < maxAttempts {
+				continue
+			}
+			return SimulatedAnswer{Reliability: reliability}, lastErr
+		}
+		answer := strings.TrimSpace(resp.Content)
+		if answer == "" {
+			kind := LearnerFailureProviderEmpty
+			reliability.FailureKind = kind
+			lastErr = &SimulationProviderError{Role: "learner", Kind: kind, ProviderCalls: attempt + 1, Retryable: true, Err: errors.New("learner provider returned an empty answer")}
+			if attempt+1 < maxAttempts {
+				continue
+			}
+			return SimulatedAnswer{Reliability: reliability}, lastErr
+		}
+		if strings.Contains(answer, "\n") {
+			answer = strings.TrimSpace(strings.Split(answer, "\n")[0])
+		}
+		if strings.HasPrefix(answer, "```") || strings.Contains(strings.ToLower(answer), "as an ai") {
+			kind := LearnerFailureUnexpectedContent
+			reliability.FailureKind = kind
+			return SimulatedAnswer{Reliability: reliability}, &SimulationProviderError{Role: "learner", Kind: kind, ProviderCalls: attempt + 1, Err: errors.New("learner provider returned a non-learner response")}
+		}
+		reliability.Retry = attempt > 0
+		return SimulatedAnswer{Text: answer, Reliability: reliability}, nil
 	}
-	answer := strings.TrimSpace(resp.Content)
-	if answer == "" {
-		return SimulatedAnswer{}, errors.New("learner provider returned an empty answer")
-	}
-	if strings.Contains(answer, "\n") {
-		answer = strings.TrimSpace(strings.Split(answer, "\n")[0])
-	}
-	if strings.HasPrefix(answer, "```") || strings.Contains(strings.ToLower(answer), "as an ai") {
-		return SimulatedAnswer{}, errors.New("learner provider returned a non-learner response")
-	}
-	return SimulatedAnswer{Text: answer}, nil
+	return SimulatedAnswer{}, lastErr
 }
 
 func simulationChinesePrompt(ptn patternDefinition, scene string) string {
@@ -327,11 +403,12 @@ func (e ProductionSimulationEvaluator) Evaluate(ctx context.Context, ex Simulati
 	if e.Server == nil || e.Server.llm == nil {
 		return SimulationEvaluation{}, errors.New("evaluator provider is not configured")
 	}
-	eval, _, _, _, err := e.Server.evaluateWithProvider(ctx, ex.ChinesePrompt, ex.PatternID, answer.Text, e.Provider)
+	eval, _, _, diagnostics, err := e.Server.evaluateWithProvider(ctx, ex.ChinesePrompt, ex.PatternID, answer.Text, e.Provider)
 	if err != nil {
-		return SimulationEvaluation{}, err
+		kind := evaluatorFailureKind(diagnostics, err)
+		return SimulationEvaluation{Reliability: SimulationProviderReliability{ProviderCalls: diagnostics.ProviderCalls, FailureKind: kind}}, &SimulationProviderError{Role: "evaluator", Kind: kind, ProviderCalls: diagnostics.ProviderCalls, Retryable: false, Err: err}
 	}
-	return SimulationEvaluation{Correct: eval.Verdict == "correct" || eval.Verdict == "mostly_correct", Verdict: eval.Verdict, Meaning: eval.MeaningScore, Grammar: eval.GrammarScore, Naturalness: eval.NaturalnessScore, Pattern: eval.PatternScore, TargetPatternMatch: eval.TargetPatternMatch, TargetPatternScore: eval.TargetPatternScore, SuggestedAnswer: eval.SuggestedAnswer, MoreNaturalNeeded: eval.MoreNaturalNeeded, Alternative: eval.Alternative, Errors: eval.Errors}, nil
+	return SimulationEvaluation{Correct: eval.Verdict == "correct" || eval.Verdict == "mostly_correct", Verdict: eval.Verdict, Meaning: eval.MeaningScore, Grammar: eval.GrammarScore, Naturalness: eval.NaturalnessScore, Pattern: eval.PatternScore, TargetPatternMatch: eval.TargetPatternMatch, TargetPatternScore: eval.TargetPatternScore, SuggestedAnswer: eval.SuggestedAnswer, MoreNaturalNeeded: eval.MoreNaturalNeeded, Alternative: eval.Alternative, Errors: eval.Errors, Reliability: SimulationProviderReliability{ProviderCalls: diagnostics.ProviderCalls, Initial: diagnostics.ProviderCalls == 1, Retry: diagnostics.FreshRetry, Repair: diagnostics.RepairAttempted && !diagnostics.FreshRetry}}, nil
 }
 
 // LLMExerciseGenerator is intentionally independent from the production DB.
@@ -447,6 +524,7 @@ type SimulationAttempt struct {
 	NewSkill           bool                  `json:"new_skill"`
 	Reason             string                `json:"reason"`
 	ErrorKind          string                `json:"error_kind,omitempty"`
+	ChainOutcome       string                `json:"chain_outcome"`
 	TargetDifficulty   float64               `json:"target_difficulty"`
 	RealizedDifficulty float64               `json:"realized_difficulty"`
 	EffectiveAbility   float64               `json:"effective_ability"`
@@ -495,6 +573,26 @@ type SimulationMetrics struct {
 	MemoryIntervalBefore                  []float64          `json:"memory_interval_before,omitempty"`
 	MemoryIntervalAfter                   []float64          `json:"memory_interval_after,omitempty"`
 	SystemFailures                        int                `json:"system_failures"`
+	RequestedChains                       int                `json:"requested_chains"`
+	GeneratorAccepted                     int                `json:"generator_accepted"`
+	LearnerInitialSuccess                 int                `json:"learner_initial_success"`
+	LearnerRetrySuccess                   int                `json:"learner_retry_success"`
+	LearnerFinalFailure                   int                `json:"learner_final_failure"`
+	EvaluatorInitialSuccess               int                `json:"evaluator_initial_success"`
+	EvaluatorRepairSuccess                int                `json:"evaluator_repair_success"`
+	EvaluatorRetrySuccess                 int                `json:"evaluator_retry_success"`
+	EvaluatorFinalFailure                 int                `json:"evaluator_final_failure"`
+	CompleteChains                        int                `json:"complete_chains"`
+	LearnerInitialSuccessRate             float64            `json:"learner_initial_success_rate"`
+	LearnerRetryRate                      float64            `json:"learner_retry_rate"`
+	LearnerFinalFailureRate               float64            `json:"learner_final_failure_rate"`
+	EvaluatorInitialSuccessRate           float64            `json:"evaluator_initial_success_rate"`
+	EvaluatorRepairRate                   float64            `json:"evaluator_repair_rate"`
+	EvaluatorRetryRate                    float64            `json:"evaluator_retry_rate"`
+	EvaluatorFinalFailureRate             float64            `json:"evaluator_final_failure_rate"`
+	FullAICompletionRate                  float64            `json:"full_ai_completion_rate"`
+	LearnerFailureKinds                   map[string]int     `json:"learner_failure_kinds,omitempty"`
+	EvaluatorFailureKinds                 map[string]int     `json:"evaluator_failure_kinds,omitempty"`
 	ReviewDue                             int                `json:"review_due"`
 	ReviewServed                          int                `json:"review_served"`
 	ProbeCount                            int                `json:"probe_count"`
@@ -739,6 +837,8 @@ func (r *SimulationRunner) runAI(ctx context.Context, cfg SimulationConfig, p Le
 	byScene, goodScene := map[string]int{}, map[string]int{}
 	state := SimulatedLearnerState{PersonaID: p.ID, Ability: p.BaseAbility, PatternMastery: map[string]float64{}, SceneMastery: map[string]float64{}}
 	matchCounts := map[string]int{}
+	result.Metrics.LearnerFailureKinds = map[string]int{}
+	result.Metrics.EvaluatorFailureKinds = map[string]int{}
 	promptCounts := map[string]int{}
 	normalizedPromptCounts := map[string]int{}
 	recentAnswers := []string{}
@@ -758,6 +858,8 @@ func (r *SimulationRunner) runAI(ctx context.Context, cfg SimulationConfig, p Le
 	aiCfg := difficultyConfig(defaultAdaptiveConfig())
 	for i := range result.AttemptsTrace {
 		a := &result.AttemptsTrace[i]
+		result.Metrics.RequestedChains++
+		a.ChainOutcome = ChainGeneratorSystemFailure
 		ex := a.Exercise
 		if r.Generator != nil {
 			generated, generation, err := generateSimulationExercise(ctx, r.Generator, ex)
@@ -803,6 +905,7 @@ func (r *SimulationRunner) runAI(ctx context.Context, cfg SimulationConfig, p Le
 				ex = fallbackSimulationExercise(ex)
 				a.Exercise = ex
 			} else {
+				result.Metrics.GeneratorAccepted++
 				ex = generated
 				a.Exercise = generated
 			}
@@ -811,23 +914,59 @@ func (r *SimulationRunner) runAI(ctx context.Context, cfg SimulationConfig, p Le
 		promptCounts[ex.ChinesePrompt]++
 		normalizedPromptCounts[strings.ToLower(strings.Join(strings.Fields(ex.ChinesePrompt), " "))]++
 		answer, err := r.Learner.Answer(ctx, ex, state)
-		result.AI.LearnerCalls++
+		learnerCalls := answer.Reliability.ProviderCalls
+		if learnerCalls == 0 {
+			learnerCalls = 1
+		}
+		result.AI.LearnerCalls += learnerCalls
 		if err != nil {
-			a.ErrorKind, a.Verdict = classifySimulationFailure(err), "system_failure"
+			kind := learnerFailureKind(err)
+			a.ErrorKind, a.Verdict, a.ChainOutcome = kind, "system_failure", ChainLearnerSystemFailure
+			if result.Metrics.LearnerFailureKinds == nil {
+				result.Metrics.LearnerFailureKinds = map[string]int{}
+			}
+			result.Metrics.LearnerFailureKinds[kind]++
+			result.Metrics.LearnerFinalFailure++
 			continue
 		}
 		if strings.TrimSpace(answer.Text) == "" {
-			a.ErrorKind, a.Verdict = "empty_answer", "system_failure"
+			a.ErrorKind, a.Verdict, a.ChainOutcome = LearnerFailureProviderEmpty, "system_failure", ChainLearnerSystemFailure
+			result.Metrics.LearnerFailureKinds[LearnerFailureProviderEmpty]++
+			result.Metrics.LearnerFinalFailure++
 			continue
+		}
+		if answer.Reliability.Retry {
+			result.Metrics.LearnerRetrySuccess++
+		} else {
+			result.Metrics.LearnerInitialSuccess++
 		}
 		a.Answer = answer.Text
 		evaluation, err := r.Evaluator.Evaluate(ctx, ex, answer)
-		result.AI.EvaluatorCalls++
+		evaluatorCalls := evaluation.Reliability.ProviderCalls
+		if evaluatorCalls == 0 {
+			evaluatorCalls = 1
+		}
+		result.AI.EvaluatorCalls += evaluatorCalls
 		if err != nil {
-			a.ErrorKind, a.Verdict = classifySimulationFailure(err), "system_failure"
+			kind := evaluatorFailureKindFromError(err)
+			a.ErrorKind, a.Verdict, a.ChainOutcome = kind, "system_failure", ChainEvaluatorSystemFailure
+			if result.Metrics.EvaluatorFailureKinds == nil {
+				result.Metrics.EvaluatorFailureKinds = map[string]int{}
+			}
+			result.Metrics.EvaluatorFailureKinds[kind]++
+			result.Metrics.EvaluatorFinalFailure++
 			continue
 		}
+		if evaluation.Reliability.Repair {
+			result.Metrics.EvaluatorRepairSuccess++
+		} else if evaluation.Reliability.Retry {
+			result.Metrics.EvaluatorRetrySuccess++
+		} else {
+			result.Metrics.EvaluatorInitialSuccess++
+		}
 		valid++
+		a.ChainOutcome = ChainComplete
+		result.Metrics.CompleteChains++
 		a.Evaluation = evaluation
 		match := evaluation.TargetPatternMatch
 		if match == "" {
@@ -950,6 +1089,17 @@ func (r *SimulationRunner) runAI(ctx context.Context, cfg SimulationConfig, p Le
 		result.Metrics.GeneratorFallbackRate = float64(result.Metrics.GeneratorFallbackCount) / float64(cfg.Attempts)
 		result.Metrics.GeneratorFinalDeliveryRate = float64(result.Metrics.GeneratorFinalDeliveryCount) / float64(cfg.Attempts)
 	}
+	requested := float64(result.Metrics.RequestedChains)
+	if requested > 0 {
+		result.Metrics.LearnerInitialSuccessRate = float64(result.Metrics.LearnerInitialSuccess) / requested
+		result.Metrics.LearnerRetryRate = float64(result.Metrics.LearnerRetrySuccess) / requested
+		result.Metrics.LearnerFinalFailureRate = float64(result.Metrics.LearnerFinalFailure) / requested
+		result.Metrics.EvaluatorInitialSuccessRate = float64(result.Metrics.EvaluatorInitialSuccess) / requested
+		result.Metrics.EvaluatorRepairRate = float64(result.Metrics.EvaluatorRepairSuccess) / requested
+		result.Metrics.EvaluatorRetryRate = float64(result.Metrics.EvaluatorRetrySuccess) / requested
+		result.Metrics.EvaluatorFinalFailureRate = float64(result.Metrics.EvaluatorFinalFailure) / requested
+		result.Metrics.FullAICompletionRate = float64(result.Metrics.CompleteChains) / requested
+	}
 	if r.Reviewer != nil {
 		if _, err := r.Reviewer.Review(ctx, result.AttemptsTrace); err != nil {
 			result.HealthFlags = append(result.HealthFlags, "SIM_REVIEWER_FAILURE")
@@ -1017,6 +1167,157 @@ func classifySimulationFailure(err error) string {
 		return "provider_error"
 	default:
 		return "system_failure"
+	}
+}
+
+type SimulationProviderError struct {
+	Role          string
+	Kind          string
+	ProviderCalls int
+	Retryable     bool
+	Err           error
+}
+
+func (e *SimulationProviderError) Error() string {
+	if e == nil || e.Err == nil {
+		return e.Kind
+	}
+	return e.Err.Error()
+}
+func (e *SimulationProviderError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func classifyProviderFailure(err error, role string) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	var pe *ProviderError
+	if errors.As(err, &pe) {
+		switch pe.Category {
+		case "timeout":
+			return LearnerFailureProviderTimeout, true
+		case "provider_4xx", "provider_5xx", "provider_error":
+			if pe.HTTPStatus >= 400 && pe.HTTPStatus < 500 {
+				return LearnerFailureProviderHTTPError, false
+			}
+			return LearnerFailureProviderHTTPError, true
+		case "provider_empty":
+			return LearnerFailureProviderEmpty, true
+		case "reasoning_only":
+			return LearnerFailureReasoningOnly, true
+		case "adapter_extraction_empty":
+			return LearnerFailureAdapterExtraction, true
+		case "invalid_provider_envelope":
+			return LearnerFailureMalformedJSON, true
+		}
+	}
+	s := strings.ToLower(err.Error())
+	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(s, "timeout") || strings.Contains(s, "deadline") {
+		return LearnerFailureProviderTimeout, true
+	}
+	if strings.Contains(s, "empty") {
+		return LearnerFailureProviderEmpty, true
+	}
+	if strings.Contains(s, "reasoning") {
+		return LearnerFailureReasoningOnly, true
+	}
+	if strings.Contains(s, "500") || strings.Contains(s, "provider") {
+		return LearnerFailureProviderHTTPError, true
+	}
+	if role == "evaluator" {
+		return evaluatorFailureKind(EvaluationDiagnostics{ErrorCategory: "invalid_structured_output"}, err), false
+	}
+	return LearnerFailureUnknown, false
+}
+
+func evaluatorFailureKind(d EvaluationDiagnostics, err error) string {
+	switch d.ErrorCategory {
+	case "timeout":
+		return EvaluatorFailureProviderTimeout
+	case "provider_4xx", "provider_5xx", "provider_error":
+		return EvaluatorFailureProviderHTTPError
+	case "provider_empty":
+		return EvaluatorFailureProviderEmpty
+	case "reasoning_only":
+		return EvaluatorFailureReasoningOnly
+	case "adapter_extraction_empty":
+		return EvaluatorFailureAdapterExtraction
+	case "invalid_provider_envelope":
+		return EvaluatorFailureMalformedJSON
+	case "invalid_structured_output", "schema_validation":
+		return classifyEvaluatorSchemaError(d.SchemaError, err)
+	}
+	return classifyEvaluatorSchemaError("", err)
+}
+
+func learnerFailureKind(err error) string {
+	var spe *SimulationProviderError
+	if errors.As(err, &spe) && spe.Kind != "" {
+		return spe.Kind
+	}
+	var pe *ProviderError
+	if errors.As(err, &pe) {
+		kind, _ := classifyProviderFailure(err, "learner")
+		return kind
+	}
+	// Preserve the historical classification for non-provider fake adapters;
+	// real adapters always return SimulationProviderError above.
+	if classified := classifySimulationFailure(err); classified != "system_failure" {
+		return classified
+	}
+	kind, _ := classifyProviderFailure(err, "learner")
+	if kind != LearnerFailureUnknown {
+		return kind
+	}
+	return LearnerFailureUnknown
+}
+
+func evaluatorFailureKindFromError(err error) string {
+	var spe *SimulationProviderError
+	if errors.As(err, &spe) && spe.Kind != "" {
+		return spe.Kind
+	}
+	kind, _ := classifyProviderFailure(err, "evaluator")
+	return kind
+}
+
+func classifyEvaluatorSchemaError(diag string, err error) string {
+	s := strings.ToLower(diag + " " + errorString(err))
+	switch {
+	case strings.Contains(s, "invalid verdict"), strings.Contains(s, "unknown verdict"), strings.Contains(s, "invalid enum"), strings.Contains(s, "target_pattern_match"):
+		return EvaluatorFailureInvalidEnum
+	case strings.Contains(s, "missing required"), strings.Contains(s, "missing field"):
+		return EvaluatorFailureMissingRequired
+	case strings.Contains(s, "truncat"), strings.Contains(s, "no complete json"):
+		return EvaluatorFailureTruncatedResponse
+	case strings.Contains(s, "invalid json"):
+		return EvaluatorFailureMalformedJSON
+	case strings.Contains(s, "empty"):
+		return EvaluatorFailureProviderEmpty
+	default:
+		return EvaluatorFailureSchemaInvalid
+	}
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func retryableEvaluatorProviderCategory(category string) bool {
+	switch category {
+	case "timeout", "provider_5xx", "provider_error", "provider_empty", "reasoning_only", "adapter_extraction_empty", "invalid_provider_envelope":
+		return true
+	case "provider_4xx":
+		return false
+	default:
+		return false
 	}
 }
 

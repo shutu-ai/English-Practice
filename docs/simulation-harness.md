@@ -1,6 +1,6 @@
 # Simulation & Acceptance Harness
 
-V2.3.4 includes the V2.3.1 deterministic simulation layer for regression and a separately
+V2.3.5 includes the V2.3.1 deterministic simulation layer for regression and a separately
 defined AI learner adapter for manual acceptance. Simulation is not human
 real-use validation: it can expose selection, difficulty, memory, scene,
 transfer, repetition, and curriculum problems, but it cannot establish that a
@@ -65,6 +65,14 @@ spacing and streaks, weak-skill exposure, review/probe metrics, acquisition /
 retention / transfer trajectories, scene coverage/mastery, transfer events,
 skill unlock events, health flags, and the complete attempt trace when JSON is
 requested.
+
+V2.3.5 Full-AI reports additionally separate requested chains, generator
+acceptance, learner initial/retry/final-failure outcomes, evaluator
+initial/repair/retry/final-failure outcomes, complete chains, chain outcome,
+failure taxonomy, provider call counts, and full-chain completion rate. A
+provider failure is a system failure and is never counted as an incorrect
+learner answer. See [provider-reliability.md](provider-reliability.md) for the
+role contracts, bounded retry policy, and state mutation boundary.
 
 Generator reports additionally include the contract version, provider request
 count, initial provider success/failure, structural/semantic/adapter extraction

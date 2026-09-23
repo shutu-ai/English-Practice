@@ -378,6 +378,105 @@ func TestLLMLearnerAdapterSeparatesPromptAndHandlesFailures(t *testing.T) {
 	}
 }
 
+func TestLLMLearnerBoundedRetryPreservesPersonaAndDoesNotLeakAnswers(t *testing.T) {
+	client := &sequenceChatClient{
+		responses: []string{"", "I would call tomorrow."},
+	}
+	adapter := LLMLearnerSimulator{Client: client, MaxTokens: 64}
+	answer, err := adapter.Answer(context.Background(), SimulationExercise{ChinesePrompt: "请明天给客户打电话。", SceneID: "phone", DifficultyBand: "appropriate"}, SimulatedLearnerState{PersonaID: "stable-intermediate", HistorySummary: "previous answer"})
+	if err != nil || answer.Text != "I would call tomorrow." || !answer.Reliability.Retry || answer.Reliability.ProviderCalls != 2 {
+		t.Fatalf("learner retry did not recover: answer=%#v err=%v", answer, err)
+	}
+	if len(client.requests) != 2 || client.requests[0].Messages[1].Content != client.requests[1].Messages[1].Content {
+		t.Fatal("learner retry changed the exercise/persona context")
+	}
+	for _, req := range client.requests {
+		content := strings.ToLower(req.Messages[1].Content)
+		if strings.Contains(content, "reference answer") || strings.Contains(content, "correct answer") || strings.Contains(content, "evaluation") {
+			t.Fatalf("learner retry leaked evaluator information: %s", content)
+		}
+	}
+}
+
+func TestLLMLearnerFailureInjectionIsBoundedAndTyped(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "reasoning-only", err: &ProviderError{Category: "reasoning_only", Err: errors.New("reasoning only")}, want: LearnerFailureReasoningOnly},
+		{name: "timeout", err: context.DeadlineExceeded, want: LearnerFailureProviderTimeout},
+		{name: "http-500", err: &ProviderError{Category: "provider_5xx", HTTPStatus: 500, Err: errors.New("500")}, want: LearnerFailureProviderHTTPError},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &sequenceChatClient{responses: []string{"", "valid after retry"}, errors: []error{tc.err}}
+			answer, err := (LLMLearnerSimulator{Client: client, MaxTokens: 64}).Answer(context.Background(), SimulationExercise{ChinesePrompt: "练习", SceneID: "daily"}, SimulatedLearnerState{PersonaID: "beginner"})
+			if err != nil || answer.Text == "" || !answer.Reliability.Retry || len(client.requests) != 2 {
+				t.Fatalf("%s did not recover: answer=%#v err=%v calls=%d", tc.name, answer, err, len(client.requests))
+			}
+		})
+	}
+	client := &sequenceChatClient{errors: []error{errors.New("provider 500"), errors.New("provider 500")}}
+	_, err := (LLMLearnerSimulator{Client: client}).Answer(context.Background(), SimulationExercise{ChinesePrompt: "练习"}, SimulatedLearnerState{PersonaID: "beginner"})
+	var providerErr *SimulationProviderError
+	if err == nil || !errors.As(err, &providerErr) || providerErr.ProviderCalls != 2 || len(client.requests) != 2 {
+		t.Fatalf("learner retry budget was not bounded: err=%v calls=%d", err, len(client.requests))
+	}
+}
+
+func TestProductionEvaluatorRetriesRepairAndFreshFailureWithoutUnboundedCalls(t *testing.T) {
+	valid := validEvaluationJSON()
+	for _, tc := range []struct {
+		name       string
+		first      string
+		wantRepair bool
+		wantRetry  bool
+	}{
+		{name: "schema repair", first: `{"verdict":"correct"`, wantRepair: true},
+		{name: "reasoning-only fresh retry", first: `{"choices":[{"message":{"content":"","reasoning_content":"internal"},"finish_reason":"length"}]}`, wantRetry: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "application/json")
+				if calls == 1 && strings.HasPrefix(tc.first, "{") && strings.Contains(tc.first, "choices") {
+					_, _ = w.Write([]byte(tc.first))
+					return
+				}
+				content := tc.first
+				if calls > 1 {
+					content = valid
+				}
+				_, _ = fmt.Fprintf(w, `{"choices":[{"message":{"content":%q},"finish_reason":"stop"}]}`, content)
+			}))
+			defer server.Close()
+			provider := ProviderConfig{ID: "eval", Type: "openai-compatible", BaseURL: server.URL, Model: "mock", Timeout: 2, Enabled: true}
+			s := &Server{llm: &LLMRegistry{configs: map[string]ProviderConfig{"eval": provider}}}
+			result, err := (ProductionSimulationEvaluator{Server: s, Provider: "eval"}).Evaluate(context.Background(), SimulationExercise{ChinesePrompt: "练习", PatternID: "having-said-that"}, SimulatedAnswer{Text: "That said, we should wait."})
+			if err != nil || calls != 2 || result.Reliability.ProviderCalls != 2 || result.Reliability.Repair != tc.wantRepair || result.Reliability.Retry != tc.wantRetry {
+				t.Fatalf("unexpected evaluator recovery: result=%#v err=%v calls=%d", result, err, calls)
+			}
+		})
+	}
+
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"choices":[{"message":{"content":%q},"finish_reason":"stop"}]}`, `{"verdict":"not-a-verdict"}`)
+	}))
+	defer server.Close()
+	provider := ProviderConfig{ID: "eval", Type: "openai-compatible", BaseURL: server.URL, Model: "mock", Timeout: 2, Enabled: true}
+	s := &Server{llm: &LLMRegistry{configs: map[string]ProviderConfig{"eval": provider}}}
+	_, err := (ProductionSimulationEvaluator{Server: s, Provider: "eval"}).Evaluate(context.Background(), SimulationExercise{ChinesePrompt: "练习", PatternID: "having-said-that"}, SimulatedAnswer{Text: "That said, we should wait."})
+	var providerErr *SimulationProviderError
+	if err == nil || !errors.As(err, &providerErr) || providerErr.ProviderCalls != 3 || calls != 3 || providerErr.Kind != EvaluatorFailureInvalidEnum {
+		t.Fatalf("evaluator retry budget/classification failed: err=%v calls=%d", err, calls)
+	}
+}
+
 func TestFullAIAdaptersClassifyGeneratorAndEvaluatorTimeouts(t *testing.T) {
 	client := &recordingChatClient{err: context.DeadlineExceeded}
 	generator := LLMExerciseGenerator{Client: client}

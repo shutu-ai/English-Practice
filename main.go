@@ -1331,18 +1331,21 @@ const (
 )
 
 type EvaluationDiagnostics struct {
-	RequestID     string `json:"request_id"`
-	Provider      string `json:"provider"`
-	ProviderType  string `json:"provider_type"`
-	Model         string `json:"model"`
-	HTTPStatus    int    `json:"http_status,omitempty"`
-	LatencyMS     int64  `json:"latency_ms,omitempty"`
-	FailureStage  string `json:"failure_stage,omitempty"`
-	ErrorCategory string `json:"error_category,omitempty"`
-	SchemaError   string `json:"schema_error,omitempty"`
-	ResponseShape string `json:"response_shape,omitempty"`
-	RetryCount    int    `json:"retry_count"`
-	Success       bool   `json:"success"`
+	RequestID       string `json:"request_id"`
+	Provider        string `json:"provider"`
+	ProviderType    string `json:"provider_type"`
+	Model           string `json:"model"`
+	HTTPStatus      int    `json:"http_status,omitempty"`
+	LatencyMS       int64  `json:"latency_ms,omitempty"`
+	FailureStage    string `json:"failure_stage,omitempty"`
+	ErrorCategory   string `json:"error_category,omitempty"`
+	SchemaError     string `json:"schema_error,omitempty"`
+	ResponseShape   string `json:"response_shape,omitempty"`
+	RetryCount      int    `json:"retry_count"`
+	ProviderCalls   int    `json:"provider_calls"`
+	RepairAttempted bool   `json:"repair_attempted"`
+	FreshRetry      bool   `json:"fresh_retry"`
+	Success         bool   `json:"success"`
 }
 
 var evaluationErrorTypes = map[string]string{
@@ -2153,12 +2156,20 @@ func (s *Server) evaluateWithProvider(ctx context.Context, prompt, pattern, answ
 	baseMessages := []ChatMessage{{Role: "system", Content: "Evaluate an English learner answer. Return exactly one JSON object in the assistant content; do not include reasoning or prose. The object must have verdict (string), meaning_score (number), grammar_score (number), naturalness_score (number), pattern_score (number), target_pattern_match (string), target_pattern_score (number), errors (array), suggested_answer (string), explanation_zh (string), and may include more_natural_needed (boolean), more_natural (string), and alternative (string). verdict must be exactly one of: correct, mostly_correct, needs_improvement, incorrect. Scores must be numbers from 0 to 1. target_pattern_match must be exactly one of: exact, semantic_equivalent, partial, not_matched. Do not require literal use of the target phrase. Accept natural semantic equivalents when they genuinely demonstrate the same grammatical or discourse function. Do not accept a merely similar overall meaning if the target grammatical/discourse skill was not demonstrated. Decide in this order: meaning, communication intent, grammar, naturalness, target pattern function. Use errors:[] when there are no errors. Every error object must contain all three string fields: type, severity, and explanation. Each error type must be one of meaning, tense, article, preposition, word_order, modal, condition, agreement, word_choice, missing_information, extra_information, unnatural_expression, target_pattern_missing, register, other. Each severity must be minor, moderate, or major. The suggested_answer must preserve and demonstrate the target pattern. Do not rewrite an already correct and natural answer merely to produce a different sentence: set more_natural_needed=false and more_natural to an empty string. Only provide more_natural when it is a meaningful improvement; use alternative for a useful but not strictly better rephrasing."}, {Role: "user", Content: fmt.Sprintf("Prompt: %s\nTarget pattern expression: %s\nTarget pattern ID: %s\nAnswer: %s", prompt, targetPattern, pattern, answer)}}
 	jsonMode := true
 	const maxEvaluationAttempts = 3
+	lastInvalidResponse := ""
 	for attempt := 0; attempt < maxEvaluationAttempts; attempt++ {
 		messages := baseMessages
-		if attempt == 1 {
+		if attempt == 1 && lastInvalidResponse != "" {
+			diagnostics.RepairAttempted = true
 			messages = append(append([]ChatMessage{}, baseMessages...), ChatMessage{Role: "system", Content: "Repair instruction: Return only one valid JSON object matching the required schema. No markdown and no explanation outside JSON. Do not omit any required field. Every errors item must include type, severity, and explanation; use errors:[] if there are no errors."})
-		} else if attempt > 1 {
-			messages = append(append([]ChatMessage{}, baseMessages...), ChatMessage{Role: "system", Content: "Final repair instruction: Your previous response failed schema validation. Return exactly one complete JSON object now. Do not truncate it, wrap it in prose, or omit fields. Use numeric scores from 0 to 1 and errors:[] when there are no errors."})
+			invalid := lastInvalidResponse
+			if len(invalid) > 4000 {
+				invalid = invalid[:4000]
+			}
+			messages = append(messages, ChatMessage{Role: "user", Content: "Previous response violated the output contract. Do not preserve its verdict or scores. Repair only the format/schema. Invalid response:\n" + invalid})
+		} else if attempt > 0 {
+			diagnostics.FreshRetry = true
+			messages = append(append([]ChatMessage{}, baseMessages...), ChatMessage{Role: "system", Content: "Fresh retry: the previous provider call failed the output contract. Re-evaluate the original exercise and learner answer independently. Do not assume the previous verdict was correct. Return exactly one complete JSON object."})
 		}
 		if !jsonMode {
 			messages = append(messages, ChatMessage{Role: "system", Content: "This provider does not support native JSON response mode. Return only the JSON object in the assistant content."})
@@ -2174,6 +2185,7 @@ func (s *Server) evaluateWithProvider(ctx context.Context, prompt, pattern, answ
 			maxTokens *= 2
 		}
 		resp, err := s.llm.Client(c).Chat(ctx, ChatRequest{Messages: messages, Temperature: c.Temperature, MaxTokens: maxTokens, JSONMode: jsonMode, RequestID: diagnostics.RequestID})
+		diagnostics.ProviderCalls++
 		diagnostics.RetryCount = attempt
 		if err != nil {
 			var pe *ProviderError
@@ -2183,13 +2195,20 @@ func (s *Server) evaluateWithProvider(ctx context.Context, prompt, pattern, answ
 				diagnostics.HTTPStatus = pe.HTTPStatus
 				diagnostics.LatencyMS = pe.Latency.Milliseconds()
 				diagnostics.ResponseShape = pe.ResponseShape
-				if attempt == 0 && (pe.Category == "invalid_provider_envelope" || (jsonMode && (pe.HTTPStatus == http.StatusBadRequest || pe.HTTPStatus == http.StatusUnprocessableEntity))) {
+				fallbackJSONMode := attempt == 0 && (pe.Category == "invalid_provider_envelope" || (jsonMode && (pe.HTTPStatus == http.StatusBadRequest || pe.HTTPStatus == http.StatusUnprocessableEntity)))
+				if fallbackJSONMode {
 					jsonMode = false
+				}
+				if (fallbackJSONMode || retryableEvaluatorProviderCategory(pe.Category)) && attempt+1 < maxEvaluationAttempts {
 					continue
 				}
+				return Eval{}, c.ID, c.Model, diagnostics, err
 			} else {
 				diagnostics.FailureStage = "provider_http"
 				diagnostics.ErrorCategory = "provider_error"
+				if attempt+1 < maxEvaluationAttempts {
+					continue
+				}
 			}
 			return Eval{}, c.ID, c.Model, diagnostics, err
 		}
@@ -2205,6 +2224,7 @@ func (s *Server) evaluateWithProvider(ctx context.Context, prompt, pattern, answ
 		diagnostics.FailureStage = "schema_validation"
 		diagnostics.ErrorCategory = "invalid_structured_output"
 		diagnostics.SchemaError = parseErr.Error()
+		lastInvalidResponse = resp.Content
 		if attempt+1 >= maxEvaluationAttempts {
 			return Eval{}, c.ID, c.Model, diagnostics, parseErr
 		}
