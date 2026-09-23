@@ -365,7 +365,7 @@ func updateSceneMasteryTx(tx *sql.Tx, pattern, scene string, difficulty float64,
 		}
 		var eligible, observed, eligibleIntent, observedIntent int
 		_ = tx.QueryRow(`SELECT COUNT(*) FROM scene_pattern_map WHERE scene_id=?`, id).Scan(&eligible)
-		_ = tx.QueryRow(`SELECT COUNT(DISTINCT e.pattern_id) FROM attempts a JOIN exercises e ON e.id=a.exercise_id WHERE a.evaluation_status='validated' AND (e.scene_id=? OR e.subscene_id=?)`, id, id).Scan(&observed)
+		_ = tx.QueryRow(`SELECT COUNT(DISTINCT e.pattern_id) FROM attempts a JOIN exercises e ON e.id=a.exercise_id WHERE a.evaluation_status='validated' AND e.pattern_id<>'' AND (e.scene_id=? OR e.subscene_id=?)`, id, id).Scan(&observed)
 		_ = tx.QueryRow(`SELECT COUNT(*) FROM scene_intent_map WHERE scene_id=?`, id).Scan(&eligibleIntent)
 		_ = tx.QueryRow(`SELECT COUNT(DISTINCT e.intent_id) FROM attempts a JOIN exercises e ON e.id=a.exercise_id WHERE a.evaluation_status='validated' AND (e.scene_id=? OR e.subscene_id=?)`, id, id).Scan(&observedIntent)
 		if eligible > 0 {

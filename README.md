@@ -122,3 +122,10 @@ cost-guarded.
 ## Data and backup
 
 SQLite migrations and seed data run on first start. Back up the SQLite file while the app is stopped, for example `Copy-Item data/english-practice.db backups/english-practice-$(Get-Date -Format yyyyMMdd).db`.
+## V2.5 Practice Modes
+
+Practice defaults to Adaptive + Sentence Pattern and also supports Fixed D1–D8
+and Free Expression. Fixed mode keeps its level center stable while covering
+eligible patterns in a ±0.3 band. Free Expression evaluates meaning, grammar,
+naturalness, and intent without a target-pattern penalty or Sentence Pattern
+Mastery mutation. See [`docs/practice-modes.md`](docs/practice-modes.md).

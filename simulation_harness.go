@@ -179,6 +179,8 @@ type SimulationConfig struct {
 	EvaluatorReasoningMode, EvaluatorReasoningEffort                 string
 	GeneratorReasoningMode, GeneratorReasoningEffort                 string
 	Output, SimulationDBPath                                         string
+	DifficultyMode, TrainingFocus                                    string
+	FixedDifficulty                                                  float64
 	DryRun, AllowLarge, AttemptsExplicit                             bool
 }
 
@@ -192,6 +194,15 @@ func validateSimulationConfig(c SimulationConfig) error {
 	}
 	if c.Attempts <= 0 || c.SessionSize <= 0 {
 		return errors.New("attempts and session-size must be positive")
+	}
+	if c.DifficultyMode != "" || c.TrainingFocus != "" {
+		p, err := normalizePracticePreferences(PracticePreferences{DifficultyMode: c.DifficultyMode, FixedDifficulty: c.FixedDifficulty, TrainingFocus: c.TrainingFocus})
+		if err != nil {
+			return err
+		}
+		if p.DifficultyMode == DifficultyModeFixed && p.FixedDifficulty <= 0 {
+			return errors.New("fixed simulation requires fixed difficulty")
+		}
 	}
 	if c.MaxAttempts <= 0 {
 		c.MaxAttempts = 100
@@ -234,6 +245,10 @@ func validateSimulationConfig(c SimulationConfig) error {
 type SimulationExercise struct {
 	ID, ChinesePrompt, PatternID, Pattern, SceneID, SubsceneID, Intent, DifficultyBand string
 	Difficulty                                                                         float64
+	DifficultyMode                                                                     string   `json:"difficulty_mode,omitempty"`
+	FixedDifficulty                                                                    float64  `json:"fixed_difficulty,omitempty"`
+	TrainingFocus                                                                      string   `json:"training_focus,omitempty"`
+	TargetPatternPresent                                                               bool     `json:"target_pattern_present"`
 	ReferenceAnswers                                                                   []string `json:"reference_answers,omitempty"`
 }
 
@@ -242,18 +257,22 @@ type SimulationExercise struct {
 // content is accepted; the provider never becomes authoritative for these
 // fields.
 type GenerationSpec struct {
-	ExerciseID       string  `json:"exercise_id"`
-	SceneID          string  `json:"scene_id"`
-	SubsceneID       string  `json:"subscene_id,omitempty"`
-	Intent           string  `json:"intent"`
-	PatternID        string  `json:"pattern_id"`
-	Pattern          string  `json:"pattern"`
-	TargetDifficulty float64 `json:"target_difficulty"`
-	DifficultyBand   string  `json:"difficulty_band"`
+	ExerciseID           string  `json:"exercise_id"`
+	SceneID              string  `json:"scene_id"`
+	SubsceneID           string  `json:"subscene_id,omitempty"`
+	Intent               string  `json:"intent"`
+	PatternID            string  `json:"pattern_id"`
+	Pattern              string  `json:"pattern"`
+	TargetDifficulty     float64 `json:"target_difficulty"`
+	DifficultyBand       string  `json:"difficulty_band"`
+	DifficultyMode       string  `json:"difficulty_mode,omitempty"`
+	FixedDifficulty      float64 `json:"fixed_difficulty,omitempty"`
+	TrainingFocus        string  `json:"training_focus,omitempty"`
+	TargetPatternPresent bool    `json:"target_pattern_present"`
 }
 
 func generationSpecFromExercise(ex SimulationExercise) GenerationSpec {
-	return GenerationSpec{ExerciseID: ex.ID, SceneID: ex.SceneID, SubsceneID: ex.SubsceneID, Intent: ex.Intent, PatternID: ex.PatternID, Pattern: ex.Pattern, TargetDifficulty: ex.Difficulty, DifficultyBand: ex.DifficultyBand}
+	return GenerationSpec{ExerciseID: ex.ID, SceneID: ex.SceneID, SubsceneID: ex.SubsceneID, Intent: ex.Intent, PatternID: ex.PatternID, Pattern: ex.Pattern, TargetDifficulty: ex.Difficulty, DifficultyBand: ex.DifficultyBand, DifficultyMode: ex.DifficultyMode, FixedDifficulty: ex.FixedDifficulty, TrainingFocus: ex.TrainingFocus, TargetPatternPresent: ex.TargetPatternPresent}
 }
 
 type SimulatedLearnerState struct {
@@ -704,6 +723,19 @@ type SimulationMetrics struct {
 	AdaptiveNextExerciseReplans           int                `json:"adaptive_next_exercise_replans"`
 	AdaptiveReplanEligible                int                `json:"adaptive_replan_eligible"`
 	AdaptiveReplanMisses                  int                `json:"adaptive_replan_misses"`
+	FixedEligiblePatterns                 int                `json:"fixed_eligible_patterns"`
+	FixedPatternsNeverSelected            int                `json:"fixed_patterns_never_selected"`
+	FixedPatternStarvationRate            float64            `json:"fixed_pattern_starvation_rate"`
+	FixedLevelCoverage                    float64            `json:"fixed_level_coverage"`
+	FixedMasteryRate                      float64            `json:"fixed_mastery_rate"`
+	FixedMasteryCompleted                 bool               `json:"fixed_mastery_completed"`
+	FixedOutOfBandExercises               int                `json:"fixed_out_of_band_exercises"`
+	FixedOutOfBandRate                    float64            `json:"fixed_out_of_band_rate"`
+	FreeExercises                         int                `json:"free_exercises"`
+	FreeTargetPatternGeneratedCount       int                `json:"free_target_pattern_generated_count"`
+	FreeTargetPatternPenaltyCount         int                `json:"free_target_pattern_penalty_count"`
+	FreePatternMasteryMutations           int                `json:"free_pattern_mastery_mutations"`
+	ModeMatrixScenario                    string             `json:"mode_matrix_scenario,omitempty"`
 	TargetDifficultyTrajectory            []float64          `json:"target_difficulty_trajectory"`
 	RealizedDifficultyTrajectory          []float64          `json:"realized_difficulty_trajectory"`
 }
@@ -884,7 +916,11 @@ func (r *SimulationRunner) Run(ctx context.Context, cfg SimulationConfig) (Simul
 		result.CompletedAt = time.Now().UTC()
 		return result, nil
 	}
-	result = r.runDeterministic(ctx, cfg, persona, result)
+	if cfg.DifficultyMode != "" || cfg.TrainingFocus != "" {
+		result = r.runV25Deterministic(ctx, cfg, persona, result)
+	} else {
+		result = r.runDeterministic(ctx, cfg, persona, result)
+	}
 	result.CompletedAt = time.Now().UTC()
 	return result, nil
 }
@@ -894,7 +930,11 @@ func (r *SimulationRunner) runAI(ctx context.Context, cfg SimulationConfig, p Le
 	// subsequent exercise from the real evaluator outcome. This keeps the run
 	// reproducible while preserving the Full-AI chain: generator -> learner ->
 	// evaluator -> adaptive state -> next exercise.
-	result = r.runDeterministic(ctx, cfg, p, result)
+	if cfg.DifficultyMode != "" || cfg.TrainingFocus != "" {
+		result = r.runV25Deterministic(ctx, cfg, p, result)
+	} else {
+		result = r.runDeterministic(ctx, cfg, p, result)
+	}
 	// The deterministic trace is only a bounded scheduling preflight. Do not
 	// let its legacy provider label leak into a Full-AI report.
 	result.Provider, result.Model = "", ""
@@ -1858,6 +1898,7 @@ func writeSimulationReport(w io.Writer, result SimulationResult, jsonOutput bool
 func runSimulationCLI(args []string) error {
 	cfg := DefaultSimulationConfig()
 	preset := ""
+	scenario := ""
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		switch args[0] {
 		case "smoke":
@@ -1873,6 +1914,21 @@ func runSimulationCLI(args []string) error {
 			cfg.Mode = SimulationModeLLMLearner
 			cfg.Attempts = 20
 			cfg.AttemptsExplicit = true
+		case "adaptive-pattern", "adaptive-free", "fixed-d4-pattern", "fixed-d4-free":
+			preset = "v25-scenario"
+			scenario = args[0]
+			args = args[1:]
+			cfg.Attempts = 50
+			cfg.AttemptsExplicit = true
+			cfg.DifficultyMode = DifficultyModeAdaptive
+			cfg.TrainingFocus = TrainingFocusPattern
+			if strings.HasSuffix(scenario, "-free") {
+				cfg.TrainingFocus = TrainingFocusFree
+			}
+			if strings.HasPrefix(scenario, "fixed-") {
+				cfg.DifficultyMode = DifficultyModeFixed
+				cfg.FixedDifficulty = 4
+			}
 		}
 	}
 	fs := flag.NewFlagSet("simulate", flag.ContinueOnError)
@@ -1907,6 +1963,9 @@ func runSimulationCLI(args []string) error {
 	generatorReasoningMode := fs.String("generator-reasoning-mode", cfg.GeneratorReasoningMode, "inherit, enabled, or disabled")
 	generatorReasoningEffort := fs.String("generator-reasoning-effort", cfg.GeneratorReasoningEffort, "provider reasoning effort: none, low, high, or max")
 	simulationDB := fs.String("simulation-db", "", "dedicated simulation DB path")
+	difficultyMode := fs.String("difficulty-mode", cfg.DifficultyMode, "adaptive or fixed")
+	fixedDifficulty := fs.Float64("fixed-difficulty", cfg.FixedDifficulty, "fixed difficulty level 1-8")
+	trainingFocus := fs.String("training-focus", cfg.TrainingFocus, "pattern or free_expression")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1934,6 +1993,19 @@ func runSimulationCLI(args []string) error {
 	cfg.EvaluatorReasoningMode, cfg.EvaluatorReasoningEffort = *evaluatorReasoningMode, *evaluatorReasoningEffort
 	cfg.GeneratorReasoningMode, cfg.GeneratorReasoningEffort = *generatorReasoningMode, *generatorReasoningEffort
 	cfg.SimulationDBPath = *simulationDB
+	cfg.DifficultyMode, cfg.FixedDifficulty, cfg.TrainingFocus = *difficultyMode, *fixedDifficulty, *trainingFocus
+	if scenario != "" {
+		// Scenario presets are explicit and therefore take precedence over the
+		// flag defaults, while explicit non-default flags remain useful for the
+		// generic simulation command.
+		if *difficultyMode == DefaultSimulationConfig().DifficultyMode && *trainingFocus == DefaultSimulationConfig().TrainingFocus {
+			cfg.DifficultyMode = map[bool]string{true: DifficultyModeFixed, false: DifficultyModeAdaptive}[strings.HasPrefix(scenario, "fixed-")]
+			cfg.TrainingFocus = map[bool]string{true: TrainingFocusFree, false: TrainingFocusPattern}[strings.HasSuffix(scenario, "-free")]
+			if strings.HasPrefix(scenario, "fixed-") && *fixedDifficulty == DefaultSimulationConfig().FixedDifficulty {
+				cfg.FixedDifficulty = 4
+			}
+		}
+	}
 	if cfg.Mode == SimulationModeDeterministic {
 		cfg.Mode = SimulationModeAlgorithm
 	}

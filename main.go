@@ -21,7 +21,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 10
+const schemaVersion = 11
 
 type Server struct {
 	db     *sql.DB
@@ -425,6 +425,12 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "v25-live" {
+		if err := runV25LiveCLI(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "calibration-report" {
 		if err := runCalibrationReportCLI(); err != nil {
 			log.Fatal(err)
@@ -474,8 +480,8 @@ func migrate(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS communication_intents (id TEXT PRIMARY KEY, name TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS sentence_patterns (id TEXT PRIMARY KEY, pattern TEXT NOT NULL, intent_id TEXT NOT NULL, difficulty REAL NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}', catalog_difficulty REAL NOT NULL DEFAULT 0, FOREIGN KEY(intent_id) REFERENCES communication_intents(id))`,
 		`CREATE TABLE IF NOT EXISTS exercises (id TEXT PRIMARY KEY, chinese_prompt TEXT NOT NULL, pattern_id TEXT NOT NULL, scene_id TEXT NOT NULL, intent_id TEXT NOT NULL, difficulty REAL NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, FOREIGN KEY(pattern_id) REFERENCES sentence_patterns(id), FOREIGN KEY(scene_id) REFERENCES scenes(id))`,
-		`CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, mode TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, start_global_difficulty REAL NOT NULL DEFAULT 0, end_global_difficulty REAL NOT NULL DEFAULT 0, patterns_seen TEXT NOT NULL DEFAULT '{}', skills_seen TEXT NOT NULL DEFAULT '{}', reviews_served INTEGER NOT NULL DEFAULT 0, probes_served INTEGER NOT NULL DEFAULT 0, new_skills_served INTEGER NOT NULL DEFAULT 0)`,
-		`CREATE TABLE IF NOT EXISTS attempts (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, exercise_id TEXT NOT NULL, user_answer TEXT NOT NULL, submitted_at TEXT NOT NULL, provider TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', prompt_version TEXT NOT NULL DEFAULT '', evaluation_status TEXT NOT NULL, FOREIGN KEY(session_id) REFERENCES sessions(id), FOREIGN KEY(exercise_id) REFERENCES exercises(id))`,
+		`CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, mode TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, start_global_difficulty REAL NOT NULL DEFAULT 0, end_global_difficulty REAL NOT NULL DEFAULT 0, patterns_seen TEXT NOT NULL DEFAULT '{}', skills_seen TEXT NOT NULL DEFAULT '{}', reviews_served INTEGER NOT NULL DEFAULT 0, probes_served INTEGER NOT NULL DEFAULT 0, new_skills_served INTEGER NOT NULL DEFAULT 0, difficulty_mode TEXT NOT NULL DEFAULT 'adaptive', fixed_difficulty REAL NOT NULL DEFAULT 0, training_focus TEXT NOT NULL DEFAULT 'pattern')`,
+		`CREATE TABLE IF NOT EXISTS attempts (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, exercise_id TEXT NOT NULL, user_answer TEXT NOT NULL, submitted_at TEXT NOT NULL, provider TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', prompt_version TEXT NOT NULL DEFAULT '', evaluation_status TEXT NOT NULL, difficulty_mode TEXT NOT NULL DEFAULT 'adaptive', fixed_difficulty REAL NOT NULL DEFAULT 0, training_focus TEXT NOT NULL DEFAULT 'pattern', target_pattern_present INTEGER NOT NULL DEFAULT 1, FOREIGN KEY(session_id) REFERENCES sessions(id), FOREIGN KEY(exercise_id) REFERENCES exercises(id))`,
 		`CREATE TABLE IF NOT EXISTS evaluations (id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL UNIQUE, verdict TEXT NOT NULL, meaning_score REAL NOT NULL, grammar_score REAL NOT NULL, naturalness_score REAL NOT NULL, pattern_score REAL NOT NULL, target_pattern_match TEXT NOT NULL DEFAULT 'unknown', target_pattern_score REAL NOT NULL DEFAULT 0, errors_json TEXT NOT NULL, suggested_answer TEXT NOT NULL, more_natural TEXT NOT NULL DEFAULT '', more_natural_needed INTEGER NOT NULL DEFAULT 0, alternative TEXT NOT NULL DEFAULT '', explanation_zh TEXT NOT NULL, validated INTEGER NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY(attempt_id) REFERENCES attempts(id))`,
 		`CREATE TABLE IF NOT EXISTS pattern_mastery (pattern_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL, correct INTEGER NOT NULL, recent_accuracy REAL NOT NULL, long_term_accuracy REAL NOT NULL, consecutive_correct INTEGER NOT NULL, last_practiced TEXT, mastery REAL NOT NULL, FOREIGN KEY(pattern_id) REFERENCES sentence_patterns(id))`,
 		`CREATE TABLE IF NOT EXISTS scene_mastery (scene_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL, correct INTEGER NOT NULL, mastery REAL NOT NULL, last_practiced TEXT, FOREIGN KEY(scene_id) REFERENCES scenes(id))`,
@@ -573,6 +579,13 @@ func migrate(db *sql.DB) error {
 		{"sessions", "scene_id", "TEXT NOT NULL DEFAULT ''"},
 		{"sessions", "subscene_id", "TEXT NOT NULL DEFAULT ''"},
 		{"sessions", "practice_scope", "TEXT NOT NULL DEFAULT 'global'"},
+		{"sessions", "difficulty_mode", "TEXT NOT NULL DEFAULT 'adaptive'"},
+		{"sessions", "fixed_difficulty", "REAL NOT NULL DEFAULT 0"},
+		{"sessions", "training_focus", "TEXT NOT NULL DEFAULT 'pattern'"},
+		{"attempts", "difficulty_mode", "TEXT NOT NULL DEFAULT 'adaptive'"},
+		{"attempts", "fixed_difficulty", "REAL NOT NULL DEFAULT 0"},
+		{"attempts", "training_focus", "TEXT NOT NULL DEFAULT 'pattern'"},
+		{"attempts", "target_pattern_present", "INTEGER NOT NULL DEFAULT 1"},
 		{"scenes", "parent_id", "TEXT NOT NULL DEFAULT ''"},
 		{"scenes", "category", "TEXT NOT NULL DEFAULT ''"},
 		{"scenes", "difficulty_min", "REAL NOT NULL DEFAULT 1"},
@@ -605,6 +618,16 @@ func migrate(db *sql.DB) error {
 	}
 	if err := ensureColumn(db, "exercises", "decision_trace_json", "TEXT NOT NULL DEFAULT '{}' "); err != nil {
 		return err
+	}
+	for _, c := range []struct{ name, definition string }{
+		{"training_focus", "TEXT NOT NULL DEFAULT 'pattern'"},
+		{"difficulty_mode", "TEXT NOT NULL DEFAULT 'adaptive'"},
+		{"fixed_difficulty", "REAL NOT NULL DEFAULT 0"},
+		{"target_pattern_present", "INTEGER NOT NULL DEFAULT 1"},
+	} {
+		if err := ensureColumn(db, "exercises", c.name, c.definition); err != nil {
+			return err
+		}
 	}
 	for _, c := range []struct{ name, definition string }{
 		{"target_difficulty", "REAL NOT NULL DEFAULT 0"},
@@ -839,13 +862,45 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 	})
 	mux.HandleFunc("/api/practice/next", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Mode       string `json:"mode"`
-			SceneID    string `json:"scene_id"`
-			SubsceneID string `json:"subscene_id"`
-			SessionID  string `json:"session_id"`
+			Mode            string  `json:"mode"`
+			SceneID         string  `json:"scene_id"`
+			SubsceneID      string  `json:"subscene_id"`
+			SessionID       string  `json:"session_id"`
+			DifficultyMode  string  `json:"difficulty_mode"`
+			FixedDifficulty float64 `json:"fixed_difficulty"`
+			TrainingFocus   string  `json:"training_focus"`
 		}
 		if r.Method == http.MethodPost {
 			_ = decode(r, &req)
+		}
+		prefs, prefsErr := practicePreferencesFromSession(s.db, req.SessionID)
+		if prefsErr != nil && req.SessionID != "" {
+			jsonResp(w, 400, map[string]string{"error": "session not found"})
+			return
+		}
+		if req.DifficultyMode != "" || req.TrainingFocus != "" || req.FixedDifficulty != 0 {
+			requested := prefs
+			if req.DifficultyMode != "" {
+				requested.DifficultyMode = req.DifficultyMode
+			}
+			if req.TrainingFocus != "" {
+				requested.TrainingFocus = req.TrainingFocus
+			}
+			if req.FixedDifficulty != 0 {
+				requested.FixedDifficulty = req.FixedDifficulty
+			}
+			var err error
+			prefs, err = normalizePracticePreferences(requested)
+			if err != nil {
+				jsonResp(w, 400, map[string]string{"error": err.Error()})
+				return
+			}
+			if req.SessionID != "" {
+				if err := writePracticePreferences(s.db, req.SessionID, prefs); err != nil {
+					jsonResp(w, 500, map[string]string{"error": err.Error()})
+					return
+				}
+			}
 		}
 		var diff float64
 		_ = s.db.QueryRow("SELECT global_difficulty FROM user_profile WHERE id='default'").Scan(&diff)
@@ -859,15 +914,22 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 			jsonResp(w, 500, map[string]string{"error": err.Error()})
 			return
 		}
+		ex["difficulty_mode"] = prefs.DifficultyMode
+		ex["fixed_difficulty"] = prefs.FixedDifficulty
+		ex["training_focus"] = prefs.TrainingFocus
+		ex["target_pattern_enabled"] = prefs.TargetPatternEnabled
 		jsonResp(w, 200, ex)
 	})
 	mux.HandleFunc("/api/sessions", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			var req struct {
-				Mode          string `json:"mode"`
-				SceneID       string `json:"scene_id"`
-				SubsceneID    string `json:"subscene_id"`
-				PracticeScope string `json:"practice_scope"`
+				Mode            string  `json:"mode"`
+				SceneID         string  `json:"scene_id"`
+				SubsceneID      string  `json:"subscene_id"`
+				PracticeScope   string  `json:"practice_scope"`
+				DifficultyMode  string  `json:"difficulty_mode"`
+				FixedDifficulty float64 `json:"fixed_difficulty"`
+				TrainingFocus   string  `json:"training_focus"`
 			}
 			_ = decode(r, &req)
 			if req.Mode == "" {
@@ -881,20 +943,30 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 					req.PracticeScope = "scene"
 				}
 			}
+			prefs, prefsErr := normalizePracticePreferences(PracticePreferences{DifficultyMode: req.DifficultyMode, FixedDifficulty: req.FixedDifficulty, TrainingFocus: req.TrainingFocus})
+			if prefsErr != nil {
+				jsonResp(w, 400, map[string]string{"error": prefsErr.Error()})
+				return
+			}
 			session := id("session")
 			var difficulty float64
 			_ = s.db.QueryRow("SELECT global_difficulty FROM user_profile WHERE id='default'").Scan(&difficulty)
 			cfg := difficultyConfig(s.adaptiveConfig())
+			center := difficulty
 			lower, upper := sessionBand(difficulty, cfg)
-			_, err := s.db.Exec("INSERT INTO sessions(id,mode,started_at,start_global_difficulty,end_global_difficulty,session_difficulty_center,session_band_lower,session_band_upper,session_center_confidence,session_evidence_count,scene_id,subscene_id,practice_scope) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?)", session, req.Mode, time.Now().UTC().Format(time.RFC3339), difficulty, difficulty, difficulty, lower, upper, 0, req.SceneID, req.SubsceneID, req.PracticeScope)
+			if prefs.DifficultyMode == DifficultyModeFixed {
+				center = prefs.FixedDifficulty
+				lower, upper = fixedDifficultyBand(center, cfg)
+			}
+			_, err := s.db.Exec("INSERT INTO sessions(id,mode,started_at,end_global_difficulty,start_global_difficulty,session_difficulty_center,session_band_lower,session_band_upper,session_center_confidence,session_evidence_count,scene_id,subscene_id,practice_scope,difficulty_mode,fixed_difficulty,training_focus) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?)", session, req.Mode, time.Now().UTC().Format(time.RFC3339), difficulty, difficulty, center, lower, upper, 0, req.SceneID, req.SubsceneID, req.PracticeScope, prefs.DifficultyMode, prefs.FixedDifficulty, prefs.TrainingFocus)
 			if err != nil {
 				jsonResp(w, 500, map[string]string{"error": err.Error()})
 				return
 			}
-			jsonResp(w, 201, map[string]any{"session_id": session, "mode": req.Mode, "scene_id": req.SceneID, "subscene_id": req.SubsceneID, "practice_scope": req.PracticeScope})
+			jsonResp(w, 201, map[string]any{"session_id": session, "mode": req.Mode, "scene_id": req.SceneID, "subscene_id": req.SubsceneID, "practice_scope": req.PracticeScope, "difficulty_mode": prefs.DifficultyMode, "fixed_difficulty": prefs.FixedDifficulty, "training_focus": prefs.TrainingFocus, "target_pattern_enabled": prefs.TargetPatternEnabled, "session_center": center, "session_band_lower": lower, "session_band_upper": upper})
 			return
 		}
-		rows, err := s.db.Query("SELECT id,mode,started_at,ended_at,attempt_count,start_global_difficulty,end_global_difficulty,patterns_seen,skills_seen,reviews_served,probes_served,new_skills_served,session_difficulty_center,session_band_lower,session_band_upper,session_center_confidence,session_evidence_count,scene_id,subscene_id,practice_scope FROM sessions ORDER BY started_at DESC LIMIT 50")
+		rows, err := s.db.Query("SELECT id,mode,started_at,ended_at,attempt_count,start_global_difficulty,end_global_difficulty,patterns_seen,skills_seen,reviews_served,probes_served,new_skills_served,session_difficulty_center,session_band_lower,session_band_upper,session_center_confidence,session_evidence_count,scene_id,subscene_id,practice_scope,difficulty_mode,fixed_difficulty,training_focus FROM sessions ORDER BY started_at DESC LIMIT 50")
 		if err != nil {
 			jsonResp(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -902,13 +974,13 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		defer rows.Close()
 		out := []map[string]any{}
 		for rows.Next() {
-			var idv, mode, start, patterns, skills, sceneID, subsceneID, practiceScope string
+			var idv, mode, start, patterns, skills, sceneID, subsceneID, practiceScope, difficultyMode, trainingFocus string
 			var end sql.NullString
 			var count, reviews, probes, newSkills int
-			var startDifficulty, endDifficulty, center, lower, upper, confidence float64
+			var startDifficulty, endDifficulty, center, lower, upper, confidence, fixedDifficulty float64
 			var evidence int
-			_ = rows.Scan(&idv, &mode, &start, &end, &count, &startDifficulty, &endDifficulty, &patterns, &skills, &reviews, &probes, &newSkills, &center, &lower, &upper, &confidence, &evidence, &sceneID, &subsceneID, &practiceScope)
-			out = append(out, map[string]any{"session_id": idv, "mode": mode, "started_at": start, "ended_at": end.String, "attempt_count": count, "start_global_difficulty": startDifficulty, "end_global_difficulty": endDifficulty, "session_difficulty_center": center, "session_band_lower": lower, "session_band_upper": upper, "session_center_confidence": confidence, "session_evidence_count": evidence, "scene_id": sceneID, "subscene_id": subsceneID, "practice_scope": practiceScope, "patterns_seen": decodeJSONMap(patterns), "skills_seen": decodeJSONMap(skills), "reviews_served": reviews, "probes_served": probes, "new_skills_served": newSkills})
+			_ = rows.Scan(&idv, &mode, &start, &end, &count, &startDifficulty, &endDifficulty, &patterns, &skills, &reviews, &probes, &newSkills, &center, &lower, &upper, &confidence, &evidence, &sceneID, &subsceneID, &practiceScope, &difficultyMode, &fixedDifficulty, &trainingFocus)
+			out = append(out, map[string]any{"session_id": idv, "mode": mode, "started_at": start, "ended_at": end.String, "attempt_count": count, "start_global_difficulty": startDifficulty, "end_global_difficulty": endDifficulty, "session_difficulty_center": center, "session_band_lower": lower, "session_band_upper": upper, "session_center_confidence": confidence, "session_evidence_count": evidence, "scene_id": sceneID, "subscene_id": subsceneID, "practice_scope": practiceScope, "difficulty_mode": difficultyMode, "fixed_difficulty": fixedDifficulty, "training_focus": trainingFocus, "target_pattern_enabled": trainingFocus == TrainingFocusPattern, "patterns_seen": decodeJSONMap(patterns), "skills_seen": decodeJSONMap(skills), "reviews_served": reviews, "probes_served": probes, "new_skills_served": newSkills})
 		}
 		jsonResp(w, 200, out)
 	})
@@ -979,7 +1051,7 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		jsonResp(w, 200, result)
 	})
 	mux.HandleFunc("/api/history", func(w http.ResponseWriter, r *http.Request) {
-		query := `SELECT a.id,a.submitted_at,e.chinese_prompt,a.user_answer,COALESCE(v.verdict,''),COALESCE(v.suggested_answer,''),COALESCE(v.errors_json,'[]'),e.pattern_id,e.scene_id,COALESCE(e.subscene_id,''),a.intent_id,a.exercise_difficulty,COALESCE(NULLIF(a.target_difficulty,0),NULLIF(e.target_difficulty,0),e.difficulty),COALESCE(NULLIF(a.realized_difficulty,0),NULLIF(e.realized_difficulty,0),e.difficulty),COALESCE(NULLIF(a.difficulty_delta,0),ABS(COALESCE(NULLIF(e.realized_difficulty,0),e.difficulty)-COALESCE(NULLIF(e.target_difficulty,0),e.difficulty))),a.selection_reason,a.is_review,a.is_probe,a.generated_by,COALESCE(NULLIF(a.difficulty_validation_status,'unknown'),NULLIF(e.difficulty_validation_status,'unknown'),'unknown') FROM attempts a JOIN exercises e ON e.id=a.exercise_id LEFT JOIN evaluations v ON v.attempt_id=a.id`
+		query := `SELECT a.id,a.submitted_at,e.chinese_prompt,a.user_answer,COALESCE(v.verdict,''),COALESCE(v.suggested_answer,''),COALESCE(v.errors_json,'[]'),e.pattern_id,e.scene_id,COALESCE(e.subscene_id,''),a.intent_id,a.exercise_difficulty,COALESCE(NULLIF(a.target_difficulty,0),NULLIF(e.target_difficulty,0),e.difficulty),COALESCE(NULLIF(a.realized_difficulty,0),NULLIF(e.realized_difficulty,0),e.difficulty),COALESCE(NULLIF(a.difficulty_delta,0),ABS(COALESCE(NULLIF(e.realized_difficulty,0),e.difficulty)-COALESCE(NULLIF(e.target_difficulty,0),e.difficulty))),a.selection_reason,a.is_review,a.is_probe,a.generated_by,COALESCE(NULLIF(a.difficulty_validation_status,'unknown'),NULLIF(e.difficulty_validation_status,'unknown'),'unknown'),COALESCE(a.difficulty_mode,e.difficulty_mode,'adaptive'),COALESCE(a.fixed_difficulty,e.fixed_difficulty,0),COALESCE(a.training_focus,e.training_focus,'pattern'),COALESCE(a.target_pattern_present,e.target_pattern_present,1) FROM attempts a JOIN exercises e ON e.id=a.exercise_id LEFT JOIN evaluations v ON v.attempt_id=a.id`
 		args := []any{}
 		if sceneID := r.URL.Query().Get("scene_id"); sceneID != "" {
 			query += " WHERE e.scene_id=?"
@@ -1003,13 +1075,13 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		defer rows.Close()
 		out := []map[string]any{}
 		for rows.Next() {
-			var a, b, c, d, e, f, g, h, i, subscene, intent, reason, generated, validationStatus string
-			var difficulty, targetDifficulty, realizedDifficulty, difficultyDelta float64
-			var review, probe int
-			_ = rows.Scan(&a, &b, &c, &d, &e, &f, &g, &h, &i, &subscene, &intent, &difficulty, &targetDifficulty, &realizedDifficulty, &difficultyDelta, &reason, &review, &probe, &generated, &validationStatus)
+			var a, b, c, d, e, f, g, h, i, subscene, intent, reason, generated, validationStatus, difficultyMode, trainingFocus string
+			var difficulty, targetDifficulty, realizedDifficulty, difficultyDelta, fixedDifficulty float64
+			var review, probe, targetPatternPresent int
+			_ = rows.Scan(&a, &b, &c, &d, &e, &f, &g, &h, &i, &subscene, &intent, &difficulty, &targetDifficulty, &realizedDifficulty, &difficultyDelta, &reason, &review, &probe, &generated, &validationStatus, &difficultyMode, &fixedDifficulty, &trainingFocus, &targetPatternPresent)
 			var er any
 			_ = json.Unmarshal([]byte(g), &er)
-			out = append(out, map[string]any{"id": a, "submitted_at": b, "prompt": c, "answer": d, "verdict": e, "suggested_answer": f, "errors": er, "pattern_id": h, "scene_id": i, "subscene_id": subscene, "intent_id": intent, "difficulty": difficulty, "target_difficulty": targetDifficulty, "realized_difficulty": realizedDifficulty, "difficulty_delta": difficultyDelta, "difficulty_validation_status": validationStatus, "selection_reason": reason, "is_review": review == 1, "is_probe": probe == 1, "generated_by": generated})
+			out = append(out, map[string]any{"id": a, "submitted_at": b, "prompt": c, "answer": d, "verdict": e, "suggested_answer": f, "errors": er, "pattern_id": h, "scene_id": i, "subscene_id": subscene, "intent_id": intent, "difficulty": difficulty, "target_difficulty": targetDifficulty, "realized_difficulty": realizedDifficulty, "difficulty_delta": difficultyDelta, "difficulty_validation_status": validationStatus, "selection_reason": reason, "is_review": review == 1, "is_probe": probe == 1, "generated_by": generated, "difficulty_mode": difficultyMode, "fixed_difficulty": fixedDifficulty, "training_focus": trainingFocus, "target_pattern_present": targetPatternPresent == 1})
 		}
 		jsonResp(w, 200, out)
 	})
@@ -1030,6 +1102,19 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		jsonResp(w, 200, out)
 	})
 	mux.HandleFunc("/api/progress", func(w http.ResponseWriter, r *http.Request) { jsonResp(w, 200, s.progress()) })
+	mux.HandleFunc("/api/progress/difficulty/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			jsonResp(w, 405, nil)
+			return
+		}
+		value := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/progress/difficulty/"), "/")
+		level, err := strconv.ParseFloat(value, 64)
+		if err != nil || level < 1 || level > 8 {
+			jsonResp(w, 400, map[string]string{"error": "difficulty level must be between 1 and 8"})
+			return
+		}
+		jsonResp(w, 200, s.fixedDifficultyMastery(level))
+	})
 	mux.HandleFunc("/api/learner-state", func(w http.ResponseWriter, r *http.Request) {
 		rows, err := s.db.Query(`SELECT skill_id,pattern_id,mastery,acquisition,retention,transfer,attempt_count,success_count,failure_count,evidence_count,state_confidence,state,current_difficulty,max_success_difficulty,consecutive_success,consecutive_failure,next_review_at,context_diversity,memory_strength,stability,updated_at FROM learner_skill_state WHERE user_id='default' ORDER BY mastery`)
 		if err != nil {
@@ -1392,12 +1477,19 @@ type Eval struct {
 	ExplanationZH      string           `json:"explanation_zh"`
 }
 
+type EvaluationSpec struct {
+	TargetPatternMode string // required or none
+	TargetPattern     string
+	Intent            string
+}
+
 const (
 	TargetPatternExact              = "exact"
 	TargetPatternSemanticEquivalent = "semantic_equivalent"
 	TargetPatternPartial            = "partial"
 	TargetPatternNotMatched         = "not_matched"
 	TargetPatternUnknown            = "unknown"
+	TargetPatternNotApplicable      = TargetPatternNA
 )
 
 type EvaluationDiagnostics struct {
@@ -1503,7 +1595,7 @@ func normalizeSeverity(value string) (string, error) {
 func normalizeTargetPatternMatch(value string) (string, error) {
 	v := normalizeEnum(value)
 	switch v {
-	case TargetPatternExact, TargetPatternSemanticEquivalent, TargetPatternPartial, TargetPatternNotMatched, TargetPatternUnknown:
+	case TargetPatternExact, TargetPatternSemanticEquivalent, TargetPatternPartial, TargetPatternNotMatched, TargetPatternUnknown, TargetPatternNotApplicable:
 		return v, nil
 	case "semantic", "equivalent", "semantic_match":
 		return TargetPatternSemanticEquivalent, nil
@@ -1626,6 +1718,12 @@ func removeTargetPatternErrors(errorsList []map[string]any) []map[string]any {
 }
 
 func reconcileTargetPattern(e *Eval, pattern, targetPattern, answer string) {
+	if strings.TrimSpace(pattern) == "" && strings.TrimSpace(targetPattern) == "" {
+		e.TargetPatternMatch = TargetPatternNotApplicable
+		e.TargetPatternScore = 0
+		e.Errors = removeTargetPatternErrors(e.Errors)
+		return
+	}
 	match, score, supported := classifyTargetPattern(pattern, targetPattern, answer)
 	if !supported {
 		if e.TargetPatternMatch == "" {
@@ -1993,10 +2091,10 @@ func (s *Server) submitAttempt(ctx context.Context, session, exercise, answer st
 	if state, err := ensureSessionDifficulty(s.db, session, "adaptive"); err == nil && state.Center > 0 {
 		sessionDifficulty = state.Center
 	}
-	var prompt, pattern, scene string
+	var prompt, pattern, scene, intent string
 	var difficulty, target, realized float64
 	var validationStatus, validationReason, policyVersion string
-	if err := s.db.QueryRow("SELECT chinese_prompt,pattern_id,scene_id,difficulty,COALESCE(NULLIF(target_difficulty,0),difficulty),COALESCE(NULLIF(realized_difficulty,0),0),COALESCE(difficulty_validation_status,'unknown'),COALESCE(difficulty_validation_reason,''),COALESCE(difficulty_policy_version,'') FROM exercises WHERE id=?", exercise).Scan(&prompt, &pattern, &scene, &difficulty, &target, &realized, &validationStatus, &validationReason, &policyVersion); err != nil {
+	if err := s.db.QueryRow("SELECT chinese_prompt,pattern_id,scene_id,intent_id,difficulty,COALESCE(NULLIF(target_difficulty,0),difficulty),COALESCE(NULLIF(realized_difficulty,0),0),COALESCE(difficulty_validation_status,'unknown'),COALESCE(difficulty_validation_reason,''),COALESCE(difficulty_policy_version,'') FROM exercises WHERE id=?", exercise).Scan(&prompt, &pattern, &scene, &intent, &difficulty, &target, &realized, &validationStatus, &validationReason, &policyVersion); err != nil {
 		return nil, err
 	}
 	if target <= 0 {
@@ -2007,7 +2105,15 @@ func (s *Server) submitAttempt(ctx context.Context, session, exercise, answer st
 		return nil, err
 	}
 	_ = s.populateAttemptMetadata(attempt)
-	return s.evaluateAndPersist(ctx, attempt, prompt, pattern, scene, difficulty, answer)
+	spec := EvaluationSpec{TargetPatternMode: "required", TargetPattern: pattern, Intent: intent}
+	var focus string
+	var targetPresent int
+	_ = s.db.QueryRow(`SELECT COALESCE(training_focus,'pattern'),COALESCE(target_pattern_present,1) FROM attempts WHERE id=?`, attempt).Scan(&focus, &targetPresent)
+	if focus == TrainingFocusFree || targetPresent == 0 || pattern == "" {
+		spec.TargetPatternMode = "none"
+		spec.TargetPattern = ""
+	}
+	return s.evaluateAndPersistWithSpec(ctx, attempt, prompt, pattern, scene, difficulty, answer, spec)
 }
 
 func failureUserMessage(d EvaluationDiagnostics) string {
@@ -2028,7 +2134,11 @@ func failureUserMessage(d EvaluationDiagnostics) string {
 }
 
 func (s *Server) evaluateAndPersist(ctx context.Context, attempt, prompt, pattern, scene string, difficulty float64, answer string) (map[string]any, error) {
-	eval, provider, model, diagnostics, err := s.evaluate(ctx, prompt, pattern, answer)
+	return s.evaluateAndPersistWithSpec(ctx, attempt, prompt, pattern, scene, difficulty, answer, EvaluationSpec{TargetPatternMode: "required", TargetPattern: pattern})
+}
+
+func (s *Server) evaluateAndPersistWithSpec(ctx context.Context, attempt, prompt, pattern, scene string, difficulty float64, answer string, spec EvaluationSpec) (map[string]any, error) {
+	eval, provider, model, diagnostics, err := s.evaluateWithProviderOptionsSpec(ctx, prompt, pattern, answer, "", ProviderRequestOptions{}, spec)
 	if err != nil {
 		diagnostics.Success = false
 		diagJSON, _ := json.Marshal(diagnostics)
@@ -2071,10 +2181,17 @@ func (s *Server) saveValidatedAttempt(attempt, prompt, pattern, scene string, di
 	_ = tx.QueryRow(`SELECT global_difficulty FROM user_profile WHERE id='default'`).Scan(&difficultyBefore)
 	mode, selectionReason, _, isProbe, _, _, _ := adaptiveAttemptMetadata(tx, attempt)
 	_ = tx.QueryRow(`SELECT COALESCE(NULLIF(target_difficulty,0),difficulty),COALESCE(NULLIF(realized_difficulty,0),0) FROM exercises WHERE id=(SELECT exercise_id FROM attempts WHERE id=?)`, attempt).Scan(&targetDifficulty, &realizedDifficulty)
-	if err = updateMasteryTxMode(tx, pattern, scene, difficulty, eval, isProbe); err != nil {
-		return nil, err
-	}
-	if err = updateAdaptiveStateTx(tx, attempt, pattern, scene, difficulty, eval); err != nil {
+	var trainingFocus string
+	var targetPatternPresent int
+	_ = tx.QueryRow(`SELECT COALESCE(training_focus,'pattern'),COALESCE(target_pattern_present,1) FROM attempts WHERE id=?`, attempt).Scan(&trainingFocus, &targetPatternPresent)
+	if pattern != "" && trainingFocus != TrainingFocusFree && targetPatternPresent != 0 {
+		if err = updateMasteryTxMode(tx, pattern, scene, difficulty, eval, isProbe); err != nil {
+			return nil, err
+		}
+		if err = updateAdaptiveStateTx(tx, attempt, pattern, scene, difficulty, eval); err != nil {
+			return nil, err
+		}
+	} else if err = updateFreeExpressionStateTx(tx, attempt, scene, difficulty, eval); err != nil {
 		return nil, err
 	}
 	if err = updateProfileTx(tx, eval, difficulty); err != nil {
@@ -2187,15 +2304,20 @@ func (s *Server) loadEvaluation(attempt string) (Eval, error) {
 }
 
 func (s *Server) reevaluateAttempt(ctx context.Context, attempt string) (map[string]any, error) {
-	var prompt, pattern, scene, answer, status string
+	var prompt, pattern, scene, answer, status, intent, focus string
 	var difficulty float64
-	if err := s.db.QueryRow(`SELECT e.chinese_prompt,e.pattern_id,e.scene_id,e.difficulty,a.user_answer,a.evaluation_status FROM attempts a JOIN exercises e ON e.id=a.exercise_id WHERE a.id=?`, attempt).Scan(&prompt, &pattern, &scene, &difficulty, &answer, &status); err != nil {
+	var targetPresent int
+	if err := s.db.QueryRow(`SELECT e.chinese_prompt,e.pattern_id,e.scene_id,e.intent_id,e.difficulty,a.user_answer,a.evaluation_status,COALESCE(a.training_focus,'pattern'),COALESCE(a.target_pattern_present,1) FROM attempts a JOIN exercises e ON e.id=a.exercise_id WHERE a.id=?`, attempt).Scan(&prompt, &pattern, &scene, &intent, &difficulty, &answer, &status, &focus, &targetPresent); err != nil {
 		return nil, err
 	}
 	if status == "validated" {
 		return s.loadAttemptResult(attempt)
 	}
-	return s.evaluateAndPersist(ctx, attempt, prompt, pattern, scene, difficulty, answer)
+	spec := EvaluationSpec{TargetPatternMode: "required", TargetPattern: pattern, Intent: intent}
+	if focus == TrainingFocusFree || targetPresent == 0 || pattern == "" {
+		spec.TargetPatternMode, spec.TargetPattern = "none", ""
+	}
+	return s.evaluateAndPersistWithSpec(ctx, attempt, prompt, pattern, scene, difficulty, answer, spec)
 }
 
 func (s *Server) evaluate(ctx context.Context, prompt, pattern, answer string) (Eval, string, string, EvaluationDiagnostics, error) {
@@ -2207,6 +2329,13 @@ func (s *Server) evaluateWithProvider(ctx context.Context, prompt, pattern, answ
 }
 
 func (s *Server) evaluateWithProviderOptions(ctx context.Context, prompt, pattern, answer, providerID string, options ProviderRequestOptions) (Eval, string, string, EvaluationDiagnostics, error) {
+	return s.evaluateWithProviderOptionsSpec(ctx, prompt, pattern, answer, providerID, options, EvaluationSpec{TargetPatternMode: "required", TargetPattern: pattern})
+}
+
+func (s *Server) evaluateWithProviderOptionsSpec(ctx context.Context, prompt, pattern, answer, providerID string, options ProviderRequestOptions, spec EvaluationSpec) (Eval, string, string, EvaluationDiagnostics, error) {
+	if spec.TargetPatternMode == "" {
+		spec.TargetPatternMode = "required"
+	}
 	s.llm.mu.RLock()
 	var c ProviderConfig
 	for _, x := range s.llm.configs {
@@ -2223,17 +2352,33 @@ func (s *Server) evaluateWithProviderOptions(ctx context.Context, prompt, patter
 		diagnostics.Model = "heuristic"
 		diagnostics.Success = true
 		e := heuristicEval(prompt, pattern, answer)
-		reconcileTargetPattern(&e, pattern, pattern, answer)
+		if spec.TargetPatternMode == "none" {
+			reconcileTargetPattern(&e, "", "", answer)
+		} else {
+			reconcileTargetPattern(&e, pattern, pattern, answer)
+		}
 		return e, "local", "heuristic", diagnostics, nil
 	}
 	targetPattern := pattern
+	if spec.TargetPattern != "" {
+		targetPattern = spec.TargetPattern
+	}
 	if s.db != nil {
 		var label string
 		if s.db.QueryRow("SELECT pattern FROM sentence_patterns WHERE id=?", pattern).Scan(&label) == nil && strings.TrimSpace(label) != "" {
 			targetPattern = label
 		}
 	}
-	baseMessages := []ChatMessage{{Role: "system", Content: "Evaluate an English learner answer. You may reason internally, but after reasoning always return the final evaluation as one complete JSON object in the assistant's final content. Never leave final content empty and never return reasoning as the evaluation. Do not include prose or markdown outside JSON. The object must have verdict (string), meaning_score (number), grammar_score (number), naturalness_score (number), pattern_score (number), target_pattern_match (string), target_pattern_score (number), errors (array), suggested_answer (string), explanation_zh (string), and may include more_natural_needed (boolean), more_natural (string), and alternative (string). verdict must be exactly one of: correct, mostly_correct, needs_improvement, incorrect. Scores must be numbers from 0 to 1. target_pattern_match must be exactly one of: exact, semantic_equivalent, partial, not_matched. Do not require literal use of the target phrase. Accept natural semantic equivalents when they genuinely demonstrate the same grammatical or discourse function. Do not accept a merely similar overall meaning if the target grammatical/discourse skill was not demonstrated. Decide in this order: meaning, communication intent, grammar, naturalness, target pattern function. Use errors:[] when there are no errors. Every error object must contain all three string fields: type, severity, and explanation. Each error type must be one of meaning, tense, article, preposition, word_order, modal, condition, agreement, word_choice, missing_information, extra_information, unnatural_expression, target_pattern_missing, register, other. Each severity must be minor, moderate, or major. The suggested_answer must preserve and demonstrate the target pattern. Do not rewrite an already correct and natural answer merely to produce a different sentence: set more_natural_needed=false and more_natural to an empty string. Only provide more_natural when it is a meaningful improvement; use alternative for a useful but not strictly better rephrasing."}, {Role: "user", Content: fmt.Sprintf("Original evaluation context\nPrompt: %s\nTarget pattern expression: %s\nTarget pattern ID: %s\nLearner answer: %s", prompt, targetPattern, pattern, answer)}}
+	systemPrompt := "Evaluate an English learner answer. You may reason internally, but after reasoning always return the final evaluation as one complete JSON object in the assistant's final content. Never leave final content empty and never return reasoning as the evaluation. Do not include prose or markdown outside JSON. The object must have verdict, meaning_score, grammar_score, naturalness_score, pattern_score, target_pattern_match, target_pattern_score, errors, suggested_answer, and explanation_zh. verdict must be exactly one of: correct, mostly_correct, needs_improvement, incorrect. Scores must be numbers from 0 to 1. Use errors:[] when there are no errors. Every errors item must contain type, severity, and explanation. Do not rewrite an already correct and natural answer merely to produce a different sentence."
+	userPrompt := fmt.Sprintf("Original evaluation context\nPrompt: %s\nLearner answer: %s", prompt, answer)
+	if spec.TargetPatternMode == "none" {
+		systemPrompt += " There is no required target sentence pattern. Evaluate meaning accuracy, communication intent fulfillment, grammar, naturalness, and appropriateness. Do not penalize a valid answer for choosing a different structure. Set target_pattern_match to not_applicable and target_pattern_score to 0. Do not add target_pattern_missing errors."
+		userPrompt = fmt.Sprintf("Original evaluation context\nPrompt: %s\nCommunication intent: %s\nLearner answer: %s", prompt, spec.Intent, answer)
+	} else {
+		systemPrompt += " Evaluate the target sentence pattern after meaning, intent, grammar, and naturalness. Do not require literal use of the target phrase; accept genuine semantic equivalents. target_pattern_match must be one of exact, semantic_equivalent, partial, not_matched. The suggested_answer should demonstrate the target pattern."
+		userPrompt = fmt.Sprintf("Original evaluation context\nPrompt: %s\nTarget pattern expression: %s\nTarget pattern ID: %s\nLearner answer: %s", prompt, targetPattern, pattern, answer)
+	}
+	baseMessages := []ChatMessage{{Role: "system", Content: systemPrompt}, {Role: "user", Content: userPrompt}}
 	jsonMode := true
 	const maxEvaluationAttempts = 3
 	lastInvalidResponse := ""
@@ -2310,7 +2455,11 @@ func (s *Server) evaluateWithProviderOptions(ctx context.Context, prompt, patter
 		diagnostics.ContentBytes = len(resp.Content)
 		ev, parseErr := normalizeEvalContent(resp.Content)
 		if parseErr == nil {
-			reconcileTargetPattern(&ev, pattern, targetPattern, answer)
+			if spec.TargetPatternMode == "none" {
+				reconcileTargetPattern(&ev, "", "", answer)
+			} else {
+				reconcileTargetPattern(&ev, pattern, targetPattern, answer)
+			}
 			diagnostics.Success = true
 			return ev, c.ID, c.Model, diagnostics, nil
 		}

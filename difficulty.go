@@ -89,6 +89,9 @@ func difficultyConfig(cfg AdaptiveConfig) AdaptiveConfig {
 	if cfg.MinimumProductiveChallenge <= 0 {
 		cfg.MinimumProductiveChallenge = .35
 	}
+	if cfg.FixedDifficultyBand <= 0 {
+		cfg.FixedDifficultyBand = .30
+	}
 	return cfg
 }
 
@@ -220,7 +223,7 @@ func recentPerformanceTx(tx *sql.Tx, where string, args []any, limit int) ([]flo
 	if limit <= 0 {
 		limit = 10
 	}
-	query := `SELECT v.meaning_score,v.grammar_score,v.naturalness_score,v.pattern_score,v.verdict FROM attempts a JOIN evaluations v ON v.attempt_id=a.id WHERE a.evaluation_status='validated' AND a.is_probe=0`
+	query := `SELECT v.meaning_score,v.grammar_score,v.naturalness_score,v.pattern_score,v.verdict,COALESCE(a.training_focus,'pattern') FROM attempts a JOIN evaluations v ON v.attempt_id=a.id WHERE a.evaluation_status='validated' AND a.is_probe=0`
 	if strings.TrimSpace(where) != "" {
 		query += " AND " + where
 	}
@@ -234,12 +237,14 @@ func recentPerformanceTx(tx *sql.Tx, where string, args []any, limit int) ([]flo
 	var out []float64
 	for rows.Next() {
 		var meaning, grammar, naturalness, pattern float64
-		var verdict string
-		if err := rows.Scan(&meaning, &grammar, &naturalness, &pattern, &verdict); err != nil {
+		var verdict, focus string
+		if err := rows.Scan(&meaning, &grammar, &naturalness, &pattern, &verdict, &focus); err != nil {
 			return nil, err
 		}
 		if meaning == 0 && grammar == 0 && naturalness == 0 && pattern == 0 {
 			out = append(out, scoreFromVerdict(verdict))
+		} else if focus == TrainingFocusFree {
+			out = append(out, clamp(.40*meaning+.35*grammar+.25*naturalness, 0, 1))
 		} else {
 			out = append(out, scoreFromEval(meaning, grammar, naturalness, pattern))
 		}
@@ -324,6 +329,14 @@ func updateSessionCenterTx(tx *sql.Tx, sessionID string, cfg AdaptiveConfig) (se
 	}
 	if err != nil {
 		return state, "", err
+	}
+	var difficultyMode string
+	if err := tx.QueryRow(`SELECT COALESCE(difficulty_mode,'adaptive') FROM sessions WHERE id=?`, sessionID).Scan(&difficultyMode); err == nil && difficultyMode == DifficultyModeFixed {
+		// Fixed practice may still update learner ability and evidence, but the
+		// session center is user-owned and must not move after successes/failures.
+		state.Lower, state.Upper = fixedDifficultyBand(state.Center, cfg)
+		_, updateErr := tx.Exec(`UPDATE sessions SET session_band_lower=?,session_band_upper=? WHERE id=?`, state.Lower, state.Upper, sessionID)
+		return state, "fixed_difficulty_hold", updateErr
 	}
 	values, err := recentPerformanceTx(tx, "a.session_id=?", []any{sessionID}, difficultyConfig(cfg).RecentWindowSize)
 	if err != nil {
