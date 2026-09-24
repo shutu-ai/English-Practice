@@ -1667,7 +1667,9 @@ func normalizeErrorType(value string) (string, error) {
 		v = "meaning"
 	case "irrelevant_content", "irrelevant_response", "task_completion", "task_fulfillment", "task_relevance", "task_response", "communication_intent", "communication_intent_not_fulfilled":
 		v = "meaning"
-	case "content", "content_error", "pragmatics":
+	case "off_topic":
+		v = "meaning"
+	case "content", "content_error", "pragmatics", "context", "contextual":
 		v = "other"
 	case "tense_error", "verb_tense":
 		v = "tense"
