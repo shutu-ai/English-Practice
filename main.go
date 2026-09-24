@@ -1690,7 +1690,7 @@ func normalizeErrorType(value string) (string, error) {
 		v = "word_choice"
 	case "grammar", "grammar_error", "punctuation", "punctuation_error", "capitalization", "capitalization_error":
 		v = "other"
-	case "fluency", "fluency_error", "naturalness_error":
+	case "fluency", "fluency_error", "naturalness", "naturalness_error":
 		v = "unnatural_expression"
 	case "unnatural", "unnatural_error":
 		v = "unnatural_expression"

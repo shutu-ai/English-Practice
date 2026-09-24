@@ -51,10 +51,12 @@ func (c limitedLLMClient) Chat(ctx context.Context, request ChatRequest) (*ChatR
 }
 
 type v26LiveSample struct {
-	Scenario, ExerciseID, Prompt, Pattern, Answer, Alternative, Verdict string
-	Level                                                               int
-	Difficulty                                                          float64
-	TargetPatternPresent, AlternativeAccepted                           bool
+	Scenario, ExerciseID, Prompt, Pattern, Answer, Alternative, Verdict           string
+	AlternativeVerdict, AlternativeErrorCategory, AlternativeSchemaError          string
+	Level                                                                         int
+	Difficulty                                                                    float64
+	AlternativeMeaningScore, AlternativeGrammarScore, AlternativeNaturalnessScore float64
+	TargetPatternPresent, AlternativeTested, AlternativeAccepted                  bool
 }
 
 type v26LiveScenario struct {
@@ -186,22 +188,47 @@ func runV26LiveCLI(args []string) error {
 			}
 			altCount++
 			providerCallsBefore := v26AllowedProviderCalls(s)
-			eval, _, _, _, evalErr := s.evaluateWithProviderOptionsSpec(ctx, sample.Prompt, "", sample.Alternative, "", ProviderRequestOptions{}, EvaluationSpec{TargetPatternMode: "none"})
+			eval, _, _, diagnostics, evalErr := s.evaluateWithProviderOptionsSpec(ctx, sample.Prompt, "", sample.Alternative, "", ProviderRequestOptions{}, EvaluationSpec{TargetPatternMode: "none"})
 			sc.EvaluatorCalls += v26AllowedProviderCalls(s) - providerCallsBefore
 			sc.AlternativePairs++
+			sample.AlternativeTested = true
 			if evalErr != nil {
 				sc.AlternativeRejected++
+				sample.AlternativeErrorCategory = diagnostics.ErrorCategory
+				sample.AlternativeSchemaError = diagnostics.SchemaError
+				if diagnostics.ErrorCategory != "" {
+					if sc.EvaluatorFailureKinds == nil {
+						sc.EvaluatorFailureKinds = map[string]int{}
+					}
+					sc.EvaluatorFailureKinds[diagnostics.ErrorCategory]++
+				}
+				if diagnostics.SchemaError != "" {
+					if len(sample.AlternativeSchemaError) > 120 {
+						sample.AlternativeSchemaError = sample.AlternativeSchemaError[:120]
+					}
+					if sc.EvaluatorSchemaErrors == nil {
+						sc.EvaluatorSchemaErrors = map[string]int{}
+					}
+					sc.EvaluatorSchemaErrors[sample.AlternativeSchemaError]++
+				}
 				continue
 			}
+			sample.AlternativeVerdict = eval.Verdict
+			sample.AlternativeMeaningScore = eval.MeaningScore
+			sample.AlternativeGrammarScore = eval.GrammarScore
+			sample.AlternativeNaturalnessScore = eval.NaturalnessScore
 			if eval.Verdict == "correct" || eval.Verdict == "mostly_correct" {
 				sc.AlternativeAccepted++
+				sample.AlternativeAccepted = true
 			} else {
 				sc.AlternativeRejected++
 			}
 		}
 	}
-	if altCount < altPairs {
-		report.HealthFlags = append(report.HealthFlags, fmt.Sprintf("only %d of %d generator-provided alternative pairs available", altCount, altPairs))
+	acceptedAlternatives := sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.AlternativeAccepted })
+	rejectedAlternatives := sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.AlternativeRejected })
+	if !v26AlternativeAcceptancePassed(altCount, altPairs, acceptedAlternatives, rejectedAlternatives) {
+		report.HealthFlags = append(report.HealthFlags, fmt.Sprintf("alternative answer gate failed: %d/%d pairs available, %d accepted, %d rejected", altCount, altPairs, acceptedAlternatives, rejectedAlternatives))
 	}
 	after, err := v241DatabaseSnapshot()
 	if err != nil {
@@ -391,6 +418,10 @@ func v26LiveScenarioRun(ctx context.Context, s *Server, name, difficultyMode, fo
 	return out, nil
 }
 
+func v26AlternativeAcceptancePassed(available, required, accepted, rejected int) bool {
+	return available >= required && accepted >= required && rejected == 0
+}
+
 func v26AllowedProviderCalls(s *Server) int {
 	if s == nil || s.llm == nil || s.llm.callLimiter == nil {
 		return 0
@@ -437,6 +468,15 @@ func writeV26LiveReport(jsonPath, mdPath string, report v26LiveReport) error {
 	b.WriteString("## Live Mode Results\n\n| Scenario | Requested | Generated | Initial success | Retries | Fallback | Evaluated | Evaluator calls | Eval failures | Curriculum violations | Out of level | Out of band | Pattern leakage | Mastery mutation | Generator failure kinds | Evaluator failure kinds | Schema errors |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |\n")
 	for _, s := range report.Scenarios {
 		fmt.Fprintf(&b, "| %s | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %v | %v | %v |\n", s.DifficultyMode+" + "+s.TrainingFocus, s.Requested, s.Generated, s.GeneratorInitialSuccesses, s.GeneratorRetries, s.GenerationFallbacks, s.Evaluated, s.EvaluatorCalls, s.EvaluatorFailures, s.CurriculumViolations, s.OutOfLevel, s.OutOfBand, s.PatternPenalty, s.PatternMasteryMutations, s.GeneratorFailureKinds, s.EvaluatorFailureKinds, s.EvaluatorSchemaErrors)
+	}
+	b.WriteString("\n## Alternative Answer Evaluations\n\n| Scenario | Accepted | Verdict | Meaning | Grammar | Naturalness | Error category | Schema error |\n| --- | --- | --- | ---: | ---: | ---: | --- | --- |\n")
+	for _, s := range report.Scenarios {
+		for _, sample := range s.Samples {
+			if !sample.AlternativeTested {
+				continue
+			}
+			fmt.Fprintf(&b, "| %s | %t | %s | %.2f | %.2f | %.2f | %s | %s |\n", sample.Scenario, sample.AlternativeAccepted, sample.AlternativeVerdict, sample.AlternativeMeaningScore, sample.AlternativeGrammarScore, sample.AlternativeNaturalnessScore, sample.AlternativeErrorCategory, sample.AlternativeSchemaError)
+		}
 	}
 	fmt.Fprintf(&b, "\nD1 advanced leakage: %d\n\nD1 Would-you-mind leakage: %d\n\nAlternative answer pairs available: %d; accepted: %d; rejected: %d\n\n", sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.D1AdvancedLeakage }), sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.D1WouldYouMindLeakage }), sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.AlternativePairs }), sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.AlternativeAccepted }), sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.AlternativeRejected }))
 	b.WriteString("Production DB snapshot before / after:\n\n| Table | Before | After |\n| --- | ---: | ---: |\n")
