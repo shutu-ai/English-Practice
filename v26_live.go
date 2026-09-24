@@ -198,7 +198,8 @@ func runV26LiveCLI(args []string) error {
 				eval, _, _, diagnostics, evalErr = s.evaluateWithProviderOptionsSpec(ctx, sample.Prompt, "", sample.Alternative, "", ProviderRequestOptions{}, EvaluationSpec{TargetPatternMode: "none"})
 				sc.EvaluatorCalls += v26AllowedProviderCalls(s) - providerCallsBefore
 				sc.EvaluatorRetries += diagnostics.RetryCount
-				if evalErr == nil || !retryableEvaluatorProviderCategory(diagnostics.ErrorCategory) || retry == 1 {
+				accepted := evalErr == nil && (eval.Verdict == "correct" || eval.Verdict == "mostly_correct")
+				if accepted || retry == 1 || (evalErr != nil && !retryableEvaluatorProviderCategory(diagnostics.ErrorCategory)) {
 					break
 				}
 				sample.AlternativeRetryCount++
