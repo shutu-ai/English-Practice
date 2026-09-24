@@ -83,7 +83,7 @@ func TestV26LiveReportIncludesCallsFailuresAndDBSnapshots(t *testing.T) {
 		t.Fatal(err)
 	}
 	markdown := string(data)
-	for _, expected := range []string{"Provider calls: 3; denied at cap: 1", "invalid_structured_output", "missing required field verdict", "| attempts | 7 | 7 |", "## Alternative Answer Evaluations", "fixed-free | false | incorrect"} {
+	for _, expected := range []string{"Provider calls: 3; denied at cap: 1", "invalid_structured_output", "missing required field verdict", "| attempts | 7 | 7 |", "## Alternative Answer Evaluations", "fixed-free | false | 0 | incorrect"} {
 		if !strings.Contains(markdown, expected) {
 			t.Errorf("report missing %q", expected)
 		}

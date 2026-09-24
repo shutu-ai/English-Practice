@@ -56,6 +56,7 @@ type v26LiveSample struct {
 	Level                                                                         int
 	Difficulty                                                                    float64
 	AlternativeMeaningScore, AlternativeGrammarScore, AlternativeNaturalnessScore float64
+	AlternativeRetryCount                                                         int
 	TargetPatternPresent, AlternativeTested, AlternativeAccepted                  bool
 }
 
@@ -64,7 +65,8 @@ type v26LiveScenario struct {
 	FixedLevel                                                     int
 	Requested, Generated, Evaluated, GenerationFallbacks           int
 	GeneratorInitialSuccesses, GeneratorRetries, GeneratorCalls    int
-	EvaluatorFailures, EvaluatorCalls, OutOfLevel, OutOfBand       int
+	EvaluatorFailures, EvaluatorCalls, EvaluatorRetries            int
+	OutOfLevel, OutOfBand                                          int
 	TargetPatternPresent, PatternPenalty, PatternMasteryMutations  int
 	CurriculumViolations, D1AdvancedLeakage, D1WouldYouMindLeakage int
 	AlternativePairs, AlternativeAccepted, AlternativeRejected     int
@@ -187,9 +189,21 @@ func runV26LiveCLI(args []string) error {
 				continue
 			}
 			altCount++
-			providerCallsBefore := v26AllowedProviderCalls(s)
-			eval, _, _, diagnostics, evalErr := s.evaluateWithProviderOptionsSpec(ctx, sample.Prompt, "", sample.Alternative, "", ProviderRequestOptions{}, EvaluationSpec{TargetPatternMode: "none"})
-			sc.EvaluatorCalls += v26AllowedProviderCalls(s) - providerCallsBefore
+			var providerCallsBefore int
+			var eval Eval
+			var diagnostics EvaluationDiagnostics
+			var evalErr error
+			for retry := 0; retry <= 1; retry++ {
+				providerCallsBefore = v26AllowedProviderCalls(s)
+				eval, _, _, diagnostics, evalErr = s.evaluateWithProviderOptionsSpec(ctx, sample.Prompt, "", sample.Alternative, "", ProviderRequestOptions{}, EvaluationSpec{TargetPatternMode: "none"})
+				sc.EvaluatorCalls += v26AllowedProviderCalls(s) - providerCallsBefore
+				sc.EvaluatorRetries += diagnostics.RetryCount
+				if evalErr == nil || !retryableEvaluatorProviderCategory(diagnostics.ErrorCategory) || retry == 1 {
+					break
+				}
+				sample.AlternativeRetryCount++
+				sc.EvaluatorRetries++
+			}
 			sc.AlternativePairs++
 			sample.AlternativeTested = true
 			if evalErr != nil {
@@ -362,6 +376,7 @@ func v26LiveScenarioRun(ctx context.Context, s *Server, name, difficultyMode, fo
 		_ = s.db.QueryRow(`SELECT evaluation_diagnostics_json FROM attempts WHERE id=?`, result["attempt_id"]).Scan(&diagnosticJSON)
 		var diag EvaluationDiagnostics
 		_ = json.Unmarshal([]byte(diagnosticJSON), &diag)
+		out.EvaluatorRetries += diag.RetryCount
 		if result["evaluation_status"] != "validated" {
 			out.EvaluatorFailures++
 			if out.EvaluatorFailureKinds == nil {
@@ -465,17 +480,17 @@ func writeV26LiveReport(jsonPath, mdPath string, report v26LiveReport) error {
 	var b strings.Builder
 	b.WriteString("# English Practice AI V2.6\n# Fixed Difficulty Mastery & Free Expression\n\n")
 	fmt.Fprintf(&b, "Provider: %s / %s\n\nStage A exercises: %d\n\nStage B exercises: %d\n\nProvider calls: %d; denied at cap: %d\n\n", report.Provider, report.Model, report.StageAAttempts, report.StageBAttempts, report.TotalProviderCalls, report.DeniedCalls)
-	b.WriteString("## Live Mode Results\n\n| Scenario | Requested | Generated | Initial success | Retries | Fallback | Evaluated | Evaluator calls | Eval failures | Curriculum violations | Out of level | Out of band | Pattern leakage | Mastery mutation | Generator failure kinds | Evaluator failure kinds | Schema errors |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |\n")
+	b.WriteString("## Live Mode Results\n\n| Scenario | Requested | Generated | Initial success | Generator retries | Fallback | Evaluated | Evaluator calls | Evaluator retries | Eval failures | Curriculum violations | Out of level | Out of band | Pattern leakage | Mastery mutation | Generator failure kinds | Evaluator failure kinds | Schema errors |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |\n")
 	for _, s := range report.Scenarios {
-		fmt.Fprintf(&b, "| %s | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %v | %v | %v |\n", s.DifficultyMode+" + "+s.TrainingFocus, s.Requested, s.Generated, s.GeneratorInitialSuccesses, s.GeneratorRetries, s.GenerationFallbacks, s.Evaluated, s.EvaluatorCalls, s.EvaluatorFailures, s.CurriculumViolations, s.OutOfLevel, s.OutOfBand, s.PatternPenalty, s.PatternMasteryMutations, s.GeneratorFailureKinds, s.EvaluatorFailureKinds, s.EvaluatorSchemaErrors)
+		fmt.Fprintf(&b, "| %s | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %v | %v | %v |\n", s.DifficultyMode+" + "+s.TrainingFocus, s.Requested, s.Generated, s.GeneratorInitialSuccesses, s.GeneratorRetries, s.GenerationFallbacks, s.Evaluated, s.EvaluatorCalls, s.EvaluatorRetries, s.EvaluatorFailures, s.CurriculumViolations, s.OutOfLevel, s.OutOfBand, s.PatternPenalty, s.PatternMasteryMutations, s.GeneratorFailureKinds, s.EvaluatorFailureKinds, s.EvaluatorSchemaErrors)
 	}
-	b.WriteString("\n## Alternative Answer Evaluations\n\n| Scenario | Accepted | Verdict | Meaning | Grammar | Naturalness | Error category | Schema error |\n| --- | --- | --- | ---: | ---: | ---: | --- | --- |\n")
+	b.WriteString("\n## Alternative Answer Evaluations\n\n| Scenario | Accepted | Retries | Verdict | Meaning | Grammar | Naturalness | Error category | Schema error |\n| --- | --- | ---: | --- | ---: | ---: | ---: | --- | --- |\n")
 	for _, s := range report.Scenarios {
 		for _, sample := range s.Samples {
 			if !sample.AlternativeTested {
 				continue
 			}
-			fmt.Fprintf(&b, "| %s | %t | %s | %.2f | %.2f | %.2f | %s | %s |\n", sample.Scenario, sample.AlternativeAccepted, sample.AlternativeVerdict, sample.AlternativeMeaningScore, sample.AlternativeGrammarScore, sample.AlternativeNaturalnessScore, sample.AlternativeErrorCategory, sample.AlternativeSchemaError)
+			fmt.Fprintf(&b, "| %s | %t | %d | %s | %.2f | %.2f | %.2f | %s | %s |\n", sample.Scenario, sample.AlternativeAccepted, sample.AlternativeRetryCount, sample.AlternativeVerdict, sample.AlternativeMeaningScore, sample.AlternativeGrammarScore, sample.AlternativeNaturalnessScore, sample.AlternativeErrorCategory, sample.AlternativeSchemaError)
 		}
 	}
 	fmt.Fprintf(&b, "\nD1 advanced leakage: %d\n\nD1 Would-you-mind leakage: %d\n\nAlternative answer pairs available: %d; accepted: %d; rejected: %d\n\n", sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.D1AdvancedLeakage }), sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.D1WouldYouMindLeakage }), sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.AlternativePairs }), sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.AlternativeAccepted }), sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.AlternativeRejected }))

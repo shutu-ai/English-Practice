@@ -294,8 +294,9 @@ func TestStructuredOutputNormalization(t *testing.T) {
 		{"task_completion", "meaning"}, {"task_fulfillment", "meaning"},
 		{"task_relevance", "meaning"}, {"task_response", "meaning"},
 		{"communication_intent", "meaning"}, {"communication_intent_not_fulfilled", "meaning"},
-		{"content", "other"}, {"pragmatics", "other"}, {"context", "other"},
+		{"content", "other"}, {"pragmatics", "other"}, {"pragmatic", "other"}, {"context", "other"},
 		{"contextual", "other"}, {"off_topic", "meaning"},
+		{"collocation", "word_choice"},
 		{"naturalness", "unnatural_expression"},
 	} {
 		input := strings.Replace(validEvaluationJSON(), `"errors":[]`, fmt.Sprintf(`"errors":[{"type":%q,"severity":"minor","explanation":"x"}]`, tc.provider), 1)
