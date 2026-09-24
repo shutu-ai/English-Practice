@@ -292,10 +292,10 @@ func TestStructuredOutputNormalization(t *testing.T) {
 	for _, tc := range []struct{ provider, canonical string }{
 		{"irrelevant_content", "meaning"}, {"irrelevant_response", "meaning"},
 		{"task_completion", "meaning"}, {"task_fulfillment", "meaning"},
-		{"task_relevance", "meaning"}, {"task_response", "meaning"},
+		{"task_relevance", "meaning"}, {"task_response", "meaning"}, {"irrelevant_answer", "meaning"},
 		{"communication_intent", "meaning"}, {"communication_intent_not_fulfilled", "meaning"},
 		{"content", "other"}, {"pragmatics", "other"}, {"pragmatic", "other"}, {"pragmatic/meaning", "other"}, {"pragmatic/context", "other"}, {"context", "other"}, {"language_use", "other"},
-		{"omission", "missing_information"},
+		{"omission", "missing_information"}, {"missing_reason", "missing_information"},
 		{"contextual", "other"}, {"off_topic", "meaning"},
 		{"collocation", "word_choice"},
 		{"naturalness", "unnatural_expression"},

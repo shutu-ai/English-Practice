@@ -1668,11 +1668,15 @@ func normalizeErrorType(value string) (string, error) {
 		v = "meaning"
 	case "irrelevant_content", "irrelevant_response", "task_completion", "task_fulfillment", "task_relevance", "task_response", "communication_intent", "communication_intent_not_fulfilled":
 		v = "meaning"
+	case "irrelevant_answer":
+		v = "meaning"
 	case "off_topic":
 		v = "meaning"
 	case "content", "content_error", "pragmatics", "pragmatic", "pragmatic_meaning", "pragmatic_context", "context", "contextual", "language_use":
 		v = "other"
 	case "omission", "omission_error":
+		v = "missing_information"
+	case "missing_reason":
 		v = "missing_information"
 	case "tense_error", "verb_tense":
 		v = "tense"
@@ -2501,7 +2505,7 @@ func (s *Server) evaluateWithProviderOptionsSpec(ctx context.Context, prompt, pa
 			targetPattern = label
 		}
 	}
-	systemPrompt := "Evaluate an English learner answer. You may reason internally, but after reasoning always return the final evaluation as one complete JSON object in the assistant's final content. Never leave final content empty and never return reasoning as the evaluation. Do not include prose or markdown outside JSON. The object must have verdict, meaning_score, grammar_score, naturalness_score, pattern_score, target_pattern_match, target_pattern_score, errors, suggested_answer, and explanation_zh. verdict must be exactly one of: correct, mostly_correct, needs_improvement, incorrect. Scores must be numbers from 0 to 1. Use errors:[] when there are no errors. Every errors item must contain type, severity, and explanation. Do not rewrite an already correct and natural answer merely to produce a different sentence."
+	systemPrompt := "Evaluate an English learner answer. You may reason internally, but after reasoning always return the final evaluation as one complete JSON object in the assistant's final content. Never leave final content empty and never return reasoning as the evaluation. Do not include prose or markdown outside JSON. The object must have verdict, meaning_score, grammar_score, naturalness_score, pattern_score, target_pattern_match, target_pattern_score, errors, suggested_answer, and explanation_zh. verdict must be exactly one of: correct, mostly_correct, needs_improvement, incorrect. Scores must be numbers from 0 to 1. Use errors:[] when there are no errors. Every errors item must contain type, severity, and explanation. Error type must be exactly one of meaning, tense, article, preposition, word_order, modal, condition, agreement, word_choice, missing_information, extra_information, unnatural_expression, target_pattern_missing, register, or other. Use other for any issue that does not fit these categories. Do not rewrite an already correct and natural answer merely to produce a different sentence."
 	userPrompt := fmt.Sprintf("Original evaluation context\nPrompt: %s\nLearner answer: %s", prompt, answer)
 	if spec.TargetPatternMode == "none" {
 		systemPrompt += " There is no required target sentence pattern. Evaluate meaning accuracy, communication intent fulfillment, grammar, naturalness, and appropriateness. Do not penalize a valid answer for choosing a different structure. Set target_pattern_match to not_applicable and target_pattern_score to 0. Do not add target_pattern_missing errors."
