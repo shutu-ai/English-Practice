@@ -281,6 +281,10 @@ func TestStructuredOutputNormalization(t *testing.T) {
 	if err != nil || len(aliased.Errors) != 1 || aliased.Errors[0]["type"] != "meaning" || aliased.Errors[0]["severity"] != "minor" {
 		t.Fatalf("known provider aliases were not normalized: %#v err=%v", aliased, err)
 	}
+	critical, err := normalizeEvalContent(strings.Replace(validEvaluationJSON(), `"errors":[]`, `"errors":[{"type":"meaning","severity":"critical","explanation":"x"}]`, 1))
+	if err != nil || critical.Errors[0]["severity"] != "major" {
+		t.Fatalf("critical provider severity was not normalized: %#v err=%v", critical, err)
+	}
 	spelling, err := normalizeEvalContent(`{"verdict":"needs_improvement","meaning_score":0.8,"grammar_score":0.7,"naturalness_score":0.6,"pattern_score":0.5,"errors":[{"type":"spelling","severity":"minor","explanation":"Check the spelling."}],"suggested_answer":"x","explanation_zh":"x"}`)
 	if err != nil || len(spelling.Errors) != 1 || spelling.Errors[0]["type"] != "word_choice" {
 		t.Fatalf("spelling provider error was not normalized: %#v err=%v", spelling, err)

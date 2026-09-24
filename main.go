@@ -1710,7 +1710,7 @@ func normalizeSeverity(value string) (string, error) {
 		v = "minor"
 	case "medium", "mid":
 		v = "moderate"
-	case "high":
+	case "high", "critical":
 		v = "major"
 	}
 	if v == "minor" || v == "moderate" || v == "major" {
