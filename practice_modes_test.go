@@ -43,8 +43,94 @@ func TestV25PracticePreferenceDefaultsAndFixedValidation(t *testing.T) {
 	if _, err := normalizePracticePreferences(PracticePreferences{DifficultyMode: DifficultyModeAdaptive, FixedDifficulty: 4, TrainingFocus: TrainingFocusFree}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := normalizePracticePreferences(PracticePreferences{DifficultyMode: DifficultyModeFixed, FixedDifficulty: 4.5, TrainingFocus: TrainingFocusPattern}); err == nil {
+		t.Fatal("non-curriculum fixed difficulty was accepted")
+	}
 	if !IsPatternEligibleForDifficulty(4.3, 4) || IsPatternEligibleForDifficulty(4.5, 4) {
 		t.Fatal("fixed difficulty overlap band is incorrect")
+	}
+}
+
+func TestV26FixedDifficultyMasterySeparatesCoverageAndMastery(t *testing.T) {
+	s := testServer(t)
+	rows, err := s.db.Query(`SELECT p.id FROM sentence_patterns p JOIN curriculum_patterns cp ON cp.pattern_id=p.id WHERE cp.app_level_min<=4 AND p.catalog_difficulty BETWEEN 3.7 AND 4.3 ORDER BY p.id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var patterns []string
+	for rows.Next() {
+		var pattern string
+		if err := rows.Scan(&pattern); err != nil {
+			t.Fatal(err)
+		}
+		patterns = append(patterns, pattern)
+	}
+	rows.Close()
+	if len(patterns) == 0 {
+		t.Fatal("expected eligible D4 curriculum patterns")
+	}
+	for i, pattern := range patterns {
+		if i == 0 {
+			_, err = s.db.Exec(`UPDATE learner_skill_state SET attempt_count=3,success_count=3,mastery=.95,state='MASTERED',next_review_at=NULL WHERE user_id='default' AND pattern_id=?`, pattern)
+		} else {
+			_, err = s.db.Exec(`UPDATE learner_skill_state SET attempt_count=0,success_count=0,mastery=.25,state='UNKNOWN',next_review_at=NULL WHERE user_id='default' AND pattern_id=?`, pattern)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	progress := s.fixedDifficultyMastery(4)
+	if progress["eligible"] != len(patterns) || progress["mastered"] != 1 || progress["covered"] != 1 || progress["coverage_rate"] != 1/float64(len(patterns)) || progress["mastery_rate"] != 1/float64(len(patterns)) || progress["unseen"] != len(patterns)-1 || progress["weak"] != 0 || progress["completed"] != false {
+		t.Fatalf("coverage and mastery aggregation mismatch: %#v", progress)
+	}
+}
+
+func TestV26FixedLevelAggregationUsesSeparateCoverageAndMastery(t *testing.T) {
+	states := map[string]int{"MASTERED": 7, "LEARNING": 2, "UNSEEN": 1, "WEAK": 0, "REVIEW_DUE": 0, "BLOCKED": 0}
+	progress := aggregateFixedLevelMastery(4, 3.7, 4.3, 10, 9, 7, 0, 0, states, false)
+	if progress["coverage_rate"] != .9 || progress["mastery_rate"] != .7 || progress["completed"] != false {
+		t.Fatalf("coverage and mastery aggregation mismatch: %#v", progress)
+	}
+	reviewStates := map[string]int{"MASTERED": 8, "LEARNING": 0, "UNSEEN": 0, "WEAK": 0, "REVIEW_DUE": 2, "BLOCKED": 0}
+	completed := aggregateFixedLevelMastery(4, 3.7, 4.3, 10, 10, 8, 2, 0, reviewStates, false)
+	if completed["completed"] != true || completed["needs_review"] != true {
+		t.Fatalf("review due must preserve historical completion: %#v", completed)
+	}
+	blockedStates := map[string]int{"MASTERED": 1, "LEARNING": 0, "UNSEEN": 0, "WEAK": 0, "REVIEW_DUE": 0, "BLOCKED": 1}
+	blocked := aggregateFixedLevelMastery(4, 3.7, 4.3, 2, 1, 1, 0, 1, blockedStates, false)
+	if blocked["completed"] != false || blocked["mastery_rate"] != .5 {
+		t.Fatalf("blocked skills must remain in the completion denominator: %#v", blocked)
+	}
+}
+
+func TestV26FixedD4KeepsLevelForOneHundredAttempts(t *testing.T) {
+	s := testServer(t)
+	session := createPracticeSession(t, s, PracticePreferences{DifficultyMode: DifficultyModeFixed, FixedDifficulty: 4, TrainingFocus: TrainingFocusPattern})
+	for i := 0; i < 100; i++ {
+		ex, err := s.generateExerciseForScene(context.Background(), 4, "adaptive", "", "", session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if level, ok := ex["curriculum_level"].(int); !ok || level > 4 {
+			t.Fatalf("fixed D4 selected a curriculum-ineligible pattern: %#v", ex)
+		}
+		if ex["fixed_difficulty"] != float64(4) {
+			t.Fatalf("fixed D4 snapshot changed: %#v", ex)
+		}
+		if got := ex["difficulty"].(float64); got < 3.7 || got > 4.3 {
+			t.Fatalf("fixed D4 exercise escaped numeric band: %.2f", got)
+		}
+		if _, err := s.submitAttempt(context.Background(), session, ex["exercise_id"].(string), "I see your point, but I think we should consider the cost."); err != nil {
+			t.Fatalf("attempt %d: %v", i+1, err)
+		}
+	}
+	var mode string
+	var fixed, center float64
+	if err := s.db.QueryRow(`SELECT difficulty_mode,fixed_difficulty,session_difficulty_center FROM sessions WHERE id=?`, session).Scan(&mode, &fixed, &center); err != nil {
+		t.Fatal(err)
+	}
+	if mode != DifficultyModeFixed || fixed != 4 || center != 4 {
+		t.Fatalf("fixed D4 moved after 100 attempts: mode=%s fixed=%.1f center=%.1f", mode, fixed, center)
 	}
 }
 

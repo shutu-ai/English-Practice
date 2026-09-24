@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +15,41 @@ import (
 
 	_ "modernc.org/sqlite"
 )
+
+func TestV26PracticeNextCreatesPreferenceSessionForFirstRequest(t *testing.T) {
+	s := testServer(t)
+	mux := http.NewServeMux()
+	registerRoutes(mux, s, http.NotFoundHandler())
+	request := httptest.NewRequest(http.MethodPost, "/api/practice/next", bytes.NewBufferString(`{"difficulty_mode":"fixed","fixed_difficulty":4,"training_focus":"pattern"}`))
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("fixed first request returned %d: %s", response.Code, response.Body.String())
+	}
+	var fixed map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &fixed); err != nil {
+		t.Fatal(err)
+	}
+	if fixed["session_id"] == "" || fixed["difficulty_mode"] != DifficultyModeFixed || fixed["fixed_difficulty"] != float64(4) || fixed["difficulty"] != float64(4) || fixed["curriculum_level"] != float64(4) {
+		t.Fatalf("first fixed request did not bind its session and exercise: %#v", fixed)
+	}
+	if difficulty := fixed["difficulty"].(float64); difficulty < 3.7 || difficulty > 4.3 {
+		t.Fatalf("fixed D4 exercise outside its band: %.2f", difficulty)
+	}
+	request = httptest.NewRequest(http.MethodPost, "/api/practice/next", bytes.NewBufferString(`{"difficulty_mode":"fixed","fixed_difficulty":4,"training_focus":"free_expression"}`))
+	response = httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("free first request returned %d: %s", response.Code, response.Body.String())
+	}
+	var free map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &free); err != nil {
+		t.Fatal(err)
+	}
+	if free["session_id"] == "" || free["training_focus"] != TrainingFocusFree || free["target_pattern_present"] != false || free["pattern_id"] != nil || free["target_pattern"] != nil || free["curriculum_level"] != float64(4) {
+		t.Fatalf("first free request did not bind its session or leaked pattern context: %#v", free)
+	}
+}
 
 func testServer(t *testing.T) *Server {
 	t.Helper()

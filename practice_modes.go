@@ -56,6 +56,9 @@ func normalizePracticePreferences(p PracticePreferences) (PracticePreferences, e
 		if out.FixedDifficulty < 1 || out.FixedDifficulty > 8 || math.IsNaN(out.FixedDifficulty) || math.IsInf(out.FixedDifficulty, 0) {
 			return PracticePreferences{}, fmt.Errorf("fixed_difficulty must be between 1 and 8")
 		}
+		if math.Abs(out.FixedDifficulty-math.Round(out.FixedDifficulty)) > 1e-9 {
+			return PracticePreferences{}, fmt.Errorf("fixed_difficulty must be a curriculum level from D1 to D8")
+		}
 		out.FixedDifficulty = math.Round(out.FixedDifficulty*10) / 10
 	}
 	out.TargetPatternEnabled = out.TrainingFocus == TrainingFocusPattern
@@ -120,6 +123,16 @@ func isPatternEligibleForDifficulty(patternDifficulty, selectedLevel float64, cf
 
 func difficultyLevelLabel(level float64) string {
 	return fmt.Sprintf("D%d", int(math.Round(level)))
+}
+
+func aggregateFixedLevelMastery(level, lower, upper float64, eligible, covered, mastered, reviewDue, blocked int, counts map[string]int, historicallyCompleted bool) map[string]any {
+	coverage, masteryRate := 0.0, 0.0
+	if eligible > 0 {
+		coverage = float64(covered) / float64(eligible)
+		masteryRate = float64(mastered) / float64(eligible)
+	}
+	completed := historicallyCompleted || (eligible > 0 && mastered+reviewDue == eligible)
+	return map[string]any{"level": level, "label": difficultyLevelLabel(level), "curriculum_version": curriculumVersion, "lower": lower, "upper": upper, "eligible": eligible, "covered": covered, "seen": covered, "unseen": counts["UNSEEN"], "learning": counts["LEARNING"], "weak": counts["WEAK"], "review_due": counts["REVIEW_DUE"], "mastered": mastered, "blocked": blocked, "coverage_rate": coverage, "mastery_rate": masteryRate, "completed": completed, "needs_review": completed && reviewDue > 0, "states": counts}
 }
 
 type fixedPatternRow struct {
@@ -301,6 +314,10 @@ func (s *Server) generateFreeAIExercise(ctx context.Context, c adaptiveCandidate
 }
 
 func (s *Server) generateFreeExerciseForScene(ctx context.Context, c adaptiveCandidate, scene string, subscene string, prefs PracticePreferences) (map[string]any, error) {
+	effectiveLevel := s.curriculumPatternLevel(c.ID)
+	if prefs.DifficultyMode == DifficultyModeFixed {
+		effectiveLevel = int(math.Round(prefs.FixedDifficulty))
+	}
 	if scene == "" {
 		scene = c.SceneID
 	}
@@ -333,6 +350,7 @@ func (s *Server) generateFreeExerciseForScene(ctx context.Context, c adaptiveCan
 	metaMap := map[string]any{
 		"mode": "free_expression", "difficulty_mode": prefs.DifficultyMode, "fixed_difficulty": prefs.FixedDifficulty,
 		"training_focus": TrainingFocusFree, "target_pattern_mode": TargetPatternNA, "target_pattern_id": nil,
+		"curriculum_version": curriculumVersion, "curriculum_level": effectiveLevel,
 		"selection_reason": c.Reason, "generated_by": generatedBy, "reference_answers": seed.Answers,
 		"target_difficulty": c.SessionCenter, "realized_difficulty": realized, "difficulty_delta": math.Abs(realized - c.SessionCenter),
 		"difficulty_validation_status": "validated", "difficulty_validation_reason": "within_configured_difficulty_band",
@@ -343,43 +361,64 @@ func (s *Server) generateFreeExerciseForScene(ctx context.Context, c adaptiveCan
 	meta, _ := json.Marshal(metaMap)
 	trace, _ := json.Marshal(metaMap["decision_trace"])
 	exID := id("exercise")
-	_, err := s.db.Exec(`INSERT INTO exercises(id,chinese_prompt,pattern_id,scene_id,subscene_id,intent_id,difficulty,target_difficulty,realized_difficulty,difficulty_delta,difficulty_validation_status,difficulty_validation_reason,difficulty_policy_version,metadata_json,created_at,normalized_chinese_hash,generated_by,decision_trace_json,training_focus,difficulty_mode,fixed_difficulty,target_pattern_present) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, exID, seed.Prompt, "", scene, subscene, c.Intent, c.SessionCenter, c.SessionCenter, realized, math.Abs(realized-c.SessionCenter), "validated", "within_configured_difficulty_band", difficultyConfig(s.adaptiveConfig()).DifficultyPolicyVersion, string(meta), time.Now().UTC().Format(time.RFC3339), hash, generatedBy, string(trace), TrainingFocusFree, prefs.DifficultyMode, prefs.FixedDifficulty, 0)
+	_, err := s.db.Exec(`INSERT INTO exercises(id,chinese_prompt,pattern_id,scene_id,subscene_id,intent_id,difficulty,target_difficulty,realized_difficulty,difficulty_delta,difficulty_validation_status,difficulty_validation_reason,difficulty_policy_version,metadata_json,created_at,normalized_chinese_hash,generated_by,decision_trace_json,training_focus,difficulty_mode,fixed_difficulty,target_pattern_present,curriculum_version,curriculum_level) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, exID, seed.Prompt, "", scene, subscene, c.Intent, c.SessionCenter, c.SessionCenter, realized, math.Abs(realized-c.SessionCenter), "validated", "within_configured_difficulty_band", difficultyConfig(s.adaptiveConfig()).DifficultyPolicyVersion, string(meta), time.Now().UTC().Format(time.RFC3339), hash, generatedBy, string(trace), TrainingFocusFree, prefs.DifficultyMode, prefs.FixedDifficulty, 0, curriculumVersion, effectiveLevel)
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"exercise_id": exID, "chinese_prompt": seed.Prompt, "target_pattern": nil, "pattern_id": nil, "scene_id": scene, "subscene_id": subscene, "communication_intent": c.Intent, "difficulty": c.SessionCenter, "target_difficulty": c.SessionCenter, "realized_difficulty": realized, "difficulty_delta": math.Abs(realized - c.SessionCenter), "difficulty_validation_status": "validated", "selection_reason": c.Reason, "difficulty_mode": prefs.DifficultyMode, "fixed_difficulty": prefs.FixedDifficulty, "training_focus": TrainingFocusFree, "target_pattern_enabled": false, "target_pattern_present": false, "reference_answers": seed.Answers, "decision_trace": metaMap["decision_trace"]}, nil
+	return map[string]any{"exercise_id": exID, "chinese_prompt": seed.Prompt, "target_pattern": nil, "pattern_id": nil, "scene_id": scene, "subscene_id": subscene, "communication_intent": c.Intent, "difficulty": c.SessionCenter, "target_difficulty": c.SessionCenter, "realized_difficulty": realized, "difficulty_delta": math.Abs(realized - c.SessionCenter), "difficulty_validation_status": "validated", "selection_reason": c.Reason, "difficulty_mode": prefs.DifficultyMode, "fixed_difficulty": prefs.FixedDifficulty, "training_focus": TrainingFocusFree, "target_pattern_enabled": false, "target_pattern_present": false, "curriculum_version": curriculumVersion, "curriculum_level": effectiveLevel, "reference_answers": seed.Answers, "decision_trace": metaMap["decision_trace"]}, nil
 }
 
 func (s *Server) fixedDifficultyMastery(level float64) map[string]any {
 	cfg := s.adaptiveConfig()
 	lower, upper := fixedDifficultyBand(level, cfg)
-	rows, err := s.db.Query(`SELECT p.id,COALESCE(p.catalog_difficulty,p.difficulty),COALESCE(ls.mastery,COALESCE(pm.mastery,.25)),COALESCE(ls.attempt_count,0),COALESCE(ls.state,'UNKNOWN'),COALESCE(ls.next_review_at,'') FROM sentence_patterns p LEFT JOIN pattern_mastery pm ON pm.pattern_id=p.id LEFT JOIN learner_skill_state ls ON ls.pattern_id=p.id AND ls.user_id='default' WHERE COALESCE(p.catalog_difficulty,p.difficulty)>=? AND COALESCE(p.catalog_difficulty,p.difficulty)<=? ORDER BY p.id`, lower, upper)
+	levelInt := int(math.Round(level))
+	rows, err := s.db.Query(`SELECT p.id,COALESCE(p.catalog_difficulty,p.difficulty),COALESCE(ls.mastery,COALESCE(pm.mastery,.25)),COALESCE(ls.attempt_count,0),COALESCE(ls.success_count,0),COALESCE(ls.state,'UNKNOWN'),COALESCE(ls.next_review_at,'') FROM sentence_patterns p LEFT JOIN pattern_mastery pm ON pm.pattern_id=p.id LEFT JOIN learner_skill_state ls ON ls.pattern_id=p.id AND ls.user_id='default' WHERE COALESCE(p.catalog_difficulty,p.difficulty)>=? AND COALESCE(p.catalog_difficulty,p.difficulty)<=? ORDER BY p.id`, lower, upper)
 	if err != nil {
 		return map[string]any{"level": level, "label": difficultyLevelLabel(level), "lower": lower, "upper": upper, "eligible": 0, "error": err.Error()}
 	}
-	defer rows.Close()
-	counts := map[string]int{"UNSEEN": 0, "LEARNING": 0, "WEAK": 0, "REVIEW_DUE": 0, "MASTERED": 0}
-	eligible, seen, mastered := 0, 0, 0
-	now := time.Now().UTC()
+	type masteryRow struct {
+		id, state, next     string
+		difficulty, mastery float64
+		attempts, correct   int
+	}
+	var items []masteryRow
 	for rows.Next() {
-		var id, state, next string
-		var difficulty, mastery float64
-		var attempts int
-		if rows.Scan(&id, &difficulty, &mastery, &attempts, &state, &next) != nil {
+		var item masteryRow
+		if rows.Scan(&item.id, &item.difficulty, &item.mastery, &item.attempts, &item.correct, &item.state, &item.next) == nil {
+			items = append(items, item)
+		}
+	}
+	rowsErr := rows.Err()
+	_ = rows.Close()
+	if rowsErr != nil {
+		return map[string]any{"level": level, "label": difficultyLevelLabel(level), "lower": lower, "upper": upper, "eligible": 0, "error": rowsErr.Error()}
+	}
+	counts := map[string]int{"UNSEEN": 0, "LEARNING": 0, "WEAK": 0, "REVIEW_DUE": 0, "MASTERED": 0, "BLOCKED": 0}
+	eligible, covered, mastered, reviewDue, blocked := 0, 0, 0, 0, 0
+	now := time.Now().UTC()
+	for _, item := range items {
+		if ok, _ := curriculumEligible(item.id, levelInt); !ok {
 			continue
 		}
 		eligible++
-		if attempts > 0 {
-			seen++
+		if item.attempts > 0 {
+			covered++
 		}
-		if attempts == 0 {
-			state = stateUnknown
+		if !s.curriculumReadiness(item.id, levelInt) {
+			counts["BLOCKED"]++
+			blocked++
+			continue
+		}
+		state := item.state
+		if item.attempts == 0 {
+			state = "UNSEEN"
 		} else {
-			state = stateFromRow(attempts, 0, mastery, state, cfg)
+			state = stateFromRow(item.attempts, item.correct, item.mastery, state, cfg)
 		}
-		if next != "" {
-			if parsed, parseErr := time.Parse(time.RFC3339, next); parseErr == nil && !parsed.After(now) && state == stateMastered {
+		if item.next != "" {
+			if parsed, parseErr := time.Parse(time.RFC3339, item.next); parseErr == nil && !parsed.After(now) && state == stateMastered {
 				state = "REVIEW_DUE"
+				reviewDue++
 			}
 		}
 		if _, ok := counts[state]; !ok {
@@ -390,13 +429,14 @@ func (s *Server) fixedDifficultyMastery(level float64) map[string]any {
 			mastered++
 		}
 	}
-	coverage := 0.0
-	masteryRate := 0.0
-	if eligible > 0 {
-		coverage = float64(seen) / float64(eligible)
-		masteryRate = float64(mastered) / float64(eligible)
+	completed := eligible > 0 && mastered+reviewDue == eligible
+	var historicallyCompleted int
+	if completed {
+		_, _ = s.db.Exec(`INSERT OR IGNORE INTO level_completions(level,curriculum_version,completed_at) VALUES(?,?,?)`, levelInt, curriculumVersion, now.Format(time.RFC3339))
 	}
-	return map[string]any{"level": level, "label": difficultyLevelLabel(level), "lower": lower, "upper": upper, "eligible": eligible, "seen": seen, "unseen": counts["UNSEEN"], "learning": counts["LEARNING"], "weak": counts["WEAK"], "review_due": counts["REVIEW_DUE"], "mastered": mastered, "coverage_rate": coverage, "mastery_rate": masteryRate, "completed": eligible > 0 && mastered == eligible, "states": counts}
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM level_completions WHERE level=? AND curriculum_version=?`, levelInt, curriculumVersion).Scan(&historicallyCompleted)
+	completed = completed || historicallyCompleted > 0
+	return aggregateFixedLevelMastery(level, lower, upper, eligible, covered, mastered, reviewDue, blocked, counts, historicallyCompleted > 0)
 }
 
 func validatePracticePreferences(p PracticePreferences) error {

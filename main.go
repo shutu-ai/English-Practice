@@ -438,6 +438,12 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "v26-live" {
+		if err := runV26LiveCLI(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "curriculum-live" {
 		if err := runCurriculumLiveCLI(os.Args[2:]); err != nil {
 			log.Fatal(err)
@@ -524,6 +530,7 @@ func migrate(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS scene_transfer_events (id TEXT PRIMARY KEY, pattern_id TEXT NOT NULL, previous_scene_count INTEGER NOT NULL, new_scene_id TEXT NOT NULL, transfer_before REAL NOT NULL, transfer_after REAL NOT NULL, intent_count INTEGER NOT NULL, created_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS curriculum_skills (skill_id TEXT PRIMARY KEY, curriculum_version TEXT NOT NULL, app_level INTEGER NOT NULL, cefr_anchor TEXT NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}')`,
 		`CREATE TABLE IF NOT EXISTS curriculum_patterns (pattern_id TEXT PRIMARY KEY, curriculum_version TEXT NOT NULL, display_name TEXT NOT NULL, app_level_min INTEGER NOT NULL, cefr_anchor TEXT NOT NULL, grammar_family TEXT NOT NULL, communication_functions_json TEXT NOT NULL DEFAULT '[]', prerequisites_json TEXT NOT NULL DEFAULT '[]', productive_complexity REAL NOT NULL, typical_contexts_json TEXT NOT NULL DEFAULT '[]', rationale TEXT NOT NULL DEFAULT '', confidence TEXT NOT NULL DEFAULT 'medium', instruction_complexity INTEGER NOT NULL DEFAULT 1, allowed_grammar_json TEXT NOT NULL DEFAULT '[]', not_yet_targetable_json TEXT NOT NULL DEFAULT '[]', metadata_json TEXT NOT NULL DEFAULT '{}')`,
+		`CREATE TABLE IF NOT EXISTS level_completions (level INTEGER NOT NULL, curriculum_version TEXT NOT NULL, completed_at TEXT NOT NULL, PRIMARY KEY(level,curriculum_version))`,
 	}
 	for _, q := range stmts {
 		if _, err := db.Exec(q); err != nil {
@@ -603,6 +610,7 @@ func migrate(db *sql.DB) error {
 		{"sessions", "difficulty_mode", "TEXT NOT NULL DEFAULT 'adaptive'"},
 		{"sessions", "fixed_difficulty", "REAL NOT NULL DEFAULT 0"},
 		{"sessions", "training_focus", "TEXT NOT NULL DEFAULT 'pattern'"},
+		{"sessions", "curriculum_version", "TEXT NOT NULL DEFAULT '" + curriculumVersion + "'"},
 		{"attempts", "difficulty_mode", "TEXT NOT NULL DEFAULT 'adaptive'"},
 		{"attempts", "fixed_difficulty", "REAL NOT NULL DEFAULT 0"},
 		{"attempts", "training_focus", "TEXT NOT NULL DEFAULT 'pattern'"},
@@ -922,6 +930,41 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 				jsonResp(w, 400, map[string]string{"error": err.Error()})
 				return
 			}
+			// A first practice request can carry explicit preferences before the
+			// client has a session. Persist those preferences in a new session so
+			// generation and exercise snapshots use the requested mode.
+			if req.SessionID == "" && (req.DifficultyMode != "" || req.TrainingFocus != "" || req.FixedDifficulty != 0) {
+				var globalDifficulty float64
+				_ = s.db.QueryRow("SELECT global_difficulty FROM user_profile WHERE id='default'").Scan(&globalDifficulty)
+				center := globalDifficulty
+				if center <= 0 {
+					center = 3
+				}
+				if prefs.DifficultyMode == DifficultyModeFixed {
+					center = prefs.FixedDifficulty
+				}
+				lower, upper := sessionBand(center, difficultyConfig(s.adaptiveConfig()))
+				if prefs.DifficultyMode == DifficultyModeFixed {
+					lower, upper = fixedDifficultyBand(center, s.adaptiveConfig())
+				}
+				sessionID := id("session")
+				requestMode := req.Mode
+				if requestMode == "" {
+					requestMode = DifficultyModeAdaptive
+				}
+				practiceScope := "global"
+				if req.SubsceneID != "" {
+					practiceScope = "subscene"
+				} else if req.SceneID != "" {
+					practiceScope = "scene"
+				}
+				_, err := s.db.Exec(`INSERT INTO sessions(id,mode,started_at,start_global_difficulty,end_global_difficulty,session_difficulty_center,session_band_lower,session_band_upper,session_center_confidence,session_evidence_count,scene_id,subscene_id,practice_scope,difficulty_mode,fixed_difficulty,training_focus,curriculum_version) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?)`, sessionID, requestMode, time.Now().UTC().Format(time.RFC3339), globalDifficulty, globalDifficulty, center, lower, upper, 0, req.SceneID, req.SubsceneID, practiceScope, prefs.DifficultyMode, prefs.FixedDifficulty, prefs.TrainingFocus, curriculumVersion)
+				if err != nil {
+					jsonResp(w, 500, map[string]string{"error": err.Error()})
+					return
+				}
+				req.SessionID = sessionID
+			}
 			if req.SessionID != "" {
 				if err := writePracticePreferences(s.db, req.SessionID, prefs); err != nil {
 					jsonResp(w, 500, map[string]string{"error": err.Error()})
@@ -945,6 +988,9 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 		ex["fixed_difficulty"] = prefs.FixedDifficulty
 		ex["training_focus"] = prefs.TrainingFocus
 		ex["target_pattern_enabled"] = prefs.TargetPatternEnabled
+		if req.SessionID != "" {
+			ex["session_id"] = req.SessionID
+		}
 		jsonResp(w, 200, ex)
 	})
 	mux.HandleFunc("/api/sessions", func(w http.ResponseWriter, r *http.Request) {
@@ -985,12 +1031,12 @@ func registerRoutes(mux *http.ServeMux, s *Server, static http.Handler) {
 				center = prefs.FixedDifficulty
 				lower, upper = fixedDifficultyBand(center, cfg)
 			}
-			_, err := s.db.Exec("INSERT INTO sessions(id,mode,started_at,end_global_difficulty,start_global_difficulty,session_difficulty_center,session_band_lower,session_band_upper,session_center_confidence,session_evidence_count,scene_id,subscene_id,practice_scope,difficulty_mode,fixed_difficulty,training_focus) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?)", session, req.Mode, time.Now().UTC().Format(time.RFC3339), difficulty, difficulty, center, lower, upper, 0, req.SceneID, req.SubsceneID, req.PracticeScope, prefs.DifficultyMode, prefs.FixedDifficulty, prefs.TrainingFocus)
+			_, err := s.db.Exec("INSERT INTO sessions(id,mode,started_at,end_global_difficulty,start_global_difficulty,session_difficulty_center,session_band_lower,session_band_upper,session_center_confidence,session_evidence_count,scene_id,subscene_id,practice_scope,difficulty_mode,fixed_difficulty,training_focus,curriculum_version) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?)", session, req.Mode, time.Now().UTC().Format(time.RFC3339), difficulty, difficulty, center, lower, upper, 0, req.SceneID, req.SubsceneID, req.PracticeScope, prefs.DifficultyMode, prefs.FixedDifficulty, prefs.TrainingFocus, curriculumVersion)
 			if err != nil {
 				jsonResp(w, 500, map[string]string{"error": err.Error()})
 				return
 			}
-			jsonResp(w, 201, map[string]any{"session_id": session, "mode": req.Mode, "scene_id": req.SceneID, "subscene_id": req.SubsceneID, "practice_scope": req.PracticeScope, "difficulty_mode": prefs.DifficultyMode, "fixed_difficulty": prefs.FixedDifficulty, "training_focus": prefs.TrainingFocus, "target_pattern_enabled": prefs.TargetPatternEnabled, "session_center": center, "session_band_lower": lower, "session_band_upper": upper})
+			jsonResp(w, 201, map[string]any{"session_id": session, "mode": req.Mode, "scene_id": req.SceneID, "subscene_id": req.SubsceneID, "practice_scope": req.PracticeScope, "difficulty_mode": prefs.DifficultyMode, "fixed_difficulty": prefs.FixedDifficulty, "training_focus": prefs.TrainingFocus, "target_pattern_enabled": prefs.TargetPatternEnabled, "curriculum_version": curriculumVersion, "session_center": center, "session_band_lower": lower, "session_band_upper": upper})
 			return
 		}
 		rows, err := s.db.Query("SELECT id,mode,started_at,ended_at,attempt_count,start_global_difficulty,end_global_difficulty,patterns_seen,skills_seen,reviews_served,probes_served,new_skills_served,session_difficulty_center,session_band_lower,session_band_upper,session_center_confidence,session_evidence_count,scene_id,subscene_id,practice_scope,difficulty_mode,fixed_difficulty,training_focus FROM sessions ORDER BY started_at DESC LIMIT 50")
