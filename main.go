@@ -1639,6 +1639,7 @@ var evaluationErrorTypes = map[string]string{
 func normalizeEnum(value string) string {
 	v := strings.ToLower(strings.TrimSpace(value))
 	v = strings.ReplaceAll(v, "-", "_")
+	v = strings.ReplaceAll(v, "/", "_")
 	v = strings.Join(strings.Fields(v), "_")
 	return v
 }
@@ -1669,8 +1670,10 @@ func normalizeErrorType(value string) (string, error) {
 		v = "meaning"
 	case "off_topic":
 		v = "meaning"
-	case "content", "content_error", "pragmatics", "pragmatic", "pragmatic_meaning", "pragmatic/meaning", "context", "contextual", "language_use":
+	case "content", "content_error", "pragmatics", "pragmatic", "pragmatic_meaning", "pragmatic_context", "context", "contextual", "language_use":
 		v = "other"
+	case "omission", "omission_error":
+		v = "missing_information"
 	case "tense_error", "verb_tense":
 		v = "tense"
 	case "article_error":
