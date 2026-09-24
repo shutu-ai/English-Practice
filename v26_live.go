@@ -69,6 +69,7 @@ type v26LiveScenario struct {
 	EligiblePatternStarvation                                      int
 	GeneratorFailureKinds                                          map[string]int
 	EvaluatorFailureKinds                                          map[string]int
+	EvaluatorSchemaErrors                                          map[string]int
 	Samples                                                        []v26LiveSample
 }
 
@@ -184,7 +185,9 @@ func runV26LiveCLI(args []string) error {
 				continue
 			}
 			altCount++
+			providerCallsBefore := v26AllowedProviderCalls(s)
 			eval, _, _, _, evalErr := s.evaluateWithProviderOptionsSpec(ctx, sample.Prompt, "", sample.Alternative, "", ProviderRequestOptions{}, EvaluationSpec{TargetPatternMode: "none"})
+			sc.EvaluatorCalls += v26AllowedProviderCalls(s) - providerCallsBefore
 			sc.AlternativePairs++
 			if evalErr != nil {
 				sc.AlternativeRejected++
@@ -251,7 +254,9 @@ func v26LiveScenarioRun(ctx context.Context, s *Server, name, difficultyMode, fo
 	var masteryBefore int
 	_ = s.db.QueryRow(`SELECT COALESCE(SUM(attempt_count),0) FROM learner_skill_state`).Scan(&masteryBefore)
 	for i := 0; i < count; i++ {
+		providerCallsBefore := v26AllowedProviderCalls(s)
 		ex, genErr := s.generateExerciseForScene(ctx, center, "adaptive", "", "", session)
+		out.GeneratorCalls += v26AllowedProviderCalls(s) - providerCallsBefore
 		if genErr != nil {
 			out.GenerationFallbacks++
 			if out.GeneratorFailureKinds == nil {
@@ -266,13 +271,10 @@ func v26LiveScenarioRun(ctx context.Context, s *Server, name, difficultyMode, fo
 		}
 		if trace, ok := ex["decision_trace"].(map[string]any); ok {
 			if diag, ok := trace["generator_diagnostics"].(ProductionGeneratorDiagnostics); ok {
-				out.GeneratorCalls += diag.Trace.ProviderCalls
 				if diag.InitialProviderSuccess {
 					out.GeneratorInitialSuccesses++
 				}
-				if diag.RetrySuccess {
-					out.GeneratorRetries++
-				}
+				out.GeneratorRetries += diag.Trace.RepairAttempts + diag.Trace.FreshRetries
 				if diag.FailureCode != "" {
 					if out.GeneratorFailureKinds == nil {
 						out.GeneratorFailureKinds = map[string]int{}
@@ -280,10 +282,14 @@ func v26LiveScenarioRun(ctx context.Context, s *Server, name, difficultyMode, fo
 					out.GeneratorFailureKinds[diag.FailureCode]++
 				}
 			} else if focus == TrainingFocusFree {
-				out.GeneratorCalls++
+				if ex["generated_by"] == "provider" {
+					out.GeneratorInitialSuccesses++
+				}
 			}
 		} else if focus == TrainingFocusFree {
-			out.GeneratorCalls++
+			if ex["generated_by"] == "provider" {
+				out.GeneratorInitialSuccesses++
+			}
 		}
 		present, _ := ex["target_pattern_present"].(bool)
 		if present {
@@ -322,7 +328,9 @@ func v26LiveScenarioRun(ctx context.Context, s *Server, name, difficultyMode, fo
 		if len(answers) > 1 && strings.TrimSpace(answers[1]) != "" && strings.TrimSpace(answers[1]) != strings.TrimSpace(answer) {
 			alternative = answers[1]
 		}
+		providerCallsBefore = v26AllowedProviderCalls(s)
 		result, submitErr := s.submitAttempt(ctx, session, fmt.Sprint(ex["exercise_id"]), answer)
+		out.EvaluatorCalls += v26AllowedProviderCalls(s) - providerCallsBefore
 		if submitErr != nil {
 			out.EvaluatorFailures++
 			continue
@@ -331,13 +339,22 @@ func v26LiveScenarioRun(ctx context.Context, s *Server, name, difficultyMode, fo
 		_ = s.db.QueryRow(`SELECT evaluation_diagnostics_json FROM attempts WHERE id=?`, result["attempt_id"]).Scan(&diagnosticJSON)
 		var diag EvaluationDiagnostics
 		_ = json.Unmarshal([]byte(diagnosticJSON), &diag)
-		out.EvaluatorCalls += diag.ProviderCalls
 		if result["evaluation_status"] != "validated" {
 			out.EvaluatorFailures++
 			if out.EvaluatorFailureKinds == nil {
 				out.EvaluatorFailureKinds = map[string]int{}
 			}
 			out.EvaluatorFailureKinds[fmt.Sprint(result["error_category"])]++
+			if diag.SchemaError != "" {
+				if out.EvaluatorSchemaErrors == nil {
+					out.EvaluatorSchemaErrors = map[string]int{}
+				}
+				schemaError := diag.SchemaError
+				if len(schemaError) > 120 {
+					schemaError = schemaError[:120]
+				}
+				out.EvaluatorSchemaErrors[schemaError]++
+			}
 			continue
 		}
 		out.Evaluated++
@@ -359,7 +376,9 @@ func v26LiveScenarioRun(ctx context.Context, s *Server, name, difficultyMode, fo
 			out.Samples = append(out.Samples, v26LiveSample{Scenario: name, ExerciseID: fmt.Sprint(ex["exercise_id"]), Prompt: prompt, Pattern: fmt.Sprint(ex["target_pattern"]), Answer: answer, Alternative: alternative, Verdict: evaluation.Verdict, Level: level, Difficulty: d, TargetPatternPresent: present})
 		}
 		if alternativeReserve > 0 && i < alternativeReserve && alternative != "" {
+			providerCallsBefore = v26AllowedProviderCalls(s)
 			altResult, altErr := s.submitAttempt(ctx, session, fmt.Sprint(ex["exercise_id"]), alternative)
+			out.EvaluatorCalls += v26AllowedProviderCalls(s) - providerCallsBefore
 			if altErr == nil && altResult["evaluation_status"] == "validated" {
 				out.AlternativePairs++
 				out.Evaluated++
@@ -374,6 +393,14 @@ func v26LiveScenarioRun(ctx context.Context, s *Server, name, difficultyMode, fo
 		out.PatternMasteryMutations = masteryAfter - masteryBefore
 	}
 	return out, nil
+}
+
+func v26AllowedProviderCalls(s *Server) int {
+	if s == nil || s.llm == nil || s.llm.callLimiter == nil {
+		return 0
+	}
+	allowed, _ := s.llm.callLimiter.counts()
+	return allowed
 }
 
 func sameDatabaseSnapshot(a, b *V241DatabaseSnapshot) bool {
@@ -402,11 +429,18 @@ func writeV26LiveReport(jsonPath, mdPath string, report v26LiveReport) error {
 	var b strings.Builder
 	b.WriteString("# English Practice AI V2.6\n# Fixed Difficulty Mastery & Free Expression\n\n")
 	fmt.Fprintf(&b, "Provider: %s / %s\n\nStage A exercises: %d\n\nStage B exercises: %d\n\nProvider calls: %d; denied at cap: %d\n\n", report.Provider, report.Model, report.StageAAttempts, report.StageBAttempts, report.TotalProviderCalls, report.DeniedCalls)
-	b.WriteString("## Live Mode Results\n\n| Scenario | Requested | Generated | Initial success | Retries | Fallback | Evaluated | Evaluator calls | Eval failures | Curriculum violations | Out of level | Out of band | Pattern leakage | Mastery mutation |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+	b.WriteString("## Live Mode Results\n\n| Scenario | Requested | Generated | Initial success | Retries | Fallback | Evaluated | Evaluator calls | Eval failures | Curriculum violations | Out of level | Out of band | Pattern leakage | Mastery mutation | Generator failure kinds | Evaluator failure kinds | Schema errors |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |\n")
 	for _, s := range report.Scenarios {
-		fmt.Fprintf(&b, "| %s | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d |\n", s.DifficultyMode+" + "+s.TrainingFocus, s.Requested, s.Generated, s.GeneratorInitialSuccesses, s.GeneratorRetries, s.GenerationFallbacks, s.Evaluated, s.EvaluatorCalls, s.EvaluatorFailures, s.CurriculumViolations, s.OutOfLevel, s.OutOfBand, s.PatternPenalty, s.PatternMasteryMutations)
+		fmt.Fprintf(&b, "| %s | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %v | %v | %v |\n", s.DifficultyMode+" + "+s.TrainingFocus, s.Requested, s.Generated, s.GeneratorInitialSuccesses, s.GeneratorRetries, s.GenerationFallbacks, s.Evaluated, s.EvaluatorCalls, s.EvaluatorFailures, s.CurriculumViolations, s.OutOfLevel, s.OutOfBand, s.PatternPenalty, s.PatternMasteryMutations, s.GeneratorFailureKinds, s.EvaluatorFailureKinds, s.EvaluatorSchemaErrors)
 	}
-	fmt.Fprintf(&b, "\nD1 advanced leakage: %d\n\nD1 Would-you-mind leakage: %d\n\nAlternative answer pairs accepted: %d; rejected: %d\n\nProduction DB unchanged: %t\n\nHuman real-use: PENDING\n\n", sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.D1AdvancedLeakage }), sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.D1WouldYouMindLeakage }), sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.AlternativeAccepted }), sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.AlternativeRejected }), sameDatabaseSnapshot(report.ProductionBefore, report.ProductionAfter))
+	fmt.Fprintf(&b, "\nD1 advanced leakage: %d\n\nD1 Would-you-mind leakage: %d\n\nAlternative answer pairs available: %d; accepted: %d; rejected: %d\n\n", sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.D1AdvancedLeakage }), sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.D1WouldYouMindLeakage }), sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.AlternativePairs }), sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.AlternativeAccepted }), sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.AlternativeRejected }))
+	b.WriteString("Production DB snapshot before / after:\n\n| Table | Before | After |\n| --- | ---: | ---: |\n")
+	if report.ProductionBefore != nil && report.ProductionAfter != nil {
+		for _, table := range []string{"attempts", "evaluations", "pattern_mastery", "scene_mastery", "review_schedule"} {
+			fmt.Fprintf(&b, "| %s | %d | %d |\n", table, report.ProductionBefore.Tables[table], report.ProductionAfter.Tables[table])
+		}
+	}
+	fmt.Fprintf(&b, "\nProduction DB unchanged: %t\n\nHuman real-use: PENDING\n\n", sameDatabaseSnapshot(report.ProductionBefore, report.ProductionAfter))
 	b.WriteString("## Health Flags\n\n")
 	if len(report.HealthFlags) == 0 {
 		b.WriteString("PASS\n")

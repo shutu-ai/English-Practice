@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -39,5 +42,37 @@ func TestV26RegistryAppliesSharedProviderCallLimiter(t *testing.T) {
 	limited, ok := client.(limitedLLMClient)
 	if !ok || limited.limiter != limiter {
 		t.Fatal("registry client does not share the V2.6 limiter")
+	}
+}
+
+func TestV26LiveReportIncludesCallsFailuresAndDBSnapshots(t *testing.T) {
+	dir := t.TempDir()
+	before := &V241DatabaseSnapshot{Tables: map[string]int{"attempts": 7}}
+	after := &V241DatabaseSnapshot{Tables: map[string]int{"attempts": 7}}
+	report := v26LiveReport{
+		Provider: "provider", Model: "model", TotalProviderCalls: 3, DeniedCalls: 1,
+		ProductionBefore: before, ProductionAfter: after,
+		Scenarios: []v26LiveScenario{{
+			DifficultyMode: DifficultyModeFixed, TrainingFocus: TrainingFocusFree,
+			Requested: 1, Generated: 1, GeneratorInitialSuccesses: 1,
+			EvaluatorCalls: 2, EvaluatorFailures: 1,
+			EvaluatorFailureKinds: map[string]int{"invalid_structured_output": 1},
+			EvaluatorSchemaErrors: map[string]int{"missing required field verdict": 1},
+		}},
+	}
+	jsonPath := filepath.Join(dir, "report.json")
+	mdPath := filepath.Join(dir, "report.md")
+	if err := writeV26LiveReport(jsonPath, mdPath, report); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(mdPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markdown := string(data)
+	for _, expected := range []string{"Provider calls: 3; denied at cap: 1", "invalid_structured_output", "missing required field verdict", "| attempts | 7 | 7 |"} {
+		if !strings.Contains(markdown, expected) {
+			t.Errorf("report missing %q", expected)
+		}
 	}
 }
