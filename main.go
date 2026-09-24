@@ -112,20 +112,27 @@ type ProviderConfig struct {
 	ExposesReasoningContent  bool    `json:"exposes_reasoning_content,omitempty"`
 }
 type LLMRegistry struct {
-	mu      sync.RWMutex
-	configs map[string]ProviderConfig
+	mu          sync.RWMutex
+	configs     map[string]ProviderConfig
+	callLimiter *providerCallLimiter
 }
 
 func (r *LLMRegistry) Client(c ProviderConfig) LLMClient {
+	var client LLMClient
 	switch strings.ToLower(strings.ReplaceAll(c.Type, "_", "-")) {
 	case "ollama":
-		return HTTPChatClient{cfg: c, ollama: true}
+		client = HTTPChatClient{cfg: c, ollama: true}
 	case "openai-compatible", "compatible":
-		return HTTPChatClient{cfg: c}
+		client = HTTPChatClient{cfg: c}
 	case "openai":
-		return HTTPChatClient{cfg: c}
+		client = HTTPChatClient{cfg: c}
+	default:
+		client = HTTPChatClient{cfg: c}
 	}
-	return HTTPChatClient{cfg: c}
+	if r.callLimiter != nil {
+		return limitedLLMClient{inner: client, limiter: r.callLimiter}
+	}
+	return client
 }
 
 type HTTPChatClient struct {

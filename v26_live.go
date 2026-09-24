@@ -10,8 +10,45 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
+
+type providerCallLimiter struct {
+	mu      sync.Mutex
+	maximum int
+	allowed int
+	denied  int
+}
+
+func (l *providerCallLimiter) acquire() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.allowed >= l.maximum {
+		l.denied++
+		return false
+	}
+	l.allowed++
+	return true
+}
+
+func (l *providerCallLimiter) counts() (allowed, denied int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.allowed, l.denied
+}
+
+type limitedLLMClient struct {
+	inner   LLMClient
+	limiter *providerCallLimiter
+}
+
+func (c limitedLLMClient) Chat(ctx context.Context, request ChatRequest) (*ChatResponse, error) {
+	if !c.limiter.acquire() {
+		return nil, errors.New("V2.6 live acceptance provider call limit reached")
+	}
+	return c.inner.Chat(ctx, request)
+}
 
 type v26LiveSample struct {
 	Scenario, ExerciseID, Prompt, Pattern, Answer, Alternative, Verdict string
@@ -36,13 +73,13 @@ type v26LiveScenario struct {
 }
 
 type v26LiveReport struct {
-	GeneratedAt, Provider, Model                       string
-	StageAAttempts, StageBAttempts, TotalProviderCalls int
-	IsolatedDB                                         bool
-	Scenarios                                          []v26LiveScenario
-	ProductionBefore, ProductionAfter                  *V241DatabaseSnapshot
-	HealthFlags                                        []string
-	HumanSpotAudit                                     string
+	GeneratedAt, Provider, Model                                    string
+	StageAAttempts, StageBAttempts, TotalProviderCalls, DeniedCalls int
+	IsolatedDB                                                      bool
+	Scenarios                                                       []v26LiveScenario
+	ProductionBefore, ProductionAfter                               *V241DatabaseSnapshot
+	HealthFlags                                                     []string
+	HumanSpotAudit                                                  string
 }
 
 func runV26LiveCLI(args []string) error {
@@ -106,7 +143,8 @@ func runV26LiveCLI(args []string) error {
 	if provider.MaxTokens < 1200 {
 		provider.MaxTokens = 1600
 	}
-	s := &Server{db: db, llm: &LLMRegistry{configs: map[string]ProviderConfig{provider.ID: provider}}}
+	limiter := &providerCallLimiter{maximum: *maxCalls}
+	s := &Server{db: db, llm: &LLMRegistry{configs: map[string]ProviderConfig{provider.ID: provider}, callLimiter: limiter}}
 	report := v26LiveReport{GeneratedAt: time.Now().UTC().Format(time.RFC3339), Provider: provider.ID, Model: provider.Model, StageAAttempts: 40, StageBAttempts: 4 * *stageB, IsolatedDB: true, ProductionBefore: before, HumanSpotAudit: "PENDING: requires human review of 20 live exercises"}
 	scenarios := []struct {
 		name, difficulty, focus string
@@ -146,8 +184,7 @@ func runV26LiveCLI(args []string) error {
 				continue
 			}
 			altCount++
-			eval, _, _, diagnostics, evalErr := s.evaluateWithProviderOptionsSpec(ctx, sample.Prompt, "", sample.Alternative, "", ProviderRequestOptions{}, EvaluationSpec{TargetPatternMode: "none"})
-			report.TotalProviderCalls += diagnostics.ProviderCalls
+			eval, _, _, _, evalErr := s.evaluateWithProviderOptionsSpec(ctx, sample.Prompt, "", sample.Alternative, "", ProviderRequestOptions{}, EvaluationSpec{TargetPatternMode: "none"})
 			sc.AlternativePairs++
 			if evalErr != nil {
 				sc.AlternativeRejected++
@@ -168,8 +205,8 @@ func runV26LiveCLI(args []string) error {
 		return err
 	}
 	report.ProductionAfter = after
+	report.TotalProviderCalls, report.DeniedCalls = limiter.counts()
 	for _, sc := range report.Scenarios {
-		report.TotalProviderCalls += sc.GeneratorCalls + sc.EvaluatorCalls
 		if sc.Generated != sc.Requested || sc.EvaluatorFailures > 0 || sc.OutOfLevel > 0 || sc.OutOfBand > 0 || sc.CurriculumViolations > 0 || sc.PatternPenalty > 0 || sc.PatternMasteryMutations > 0 {
 			report.HealthFlags = append(report.HealthFlags, sc.DifficultyMode+"/"+sc.TrainingFocus+" acceptance invariant failed")
 		}
@@ -177,8 +214,8 @@ func runV26LiveCLI(args []string) error {
 	if !sameDatabaseSnapshot(before, after) {
 		report.HealthFlags = append(report.HealthFlags, "production learner database changed")
 	}
-	if report.TotalProviderCalls > *maxCalls {
-		report.HealthFlags = append(report.HealthFlags, "provider call bound exceeded")
+	if report.DeniedCalls > 0 {
+		report.HealthFlags = append(report.HealthFlags, fmt.Sprintf("provider call cap denied %d request(s)", report.DeniedCalls))
 	}
 	if err := writeV26LiveReport(*output, *markdown, report); err != nil {
 		return err
@@ -364,10 +401,10 @@ func writeV26LiveReport(jsonPath, mdPath string, report v26LiveReport) error {
 	}
 	var b strings.Builder
 	b.WriteString("# English Practice AI V2.6\n# Fixed Difficulty Mastery & Free Expression\n\n")
-	fmt.Fprintf(&b, "Provider: %s / %s\n\nStage A exercises: %d\n\nStage B exercises: %d\n\nProvider calls: %d\n\n", report.Provider, report.Model, report.StageAAttempts, report.StageBAttempts, report.TotalProviderCalls)
-	b.WriteString("## Live Mode Results\n\n| Scenario | Requested | Generated | Evaluated | Fallback | Out of level | Out of band | Pattern leakage | Mastery mutation |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+	fmt.Fprintf(&b, "Provider: %s / %s\n\nStage A exercises: %d\n\nStage B exercises: %d\n\nProvider calls: %d; denied at cap: %d\n\n", report.Provider, report.Model, report.StageAAttempts, report.StageBAttempts, report.TotalProviderCalls, report.DeniedCalls)
+	b.WriteString("## Live Mode Results\n\n| Scenario | Requested | Generated | Initial success | Retries | Fallback | Evaluated | Evaluator calls | Eval failures | Curriculum violations | Out of level | Out of band | Pattern leakage | Mastery mutation |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
 	for _, s := range report.Scenarios {
-		fmt.Fprintf(&b, "| %s | %d | %d | %d | %d | %d | %d | %d | %d |\n", s.DifficultyMode+" + "+s.TrainingFocus, s.Requested, s.Generated, s.Evaluated, s.GenerationFallbacks, s.OutOfLevel, s.OutOfBand, s.PatternPenalty, s.PatternMasteryMutations)
+		fmt.Fprintf(&b, "| %s | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d |\n", s.DifficultyMode+" + "+s.TrainingFocus, s.Requested, s.Generated, s.GeneratorInitialSuccesses, s.GeneratorRetries, s.GenerationFallbacks, s.Evaluated, s.EvaluatorCalls, s.EvaluatorFailures, s.CurriculumViolations, s.OutOfLevel, s.OutOfBand, s.PatternPenalty, s.PatternMasteryMutations)
 	}
 	fmt.Fprintf(&b, "\nD1 advanced leakage: %d\n\nD1 Would-you-mind leakage: %d\n\nAlternative answer pairs accepted: %d; rejected: %d\n\nProduction DB unchanged: %t\n\nHuman real-use: PENDING\n\n", sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.D1AdvancedLeakage }), sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.D1WouldYouMindLeakage }), sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.AlternativeAccepted }), sumV26(report.Scenarios, func(s v26LiveScenario) int { return s.AlternativeRejected }), sameDatabaseSnapshot(report.ProductionBefore, report.ProductionAfter))
 	b.WriteString("## Health Flags\n\n")
