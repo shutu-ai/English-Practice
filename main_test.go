@@ -289,7 +289,8 @@ func TestStructuredOutputNormalization(t *testing.T) {
 		{"irrelevant_content", "meaning"}, {"irrelevant_response", "meaning"},
 		{"task_completion", "meaning"}, {"task_fulfillment", "meaning"},
 		{"task_relevance", "meaning"}, {"task_response", "meaning"},
-		{"communication_intent_not_fulfilled", "meaning"}, {"content", "other"},
+		{"communication_intent", "meaning"}, {"communication_intent_not_fulfilled", "meaning"},
+		{"content", "other"}, {"pragmatics", "other"},
 	} {
 		input := strings.Replace(validEvaluationJSON(), `"errors":[]`, fmt.Sprintf(`"errors":[{"type":%q,"severity":"minor","explanation":"x"}]`, tc.provider), 1)
 		eval, err := normalizeEvalContent(input)
