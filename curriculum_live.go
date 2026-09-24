@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -200,35 +201,132 @@ func blindCurriculumJudge(ctx context.Context, client LLMClient, prompt string, 
 	}
 	system := `Judge the English-learning task independently. Return one strict JSON object only with estimated_cefr, productive_complexity, grammar_features, communication_function, confidence. Do not infer or return an internal D-level, expected label, pattern id, or target difficulty. Judge only the Chinese prompt, task, and reference answer.`
 	user := fmt.Sprintf("Chinese prompt: %s\nReference answer(s): %s", prompt, strings.Join(references, " | "))
-	response, err := client.Chat(ctx, ChatRequest{Messages: []ChatMessage{{Role: "system", Content: system}, {Role: "user", Content: user}}, Temperature: .1, MaxTokens: 300, JSONMode: true})
-	if err != nil || response == nil {
-		return curriculumLiveJudge{}, errors.New("blind judge request failed")
+	response, err := client.Chat(ctx, ChatRequest{Messages: []ChatMessage{{Role: "system", Content: system}, {Role: "user", Content: user}}, Temperature: .1, MaxTokens: 500, JSONMode: true, ReasoningMode: "disabled", ReasoningEffort: "none", RequestID: "curriculum-independent-judge"})
+	if err != nil {
+		return curriculumLiveJudge{}, fmt.Errorf("judge_%s", judgeFailureCode(err))
 	}
-	content := strings.TrimSpace(response.Content)
-	content = strings.TrimPrefix(content, "```")
-	content = strings.TrimPrefix(content, "json")
-	content = strings.TrimSuffix(content, "```")
-	var result curriculumLiveJudge
-	if err := json.Unmarshal([]byte(strings.TrimSpace(content)), &result); err != nil || result.EstimatedCEFR == "" {
-		return curriculumLiveJudge{}, errors.New("blind judge JSON invalid")
+	if response == nil {
+		return curriculumLiveJudge{}, errors.New("judge_provider_empty")
+	}
+	content, err := stripJSONFence(response.Content)
+	if err != nil {
+		return curriculumLiveJudge{}, errors.New("judge_malformed_json")
+	}
+	result, err := parseCurriculumLiveJudge(content)
+	if err != nil {
+		return curriculumLiveJudge{}, errors.New("judge_schema_invalid")
 	}
 	return result, nil
+}
+
+func parseCurriculumLiveJudge(content string) (curriculumLiveJudge, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(content), &fields); err != nil || fields == nil {
+		return curriculumLiveJudge{}, errors.New("judge object required")
+	}
+	for _, wrapper := range []string{"judge", "result", "assessment"} {
+		if nested, ok := fields[wrapper]; ok {
+			var candidate map[string]json.RawMessage
+			if json.Unmarshal(nested, &candidate) == nil && candidate != nil && len(candidate) > 0 {
+				fields = candidate
+				break
+			}
+		}
+	}
+	lookup := func(names ...string) json.RawMessage {
+		for _, name := range names {
+			if value, ok := fields[name]; ok {
+				return value
+			}
+		}
+		return nil
+	}
+	var result curriculumLiveJudge
+	cefr := lookup("estimated_cefr", "estimated_cefr_band", "cefr", "cefr_band", "level")
+	if len(cefr) == 0 {
+		return result, errors.New("missing estimated cefr")
+	}
+	if err := json.Unmarshal(cefr, &result.EstimatedCEFR); err != nil {
+		var object map[string]json.RawMessage
+		if json.Unmarshal(cefr, &object) != nil {
+			return result, err
+		}
+		for _, key := range []string{"band", "cefr", "label", "level"} {
+			if value, ok := object[key]; ok && json.Unmarshal(value, &result.EstimatedCEFR) == nil && strings.TrimSpace(result.EstimatedCEFR) != "" {
+				break
+			}
+		}
+	}
+	if strings.TrimSpace(result.EstimatedCEFR) == "" {
+		return result, errors.New("empty estimated cefr")
+	}
+	parseNumber := func(raw json.RawMessage) float64 {
+		if len(raw) == 0 {
+			return 0
+		}
+		var number float64
+		if json.Unmarshal(raw, &number) == nil {
+			return number
+		}
+		var text string
+		if json.Unmarshal(raw, &text) == nil {
+			value, _ := strconv.ParseFloat(strings.TrimSuffix(strings.TrimSpace(text), "%"), 64)
+			if value > 1 {
+				value /= 100
+			}
+			return value
+		}
+		return 0
+	}
+	result.ProductiveComplexity = parseNumber(lookup("productive_complexity", "complexity", "difficulty"))
+	result.Confidence = parseNumber(lookup("confidence", "confidence_score"))
+	if raw := lookup("communication_function", "communication", "function"); len(raw) > 0 {
+		_ = json.Unmarshal(raw, &result.CommunicationFunction)
+	}
+	if raw := lookup("grammar_features", "grammar", "features"); len(raw) > 0 {
+		if json.Unmarshal(raw, &result.GrammarFeatures) != nil {
+			var text string
+			if json.Unmarshal(raw, &text) == nil && strings.TrimSpace(text) != "" {
+				result.GrammarFeatures = []string{text}
+			}
+		}
+	}
+	return result, nil
+}
+
+func judgeFailureCode(err error) string {
+	var providerErr *ProviderError
+	if errors.As(err, &providerErr) {
+		switch providerErr.Category {
+		case "timeout":
+			return "timeout"
+		case "reasoning_only":
+			return "reasoning_only"
+		case "provider_empty":
+			return "provider_empty"
+		case "invalid_provider_envelope", "adapter_extraction_empty":
+			return "malformed_response"
+		default:
+			return "http_error"
+		}
+	}
+	return "unknown"
 }
 
 func curriculumSeriousMismatch(expected, estimated string) bool {
 	band := func(value string) int {
 		value = strings.ToUpper(strings.TrimSpace(value))
 		switch {
-		case strings.Contains(value, "PRE"):
+		case strings.HasPrefix(value, "PRE") || strings.Contains(value, "PRE-A1") || strings.Contains(value, "PRE A1"):
 			return 0
-		case strings.Contains(value, "A1"):
-			return 1
-		case strings.Contains(value, "A2"):
-			return 2
-		case strings.Contains(value, "B1"):
-			return 3
 		case strings.Contains(value, "B2"):
 			return 4
+		case strings.Contains(value, "B1"):
+			return 3
+		case strings.Contains(value, "A2"):
+			return 2
+		case strings.Contains(value, "A1"):
+			return 1
 		default:
 			return -1
 		}

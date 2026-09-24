@@ -245,6 +245,7 @@ func validateSimulationConfig(c SimulationConfig) error {
 type SimulationExercise struct {
 	ID, ChinesePrompt, PatternID, Pattern, SceneID, SubsceneID, Intent, DifficultyBand string
 	Difficulty                                                                         float64
+	CurriculumLevel                                                                    int      `json:"curriculum_level,omitempty"`
 	DifficultyMode                                                                     string   `json:"difficulty_mode,omitempty"`
 	FixedDifficulty                                                                    float64  `json:"fixed_difficulty,omitempty"`
 	TrainingFocus                                                                      string   `json:"training_focus,omitempty"`
@@ -265,6 +266,7 @@ type GenerationSpec struct {
 	Pattern              string  `json:"pattern"`
 	TargetDifficulty     float64 `json:"target_difficulty"`
 	DifficultyBand       string  `json:"difficulty_band"`
+	CurriculumLevel      int     `json:"curriculum_level"`
 	DifficultyMode       string  `json:"difficulty_mode,omitempty"`
 	FixedDifficulty      float64 `json:"fixed_difficulty,omitempty"`
 	TrainingFocus        string  `json:"training_focus,omitempty"`
@@ -272,7 +274,7 @@ type GenerationSpec struct {
 }
 
 func generationSpecFromExercise(ex SimulationExercise) GenerationSpec {
-	return GenerationSpec{ExerciseID: ex.ID, SceneID: ex.SceneID, SubsceneID: ex.SubsceneID, Intent: ex.Intent, PatternID: ex.PatternID, Pattern: ex.Pattern, TargetDifficulty: ex.Difficulty, DifficultyBand: ex.DifficultyBand, DifficultyMode: ex.DifficultyMode, FixedDifficulty: ex.FixedDifficulty, TrainingFocus: ex.TrainingFocus, TargetPatternPresent: ex.TargetPatternPresent}
+	return GenerationSpec{ExerciseID: ex.ID, SceneID: ex.SceneID, SubsceneID: ex.SubsceneID, Intent: ex.Intent, PatternID: ex.PatternID, Pattern: ex.Pattern, TargetDifficulty: ex.Difficulty, DifficultyBand: ex.DifficultyBand, CurriculumLevel: ex.CurriculumLevel, DifficultyMode: ex.DifficultyMode, FixedDifficulty: ex.FixedDifficulty, TrainingFocus: ex.TrainingFocus, TargetPatternPresent: ex.TargetPatternPresent}
 }
 
 type SimulatedLearnerState struct {
@@ -504,6 +506,7 @@ type LLMExerciseGenerator struct {
 	Client                         LLMClient
 	MaxTokens                      int
 	ReasoningMode, ReasoningEffort string
+	retryHint                      string
 }
 
 func (g LLMExerciseGenerator) Generate(ctx context.Context, ex SimulationExercise) (SimulationExercise, error) {

@@ -363,6 +363,7 @@ type adaptiveCandidate struct {
 	Reason                                                                   string
 	ReviewTiming                                                             string
 	Review, Probe, New                                                       bool
+	CurriculumLevel                                                          int
 	DecisionTrace                                                            map[string]any
 	SceneID, SubsceneID                                                      string
 	ScopeRelaxed                                                             bool
@@ -707,6 +708,11 @@ func normalizeChineseHash(s string) string {
 	return hex.EncodeToString(h[:])
 }
 func (s *Server) generateAIExercise(ctx context.Context, c adaptiveCandidate, scene string, recent []string) (exerciseSeed, string, float64) {
+	seed, source, realized, _ := s.generateAIExerciseDetailed(ctx, c, scene, recent)
+	return seed, source, realized
+}
+
+func (s *Server) generateAIExerciseDetailed(ctx context.Context, c adaptiveCandidate, scene string, recent []string) (exerciseSeed, string, float64, ProductionGeneratorDiagnostics) {
 	s.llm.mu.RLock()
 	var pc ProviderConfig
 	for _, x := range s.llm.configs {
@@ -717,47 +723,55 @@ func (s *Server) generateAIExercise(ctx context.Context, c adaptiveCandidate, sc
 	}
 	s.llm.mu.RUnlock()
 	if pc.ID == "" {
-		return exerciseSeed{}, "", 0
+		diag := ProductionGeneratorDiagnostics{RequestedLevel: curriculumLevelForDifficulty(c.SessionCenter), PatternID: c.ID, FailureCode: "PROVIDER_HTTP_ERROR", FailureDetail: "no enabled generator provider"}
+		return exerciseSeed{}, "", 0, diag
 	}
-	lower, upper := sessionBand(c.SessionCenter, s.adaptiveConfig())
-	if value, ok := c.DecisionTrace["fixed_band_lower"].(float64); ok {
-		lower = value
+	level := c.CurriculumLevel
+	if level <= 0 {
+		level = curriculumLevelForDifficulty(c.SessionCenter)
 	}
-	if value, ok := c.DecisionTrace["fixed_band_upper"].(float64); ok {
-		upper = value
-	}
-	level := curriculumLevelForDifficulty(c.SessionCenter)
 	p, _ := curriculumPattern(c.ID)
 	if p.AppLevelMin > level {
 		level = p.AppLevelMin
 	}
-	envelope, _ := json.Marshal(curriculumEnvelope(level))
-	sys := `Generate one English practice exercise as strict JSON only. Fields: chinese_prompt, target_pattern, scene, intent, estimated_difficulty, reference_answers (array of strings). Respect every constraint: target difficulty, allowed difficulty range, sentence length target, grammar complexity, maximum clause count, lexical complexity, scene, pattern, intent, and the curriculum envelope. Do not exceed the specified difficulty band or introduce a higher-level target. Make a substantially different context from recent exercises and do not reveal the answer before the learner responds.`
-	user := fmt.Sprintf("pattern=%s skill=%s scene=%s intent=%s curriculum_level=D%d cefr_anchor=%s grammar_family=%s target_difficulty=%.1f allowed_difficulty_range=%.1f-%.1f sentence_length_target=%s grammar_complexity=%s max_clause_count=%d lexical_complexity=%s selection_reason=%s curriculum_envelope=%s recent=%s", c.Pattern, c.Skill, scene, c.Intent, level, p.CEFRAnchor, p.GrammarFamily, c.Difficulty, lower, upper, difficultySentenceLength(c.Difficulty), difficultyGrammarComplexity(c.Pattern), difficultyMaxClauses(c.Difficulty), difficultyLexicalComplexity(c.Difficulty), c.Reason, string(envelope), strings.Join(recent, " | "))
-	r, err := s.llm.Client(pc).Chat(ctx, ChatRequest{Messages: []ChatMessage{{Role: "system", Content: sys}, {Role: "user", Content: user}}, Temperature: pc.Temperature, MaxTokens: maxInt(pc.MaxTokens, 500), JSONMode: true})
+	ex := SimulationExercise{ID: "adaptive-" + c.ID, PatternID: c.ID, Pattern: c.Pattern, SceneID: scene, Intent: c.Intent, DifficultyBand: difficultyBand(c.Difficulty), Difficulty: c.Difficulty, CurriculumLevel: level, ReferenceAnswers: nil}
+	client := s.llm.Client(pc)
+	generator := LLMExerciseGenerator{Client: client, MaxTokens: maxInt(pc.MaxTokens, 700), ReasoningMode: "disabled", ReasoningEffort: "none"}
+	generated, trace, err := generator.GenerateDetailed(ctx, ex)
+	diag := productionGeneratorDiagnostics(trace, err)
+	diag.RequestedLevel = level
+	diag.PatternID = c.ID
 	if err != nil {
-		return exerciseSeed{}, "", 0
+		return exerciseSeed{}, "", 0, diag
 	}
-	var out struct {
-		Prompt     string   `json:"chinese_prompt"`
-		Pattern    string   `json:"target_pattern"`
-		Scene      string   `json:"scene"`
-		Difficulty float64  `json:"estimated_difficulty"`
-		Answers    []string `json:"reference_answers"`
+	if check := (CurriculumComplianceValidator{DB: s.db}).Validate(level, c.ID, generated.ChinesePrompt); !check.Passed {
+		diag.CurriculumValid = false
+		diag.Accepted = false
+		diag.FailureCode = curriculumFailureCode(check)
+		diag.FailureDetail = diag.FailureCode
+		return exerciseSeed{}, "", 0, diag
 	}
-	if json.Unmarshal([]byte(strings.TrimSpace(r.Content)), &out) != nil || strings.TrimSpace(out.Prompt) == "" || out.Pattern == "" {
-		return exerciseSeed{}, "", 0
+	diag.CurriculumValid = true
+	realized, _ := validateExerciseHeuristics(generated.ChinesePrompt, c.Pattern, c.Difficulty)
+	if realized <= 0 {
+		realized = c.Difficulty
 	}
-	if check := (CurriculumComplianceValidator{DB: s.db}).Validate(p.AppLevelMin, c.ID, out.Prompt); !check.Passed {
-		return exerciseSeed{}, "", 0
+	diag.DifficultyValid = true
+	diag.Accepted = true
+	return exerciseSeed{Prompt: generated.ChinesePrompt, Answers: generated.ReferenceAnswers}, "provider", realized, diag
+}
+
+func curriculumFailureCode(check CurriculumValidationResult) string {
+	if len(check.PrerequisiteViolations) > 0 {
+		return "PREREQUISITE_NOT_READY"
 	}
-	if out.Pattern != c.Pattern {
-		out.Pattern = c.Pattern
+	if len(check.InstructionViolations) > 0 {
+		return "INSTRUCTION_COMPLEXITY_VIOLATION"
 	}
-	if out.Difficulty <= 0 {
-		out.Difficulty = c.Difficulty
+	if check.AdvancedPatternLeakage {
+		return "CURRICULUM_LEVEL_MISMATCH"
 	}
-	return exerciseSeed{Prompt: out.Prompt, Answers: out.Answers}, "provider", out.Difficulty
+	return "CURRICULUM_LEVEL_MISMATCH"
 }
 func maxInt(a, b int) int {
 	if a > b {
@@ -887,6 +901,7 @@ func (s *Server) generateExerciseForScene(ctx context.Context, diff float64, mod
 	var seed exerciseSeed
 	var generatedBy string
 	var realized float64
+	var lastGeneratorDiagnostics ProductionGeneratorDiagnostics
 	validationStatus := "validated"
 	validationReason := "within_configured_difficulty_band"
 	validationFailed := false
@@ -894,9 +909,17 @@ func (s *Server) generateExerciseForScene(ctx context.Context, diff float64, mod
 		var candidate exerciseSeed
 		var candidateBy string
 		var candidateRealized float64
-		candidate, candidateBy, candidateRealized = s.generateAIExercise(ctx, c, chosenScene, recent)
+		candidate, candidateBy, candidateRealized, lastGeneratorDiagnostics = s.generateAIExerciseDetailed(ctx, c, chosenScene, recent)
+		if c.DecisionTrace == nil {
+			c.DecisionTrace = map[string]any{}
+		}
+		c.DecisionTrace["generator_diagnostics"] = lastGeneratorDiagnostics
 		if candidate.Prompt == "" {
-			break
+			validationFailed = true
+			if lastGeneratorDiagnostics.FailureCode == "REALIZED_DIFFICULTY_MISMATCH" {
+				recordDifficultyValidation(s.db, "", difficultyValidation{Target: c.Difficulty, Realized: c.Difficulty + .61, Delta: .61, Accepted: false, Status: "difficulty_validation_failed", Reason: "provider metadata exceeded the application-owned difficulty band"}, retry)
+			}
+			continue
 		}
 		if candidateRealized <= 0 {
 			candidateRealized, _ = validateExerciseHeuristics(candidate.Prompt, c.Pattern, c.Difficulty)
@@ -907,6 +930,11 @@ func (s *Server) generateExerciseForScene(ctx context.Context, diff float64, mod
 		if !check.Accepted {
 			recordDifficultyValidation(s.db, "", check, retry)
 			validationFailed = true
+			lastGeneratorDiagnostics.DifficultyValid = false
+			lastGeneratorDiagnostics.Accepted = false
+			lastGeneratorDiagnostics.FailureCode = "REALIZED_DIFFICULTY_MISMATCH"
+			lastGeneratorDiagnostics.FailureDetail = "REALIZED_DIFFICULTY_MISMATCH"
+			c.DecisionTrace["generator_diagnostics"] = lastGeneratorDiagnostics
 			continue
 		}
 		seed, generatedBy, realized = candidate, candidateBy, candidateRealized
@@ -966,6 +994,12 @@ func (s *Server) generateExerciseForScene(ctx context.Context, diff float64, mod
 			}
 		}
 		generatedBy = "fallback"
+		lastGeneratorDiagnostics.FallbackUsed = true
+		lastGeneratorDiagnostics.Accepted = false
+		if lastGeneratorDiagnostics.FailureCode == "" {
+			lastGeneratorDiagnostics.FailureCode = "UNKNOWN"
+		}
+		c.DecisionTrace["generator_diagnostics"] = lastGeneratorDiagnostics
 		if validationFailed {
 			validationStatus = "fallback_after_validation_failure"
 			validationReason = "difficulty_validation_failed"

@@ -76,6 +76,14 @@ separates structural checks (target and prerequisites) from semantic checks
 (instruction complexity and obvious advanced leakage); invalid provider output
 falls back through the existing bounded reliability path.
 
+### V2.5.1 evidence update
+
+The `need` pattern was narrowly reclassified from D1 to D2. In the live
+V2.5.1 acceptance probe, independent judges repeatedly rated the productive
+form “need to + infinitive” as A2, while the earlier D1 placement treated it
+as a foundation statement. This is a single-pattern evidence update, not a
+bulk level shift; other D1 safety boundaries remain unchanged.
+
 ## Assessment and acceptance
 
 The 12-question assessment now uses stable anchors across foundation, A1, A2,

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 	"unicode"
@@ -134,6 +135,123 @@ type GenerationDiagnostics struct {
 	Responses            []GeneratorResponseDiagnostics `json:"responses,omitempty"`
 }
 
+// ProductionGeneratorDiagnostics is the sanitized trace used by the live
+// acceptance harness and by the exercise decision trace. It intentionally
+// records stages and bounded retry decisions, never raw provider content or
+// credentials.
+type ProductionGeneratorDiagnostics struct {
+	RequestedLevel            int                   `json:"requested_level"`
+	PatternID                 string                `json:"pattern_id"`
+	ProviderCallFailed        bool                  `json:"provider_call_failed"`
+	ProviderResponseReceived  bool                  `json:"provider_response_received"`
+	ProviderResponseParseable bool                  `json:"provider_response_parseable"`
+	StructurallyValid         bool                  `json:"structurally_valid"`
+	CurriculumValid           bool                  `json:"curriculum_valid"`
+	DifficultyValid           bool                  `json:"difficulty_valid"`
+	Accepted                  bool                  `json:"accepted"`
+	FallbackUsed              bool                  `json:"fallback_used"`
+	InitialProviderSuccess    bool                  `json:"initial_provider_success"`
+	RetrySuccess              bool                  `json:"retry_success"`
+	FinalSource               string                `json:"final_source,omitempty"`
+	FailureCode               string                `json:"failure_code,omitempty"`
+	FailureDetail             string                `json:"failure_detail,omitempty"`
+	PromptBytes               int                   `json:"prompt_bytes,omitempty"`
+	ResponseBytes             int                   `json:"response_bytes,omitempty"`
+	ContentSource             string                `json:"content_source,omitempty"`
+	FinishReason              string                `json:"finish_reason,omitempty"`
+	ReasoningPresent          bool                  `json:"reasoning_present,omitempty"`
+	ContractVersion           string                `json:"contract_version"`
+	Trace                     GenerationDiagnostics `json:"trace"`
+}
+
+func productionGeneratorFailureCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := strings.ToUpper(errorText(err))
+	kind := generatorFailureKind(err)
+	if strings.Contains(text, "CURRICULUM") || strings.Contains(text, "ADVANCED TARGET") {
+		return "CURRICULUM_LEVEL_MISMATCH"
+	}
+	if strings.Contains(text, "INSTRUCTION COMPLEXITY") {
+		return "INSTRUCTION_COMPLEXITY_VIOLATION"
+	}
+	if strings.Contains(text, "PREREQUISITE") {
+		return "PREREQUISITE_NOT_READY"
+	}
+	if strings.Contains(text, "INTENT") {
+		return "INTENT_LEVEL_VIOLATION"
+	}
+	if strings.Contains(text, "PATTERN") {
+		return "TARGET_PATTERN_NOT_ELIGIBLE"
+	}
+	switch kind {
+	case GeneratorFailureTimeout:
+		return "PROVIDER_TIMEOUT"
+	case GeneratorFailureProviderError:
+		var providerErr *ProviderError
+		if errors.As(err, &providerErr) && providerErr.HTTPStatus > 0 {
+			return "PROVIDER_HTTP_ERROR"
+		}
+		return "PROVIDER_HTTP_ERROR"
+	case GeneratorFailureProviderEmpty, GeneratorFailureEmptyResponse:
+		return "PROVIDER_EMPTY"
+	case GeneratorFailureReasoningOnly:
+		return "REASONING_ONLY"
+	case GeneratorFailureTruncatedJSON:
+		return "TRUNCATED_RESPONSE"
+	case GeneratorFailureMalformedJSON:
+		return "MALFORMED_JSON"
+	case GeneratorFailureSchemaInvalid:
+		if strings.Contains(text, "MISSING REQUIRED") || strings.Contains(text, "MISSING_FIELD") {
+			return "MISSING_FIELD"
+		}
+		return "SCHEMA_INVALID"
+	case GeneratorFailureInvalidDifficulty:
+		return "REALIZED_DIFFICULTY_MISMATCH"
+	case GeneratorFailureConstraintViolation:
+		return "CURRICULUM_LEVEL_MISMATCH"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+func productionGeneratorDiagnostics(diag GenerationDiagnostics, err error) ProductionGeneratorDiagnostics {
+	out := ProductionGeneratorDiagnostics{ContractVersion: diag.ContractVersion, PatternID: diag.Spec.PatternID, RequestedLevel: diag.Spec.CurriculumLevel, InitialProviderSuccess: diag.InitialSuccess, FinalSource: diag.FinalSource, Trace: diag}
+	for _, response := range diag.Responses {
+		if response.ResponseBytes > 0 || response.ContentSource != "" {
+			out.ProviderResponseReceived = true
+		}
+		if response.PromptBytes > out.PromptBytes {
+			out.PromptBytes = response.PromptBytes
+		}
+		if response.ResponseBytes > out.ResponseBytes {
+			out.ResponseBytes = response.ResponseBytes
+		}
+		if response.ContentSource != "" {
+			out.ContentSource = response.ContentSource
+		}
+		if response.FinishReason != "" {
+			out.FinishReason = response.FinishReason
+		}
+		out.ReasoningPresent = out.ReasoningPresent || response.ReasoningPresent
+	}
+	out.ProviderCallFailed = diag.ProviderCalls > 0 && !out.ProviderResponseReceived && err != nil
+	out.ProviderResponseParseable = diag.StructuralValidation == "passed"
+	out.StructurallyValid = out.ProviderResponseParseable
+	out.CurriculumValid = diag.SemanticValidation == "passed"
+	out.Accepted = err == nil
+	out.RetrySuccess = err == nil && diag.ProviderCalls > 1
+	if err != nil {
+		out.FailureCode = productionGeneratorFailureCode(err)
+		out.FailureDetail = out.FailureCode
+		if diag.LastFailureStage != "" {
+			out.FailureDetail += " at " + diag.LastFailureStage
+		}
+	}
+	return out
+}
+
 type GeneratorResponseDiagnostics struct {
 	Attempt             int                  `json:"attempt"`
 	ContentSource       string               `json:"content_source,omitempty"`
@@ -154,6 +272,10 @@ type generatedExercisePayload struct {
 	ChinesePrompt      string   `json:"chinese_prompt"`
 	ReferenceAnswers   []string `json:"reference_answers,omitempty"`
 	AlternativeAnswers []string `json:"alternative_answers,omitempty"`
+	// Legacy providers sometimes echo a difficulty estimate. It is never used
+	// as application metadata; an obviously inconsistent value is rejected so
+	// the provider cannot silently widen the accepted difficulty boundary.
+	EstimatedDifficulty *float64 `json:"estimated_difficulty,omitempty"`
 }
 
 const generatorContractVersion = "generator-contract-v2"
@@ -185,10 +307,10 @@ func (g LLMExerciseGenerator) GenerateDetailed(ctx context.Context, ex Simulatio
 		return SimulationExercise{}, diag, err
 	}
 	if kind == GeneratorFailureEmptyResponse || kind == GeneratorFailureTimeout || kind == GeneratorFailureProviderError || !generatorRetryableProviderError(err) {
-		return g.freshRetry(ctx, ex, &diag)
+		return g.freshRetry(ctx, ex, &diag, err)
 	}
 	if kind == GeneratorFailureSceneMismatch || kind == GeneratorFailurePatternMismatch || kind == GeneratorFailureIntentMismatch || kind == GeneratorFailureConstraintViolation || kind == GeneratorFailureInvalidDifficulty {
-		return g.freshRetry(ctx, ex, &diag)
+		return g.freshRetry(ctx, ex, &diag, err)
 	}
 
 	// Markdown fences, leading prose, and a single malformed/truncated object
@@ -208,7 +330,7 @@ func (g LLMExerciseGenerator) GenerateDetailed(ctx context.Context, ex Simulatio
 			return SimulationExercise{}, diag, repairErr
 		}
 	}
-	return g.freshRetry(ctx, ex, &diag)
+	return g.freshRetry(ctx, ex, &diag, err)
 }
 
 func (d *GenerationDiagnostics) recordFailure(err error) {
@@ -240,7 +362,7 @@ func (d *GenerationDiagnostics) recordResponse(response GeneratorResponseDiagnos
 	}
 }
 
-func (g LLMExerciseGenerator) freshRetry(ctx context.Context, ex SimulationExercise, diag *GenerationDiagnostics) (SimulationExercise, GenerationDiagnostics, error) {
+func (g LLMExerciseGenerator) freshRetry(ctx context.Context, ex SimulationExercise, diag *GenerationDiagnostics, previousErr error) (SimulationExercise, GenerationDiagnostics, error) {
 	if diag.ProviderCalls >= generatorMaxProviderCalls {
 		return SimulationExercise{}, *diag, generatorFailure(GeneratorFailureUnknown, errors.New("generator retry budget exhausted"))
 	}
@@ -250,7 +372,9 @@ func (g LLMExerciseGenerator) freshRetry(ctx context.Context, ex SimulationExerc
 		diag.recordFailure(generatorFailure(GeneratorFailureTimeout, err))
 		return SimulationExercise{}, *diag, generatorFailure(GeneratorFailureTimeout, err)
 	}
-	generated, _, responseDiag, err := g.generateOnce(ctx, ex, true)
+	retryGenerator := g
+	retryGenerator.retryHint = generatorRetryHint(previousErr)
+	generated, _, responseDiag, err := retryGenerator.generateOnce(ctx, ex, true)
 	diag.recordResponse(responseDiag)
 	diag.ProviderCalls++
 	if err != nil {
@@ -261,17 +385,37 @@ func (g LLMExerciseGenerator) freshRetry(ctx context.Context, ex SimulationExerc
 	return generated, *diag, nil
 }
 
+func generatorRetryHint(err error) string {
+	switch generatorFailureKind(err) {
+	case GeneratorFailurePatternMismatch:
+		return "The previous reference answer did not demonstrate the selected target skill. Use the target pattern explicitly in one natural answer."
+	case GeneratorFailureIntentMismatch:
+		return "The previous situation did not make the selected communication intent clear. Use one direct, realistic situation for that intent."
+	case GeneratorFailureConstraintViolation:
+		return "The previous exercise exceeded the curriculum boundary. Use only the selected skill, simple vocabulary, and the requested level."
+	case GeneratorFailureInvalidDifficulty:
+		return "The previous exercise was outside the application-owned difficulty band. Keep the new situation short and within the selected level."
+	default:
+		return ""
+	}
+}
+
 func (g LLMExerciseGenerator) generateOnce(ctx context.Context, ex SimulationExercise, fresh bool) (SimulationExercise, string, GeneratorResponseDiagnostics, error) {
 	maxTokens := g.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = 512
 	}
-	system := "Generate one natural, complete, adult-appropriate Chinese English-practice exercise. The application already selected the scene, intent, target pattern, and target difficulty. Use that context, but do not repeat internal IDs or difficulty fields in your response. Return JSON only with this minimal schema: {\"chinese_prompt\":\"...\",\"reference_answers\":[\"one natural English answer\"]}. reference_answers may contain one primary answer and should not contain analysis. Do not include markdown, reasoning, or prose outside the JSON object. The Chinese prompt must not reveal the exact English answer or target expression."
+	pattern, _ := curriculumPattern(ex.PatternID)
+	curriculumInstruction := curriculumCompactInstruction(ex.CurriculumLevel, pattern)
+	system := "Generate one natural, complete, adult-appropriate Chinese English-practice exercise. The application already selected the scene, intent, target pattern, target difficulty, and curriculum boundary. Use that context, but do not repeat internal IDs, curriculum metadata, or difficulty fields in your response. Return JSON only with this minimal schema: {\"chinese_prompt\":\"...\",\"reference_answers\":[\"one natural English answer\"]}. reference_answers may contain one primary answer and should not contain analysis. Do not include markdown, reasoning, or prose outside the JSON object. The Chinese prompt must not reveal the exact English answer or target expression."
 	if fresh {
 		system += " This is a fresh generation after a failed response; preserve the requested scene, pattern, intent, and difficulty."
+		if g.retryHint != "" {
+			system += " " + g.retryHint
+		}
 	}
 	spec := generationSpecFromExercise(ex)
-	user := fmt.Sprintf("Training context\nScene: %s\nSubscene: %s\nCommunication intent: %s\nTarget pattern skill: %s\nTarget difficulty: %.3f (%s)\n\nGeneration requirements\n- Write a realistic adult situation in Chinese that naturally calls for the target skill.\n- Make the intent clear without giving an English answer hint.\n- Keep the prompt concise and complete.\n- Write one high-quality English reference answer that fulfills the situation and demonstrates the target skill.\n\nOutput contract\nReturn exactly one JSON object with chinese_prompt and reference_answers.", spec.SceneID, spec.SubsceneID, spec.Intent, spec.Pattern, spec.TargetDifficulty, spec.DifficultyBand)
+	user := fmt.Sprintf("Training context\nScene: %s\nSubscene: %s\nCommunication intent: %s\nTarget pattern skill: %s\nTarget difficulty: %.3f (%s)\nCurriculum boundary: %s\n\nGeneration requirements\n- Write a realistic adult situation in Chinese that naturally calls for the target skill.\n- Make the intent clear without giving an English answer hint.\n- Keep the prompt concise and complete.\n- Write one high-quality English reference answer that fulfills the situation and demonstrates the target skill.\n\nOutput contract\nReturn exactly one JSON object with chinese_prompt and reference_answers.", spec.SceneID, spec.SubsceneID, spec.Intent, spec.Pattern, spec.TargetDifficulty, spec.DifficultyBand, curriculumInstruction)
 	messages := []ChatMessage{{Role: "system", Content: system}, {Role: "user", Content: user}}
 	resp, err := g.Client.Chat(ctx, ChatRequest{Messages: messages, MaxTokens: maxTokens, JSONMode: true, ReasoningMode: g.ReasoningMode, ReasoningEffort: g.ReasoningEffort, RequestID: "generator-" + ex.ID})
 	responseDiag := GeneratorResponseDiagnostics{PromptBytes: chatPromptBytes(messages)}
@@ -457,6 +601,9 @@ func parseGeneratedExercise(raw string, ex SimulationExercise) (SimulationExerci
 	if strings.TrimSpace(payload.ChinesePrompt) == "" {
 		return SimulationExercise{}, generatorFailure(GeneratorFailureSchemaInvalid, errors.New("missing required chinese_prompt"))
 	}
+	if payload.EstimatedDifficulty != nil && math.Abs(*payload.EstimatedDifficulty-ex.Difficulty) > .60 {
+		return SimulationExercise{}, generatorFailure(GeneratorFailureInvalidDifficulty, errors.New("provider estimated difficulty is outside the application difficulty band"))
+	}
 	prompt := strings.TrimSpace(payload.ChinesePrompt)
 	if len(prompt) > 2000 {
 		return SimulationExercise{}, generatorFailure(GeneratorFailureSchemaInvalid, errors.New("chinese_prompt exceeds 2000 bytes"))
@@ -482,10 +629,16 @@ func parseGeneratedExercise(raw string, ex SimulationExercise) (SimulationExerci
 	if err := validateGeneratedSemantics(ex, prompt, answers); err != nil {
 		return SimulationExercise{}, err
 	}
+	if ex.CurriculumLevel > 0 {
+		check := (CurriculumComplianceValidator{}).Validate(ex.CurriculumLevel, ex.PatternID, prompt)
+		if !check.Passed {
+			return SimulationExercise{}, generatorFailure(GeneratorFailureConstraintViolation, fmt.Errorf("curriculum validation failed: %s", strings.Join(check.Reasons, "; ")))
+		}
+	}
 	// The application-owned GenerationSpec is authoritative. The provider
 	// contributes only linguistic fields; metadata from older providers is
 	// intentionally ignored instead of being revalidated as a duplicate.
-	return SimulationExercise{ID: ex.ID, ChinesePrompt: prompt, PatternID: ex.PatternID, Pattern: ex.Pattern, SceneID: ex.SceneID, SubsceneID: ex.SubsceneID, Intent: ex.Intent, DifficultyBand: ex.DifficultyBand, Difficulty: ex.Difficulty, ReferenceAnswers: answers}, nil
+	return SimulationExercise{ID: ex.ID, ChinesePrompt: prompt, PatternID: ex.PatternID, Pattern: ex.Pattern, SceneID: ex.SceneID, SubsceneID: ex.SubsceneID, Intent: ex.Intent, DifficultyBand: ex.DifficultyBand, Difficulty: ex.Difficulty, CurriculumLevel: ex.CurriculumLevel, ReferenceAnswers: answers}, nil
 }
 
 func containsHan(value string) bool {
@@ -546,8 +699,17 @@ func containsAnyTerm(value string, terms ...string) bool {
 func referenceAnswerSupportsPattern(patternID, answer string) bool {
 	answer = strings.ToLower(answer)
 	switch patternID {
-	case "conditional", "if-first", "if-second", "unless", "mixed-conditional":
-		return (strings.Contains(answer, "if ") || strings.Contains(answer, "unless ")) && containsAnyTerm(answer, "would", "will", "could", "might")
+	case "if-first":
+		return strings.Contains(answer, "if ") && containsAnyTerm(answer, "will", "i'll", "you'll", "can", "may", "might", "could")
+	case "unless":
+		// Unless clauses can naturally take a present-tense result ("Unless
+		// you hurry, we miss the bus"), so requiring a modal here rejects
+		// valid conditional-exception answers.
+		return strings.Contains(answer, "unless ") && strings.Contains(answer, ",")
+	case "conditional", "if-second":
+		return strings.Contains(answer, "if ") && containsAnyTerm(answer, "would", "could", "might")
+	case "mixed-conditional":
+		return strings.Contains(answer, "if ") && containsAnyTerm(answer, "would")
 	case "disagreement":
 		return strings.Contains(answer, " but ") && containsAnyTerm(answer, "point", "understand", "concern", "agree", "worry")
 	case "having-said-that":

@@ -187,7 +187,7 @@ func curriculumPatternMap() map[string]CurriculumPattern {
 		"like":                    {PatternID: "like", DisplayName: "I like ...", AppLevelMin: 1, CEFRAnchor: curriculumCEFR(1), GrammarFamily: "like", CommunicationFunctions: []string{"state_preference"}, Prerequisites: []string{"simple_present_statement"}, ProductiveComplexity: 1.2, TypicalContexts: []string{"food", "hobbies", "friends"}, Rationale: "Concrete preferences are a high-frequency early communicative function.", Confidence: "high", InstructionComplexity: 1, AllowedGrammar: []string{"like", "simple_present"}},
 		"can":                     {PatternID: "can", DisplayName: "I can ...", AppLevelMin: 1, CEFRAnchor: curriculumCEFR(1), GrammarFamily: "ability", CommunicationFunctions: []string{"state_ability"}, Prerequisites: []string{"simple_present_statement"}, ProductiveComplexity: 1.3, TypicalContexts: []string{"home", "school", "transport"}, Rationale: "Basic ability supports immediate action-oriented communication.", Confidence: "high", InstructionComplexity: 1, AllowedGrammar: []string{"can", "simple_present"}},
 		"want":                    {PatternID: "want", DisplayName: "I want to ...", AppLevelMin: 1, CEFRAnchor: curriculumCEFR(1), GrammarFamily: "want", CommunicationFunctions: []string{"state_want"}, Prerequisites: []string{"simple_present_statement"}, ProductiveComplexity: 1.4, TypicalContexts: []string{"food", "friends", "daily"}, Rationale: "Basic wants let a learner participate in simple transactions.", Confidence: "high", InstructionComplexity: 1, AllowedGrammar: []string{"want", "to_infinitive"}},
-		"need":                    {PatternID: "need", DisplayName: "I need to ...", AppLevelMin: 1, CEFRAnchor: curriculumCEFR(1), GrammarFamily: "need", CommunicationFunctions: []string{"state_need"}, Prerequisites: []string{"simple_present_statement"}, ProductiveComplexity: 1.5, TypicalContexts: []string{"school", "home", "daily"}, Rationale: "Concrete needs are part of the foundation productive repertoire.", Confidence: "high", InstructionComplexity: 1, AllowedGrammar: []string{"need", "to_infinitive"}},
+		"need":                    {PatternID: "need", DisplayName: "I need to ...", AppLevelMin: 2, CEFRAnchor: curriculumCEFR(2), GrammarFamily: "need", CommunicationFunctions: []string{"state_need"}, Prerequisites: []string{"simple_present_statement"}, ProductiveComplexity: 1.5, TypicalContexts: []string{"school", "home", "daily"}, Rationale: "Live V2.5.1 independent-judge evidence repeatedly placed need-to + infinitive at A2; this narrow reclassification avoids treating a full infinitival need statement as an early foundation target.", Confidence: "medium", InstructionComplexity: 1, AllowedGrammar: []string{"need", "to_infinitive"}},
 		"there-is":                {PatternID: "there-is", DisplayName: "There is / There are ...", AppLevelMin: 1, CEFRAnchor: curriculumCEFR(1), GrammarFamily: "existential_be", CommunicationFunctions: []string{"describe_simple_state"}, Prerequisites: []string{"simple_present_statement"}, ProductiveComplexity: 1.6, TypicalContexts: []string{"home", "school", "park"}, Rationale: "Concrete existence and location statements support simple description.", Confidence: "high", InstructionComplexity: 1, AllowedGrammar: []string{"be", "there_is_are"}},
 		"do-you":                  {PatternID: "do-you", DisplayName: "Do you ...?", AppLevelMin: 2, CEFRAnchor: curriculumCEFR(2), GrammarFamily: "simple_present_question", CommunicationFunctions: []string{"ask_simple_information"}, Prerequisites: []string{"simple_present_statement"}, ProductiveComplexity: 1.8, TypicalContexts: []string{"school", "friends", "routine"}, Rationale: "Simple questions extend the foundation into interaction.", Confidence: "high", InstructionComplexity: 2, AllowedGrammar: []string{"simple_present", "questions"}},
 		"present-continuous":      {PatternID: "present-continuous", DisplayName: "I'm ...-ing", AppLevelMin: 3, CEFRAnchor: curriculumCEFR(3), GrammarFamily: "present_continuous", CommunicationFunctions: []string{"describe_current_activity"}, Prerequisites: []string{"simple_present_statement"}, ProductiveComplexity: 2.0, TypicalContexts: []string{"home", "phone", "daily"}, Rationale: "Current activity is a bridge from static foundation statements to event description.", Confidence: "high", InstructionComplexity: 2, AllowedGrammar: []string{"present_continuous"}},
@@ -374,6 +374,33 @@ func curriculumEnvelope(level int) CurriculumEnvelope {
 		return out
 	}
 	return CurriculumEnvelope{Version: curriculumVersion, Level: level, AllowedSkillIDs: toSorted(allowedSkills), AllowedGrammar: toSorted(allowedGrammar), AllowedIntents: toSorted(allowedIntents), ComplexityBounds: map[string]float64{"max_productive_complexity": float64(level) + .8, "max_clause_count": float64(guide.MaxClauses), "max_instruction_complexity": float64(guide.MaxInstruction)}, VocabularyGuide: map[string]string{"frequency": map[bool]string{true: "high", false: "mixed"}[level <= 2], "concreteness": map[bool]string{true: "concrete", false: "concrete-to-abstract"}[level <= 2], "idiomaticity": map[bool]string{true: "low", false: "controlled"}[level <= 3]}}
+}
+
+// curriculumCompactInstruction is the provider-facing curriculum envelope.
+// It carries only the selected level and the local boundary needed to write
+// one exercise; the full catalog remains application-owned and is never
+// duplicated in the provider output contract.
+func curriculumCompactInstruction(level int, pattern CurriculumPattern) string {
+	if level < 1 {
+		level = 1
+	}
+	if level > 8 {
+		level = 8
+	}
+	guide := curriculumLevelGuide(level)
+	required := []string{pattern.DisplayName}
+	if len(pattern.AllowedGrammar) > 0 {
+		required = append(required, pattern.AllowedGrammar[0])
+	}
+	avoid := append([]string{}, pattern.NotYetTargetable...)
+	if level == 1 {
+		avoid = append(avoid, "Would you mind", "advanced hypothetical structures", "advanced discourse markers")
+	}
+	base := fmt.Sprintf("Level D%d (%s). Target skill: %s. Required: %s. Keep the instruction simple and the situation concrete. Maximum instruction complexity: %d; maximum clause count: %d. Avoid: %s.", level, guide.ExternalAnchor, pattern.DisplayName, strings.Join(required, ", "), guide.MaxInstruction, guide.MaxClauses, strings.Join(avoid, ", "))
+	if level <= 1 {
+		base += " Use one short sentence, high-frequency vocabulary, and one concrete everyday need or preference; do not require a reason, negotiation, or multi-step arrangement."
+	}
+	return base
 }
 
 func validateCurriculumCatalog() error {
