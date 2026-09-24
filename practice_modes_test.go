@@ -9,6 +9,20 @@ import (
 	"testing"
 )
 
+func TestFreeExerciseResponseRequiresDistinctAlternativeAnswers(t *testing.T) {
+	content := `{"chinese_prompt":"What would you choose?","estimated_difficulty":4,"reference_answers":["I would stay home."],"alternative_answers":["I would stay home.","I prefer to stay in."]}`
+	seed, difficulty, err := parseFreeExerciseResponse(content, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if difficulty != 4 || !hasDistinctFreeExpressionAnswers(seed.Answers) {
+		t.Fatalf("expected a distinct answer pair at D4, got difficulty=%v answers=%v", difficulty, seed.Answers)
+	}
+	if hasDistinctFreeExpressionAnswers([]string{"I would stay home.", "I would stay home!"}) {
+		t.Fatal("punctuation-only variants must not count as distinct alternatives")
+	}
+}
+
 func createPracticeSession(t *testing.T, s *Server, p PracticePreferences) string {
 	t.Helper()
 	p, err := normalizePracticePreferences(p)

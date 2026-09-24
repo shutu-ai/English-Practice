@@ -285,6 +285,18 @@ func TestStructuredOutputNormalization(t *testing.T) {
 	if err != nil || len(spelling.Errors) != 1 || spelling.Errors[0]["type"] != "word_choice" {
 		t.Fatalf("spelling provider error was not normalized: %#v err=%v", spelling, err)
 	}
+	for _, tc := range []struct{ provider, canonical string }{
+		{"irrelevant_content", "meaning"}, {"irrelevant_response", "meaning"},
+		{"task_completion", "meaning"}, {"task_fulfillment", "meaning"},
+		{"task_relevance", "meaning"}, {"task_response", "meaning"},
+		{"communication_intent_not_fulfilled", "meaning"}, {"content", "other"},
+	} {
+		input := strings.Replace(validEvaluationJSON(), `"errors":[]`, fmt.Sprintf(`"errors":[{"type":%q,"severity":"minor","explanation":"x"}]`, tc.provider), 1)
+		eval, err := normalizeEvalContent(input)
+		if err != nil || len(eval.Errors) != 1 || eval.Errors[0]["type"] != tc.canonical {
+			t.Errorf("provider error type %q was not normalized to %q: %#v err=%v", tc.provider, tc.canonical, eval, err)
+		}
+	}
 	if eval, err := normalizeEvalContent(`{"verdict":"correct","meaning_score":0.8,"grammar_score":0.8,"naturalness_score":0.8,"pattern_score":0.8,"errors":[{"type":"meaning","level":"low","description":"x"}],"suggested_answer":"x","explanation_zh":"x"}`); err != nil || eval.Errors[0]["explanation"] != "x" {
 		t.Fatalf("error field aliases were not normalized: %#v err=%v", eval, err)
 	}

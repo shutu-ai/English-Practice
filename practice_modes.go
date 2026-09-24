@@ -270,7 +270,8 @@ func freeExpressionPrompt(intent, scene string, index int) string {
 	return "请用自然英语表达这个意思，并清楚完成沟通目的。"
 }
 
-func (s *Server) generateFreeAIExercise(ctx context.Context, c adaptiveCandidate, scene string, recent []string) (exerciseSeed, string, float64) {
+func (s *Server) generateFreeAIExercise(ctx context.Context, c adaptiveCandidate, scene string, recent []string) (exerciseSeed, string, float64, ProductionGeneratorDiagnostics) {
+	diagnostics := ProductionGeneratorDiagnostics{ContractVersion: "free-expression-v2"}
 	s.llm.mu.RLock()
 	var pc ProviderConfig
 	for _, x := range s.llm.configs {
@@ -281,7 +282,8 @@ func (s *Server) generateFreeAIExercise(ctx context.Context, c adaptiveCandidate
 	}
 	s.llm.mu.RUnlock()
 	if pc.ID == "" {
-		return exerciseSeed{}, "", 0
+		diagnostics.FailureCode = "NO_ENABLED_GENERATOR_PROVIDER"
+		return exerciseSeed{}, "", 0, diagnostics
 	}
 	lower, upper := fixedDifficultyBand(c.SessionCenter, s.adaptiveConfig())
 	if v, ok := c.DecisionTrace["fixed_band_lower"].(float64); ok {
@@ -290,27 +292,98 @@ func (s *Server) generateFreeAIExercise(ctx context.Context, c adaptiveCandidate
 	if v, ok := c.DecisionTrace["fixed_band_upper"].(float64); ok {
 		upper = v
 	}
-	sys := `Generate one open-ended English practice exercise as strict JSON only. Fields: chinese_prompt, scene, intent, estimated_difficulty, reference_answers, alternative_answers. The task must have one clear communication intent and multiple valid natural English answers. There is no required target sentence pattern: do not name, imply, or secretly enforce a sentence pattern. Do not include target_pattern or pattern_id fields. Do not reveal an English answer in chinese_prompt.`
+	sys := `Generate one open-ended English practice exercise as strict JSON only. Fields: chinese_prompt, scene, intent, estimated_difficulty, reference_answers, alternative_answers. The task must have one clear communication intent and at least two valid natural English answers that use noticeably different sentence structures. Put at least one answer in reference_answers and at least one in alternative_answers. There is no required target sentence pattern: do not name, imply, or secretly enforce a sentence pattern. Do not include target_pattern or pattern_id fields. Do not reveal an English answer in chinese_prompt.`
 	user := fmt.Sprintf("scene=%s intent=%s target_difficulty=%.1f allowed_difficulty_range=%.1f-%.1f sentence_length_target=%s lexical_complexity=%s recent_prompts=%s", scene, c.Intent, c.SessionCenter, lower, upper, difficultySentenceLength(c.SessionCenter), difficultyLexicalComplexity(c.SessionCenter), strings.Join(recent, " | "))
-	r, err := s.llm.Client(pc).Chat(ctx, ChatRequest{Messages: []ChatMessage{{Role: "system", Content: sys}, {Role: "user", Content: user}}, Temperature: pc.Temperature, MaxTokens: maxInt(pc.MaxTokens, 500), JSONMode: true})
-	if err != nil || r == nil {
-		return exerciseSeed{}, "", 0
+	client := s.llm.Client(pc)
+	var best exerciseSeed
+	bestDifficulty := c.SessionCenter
+	repairReason := ""
+	for attempt := 0; attempt < 2; attempt++ {
+		messages := []ChatMessage{{Role: "system", Content: sys}, {Role: "user", Content: user}}
+		if attempt > 0 {
+			diagnostics.Trace.RepairAttempts++
+			messages = append(messages, ChatMessage{Role: "system", Content: "Repair the exercise contract. Return the complete JSON exercise and include two non-duplicate valid answers with noticeably different sentence structures, one in each answer array. Keep the prompt open-ended and do not add a required pattern."})
+			messages = append(messages, ChatMessage{Role: "user", Content: "Repair reason: " + repairReason})
+		}
+		diagnostics.Trace.ProviderCalls++
+		diagnostics.Trace.InitialCalls = 1
+		response, err := client.Chat(ctx, ChatRequest{Messages: messages, Temperature: pc.Temperature, MaxTokens: maxInt(pc.MaxTokens, 500), JSONMode: true})
+		if err != nil || response == nil {
+			diagnostics.ProviderCallFailed = true
+			diagnostics.FailureCode = productionGeneratorFailureCode(err)
+			if diagnostics.FailureCode == "" {
+				diagnostics.FailureCode = "EMPTY_PROVIDER_RESPONSE"
+			}
+			repairReason = diagnostics.FailureCode
+			continue
+		}
+		diagnostics.ProviderResponseReceived = true
+		diagnostics.ResponseBytes = response.ResponseBytes
+		diagnostics.ContentSource = response.ContentSource
+		diagnostics.FinishReason = response.FinishReason
+		diagnostics.ReasoningPresent = response.ReasoningPresent
+		seed, difficulty, parseErr := parseFreeExerciseResponse(response.Content, c.SessionCenter)
+		if parseErr != nil {
+			diagnostics.ProviderResponseParseable = false
+			diagnostics.FailureCode = "INVALID_FREE_EXERCISE_OUTPUT"
+			repairReason = diagnostics.FailureCode
+			continue
+		}
+		diagnostics.ProviderResponseParseable = true
+		diagnostics.StructurallyValid = true
+		best, bestDifficulty = seed, difficulty
+		if hasDistinctFreeExpressionAnswers(seed.Answers) {
+			diagnostics.Accepted = true
+			diagnostics.InitialProviderSuccess = attempt == 0
+			diagnostics.RetrySuccess = attempt > 0
+			diagnostics.FinalSource = "provider"
+			diagnostics.FailureCode = ""
+			return seed, "provider", difficulty, diagnostics
+		}
+		diagnostics.FailureCode = "MISSING_DISTINCT_FREE_ANSWERS"
+		repairReason = diagnostics.FailureCode
 	}
+	if best.Prompt != "" {
+		diagnostics.FinalSource = "provider"
+		return best, "provider", bestDifficulty, diagnostics
+	}
+	diagnostics.FallbackUsed = true
+	diagnostics.FinalSource = "fallback"
+	return exerciseSeed{}, "", 0, diagnostics
+}
+
+func parseFreeExerciseResponse(content string, center float64) (exerciseSeed, float64, error) {
 	var out struct {
 		Prompt       string   `json:"chinese_prompt"`
 		Difficulty   float64  `json:"estimated_difficulty"`
 		Answers      []string `json:"reference_answers"`
 		Alternatives []string `json:"alternative_answers"`
 	}
-	if json.Unmarshal([]byte(strings.TrimSpace(r.Content)), &out) != nil || strings.TrimSpace(out.Prompt) == "" {
-		return exerciseSeed{}, "", 0
+	if err := json.Unmarshal([]byte(strings.TrimSpace(content)), &out); err != nil {
+		return exerciseSeed{}, 0, err
+	}
+	if strings.TrimSpace(out.Prompt) == "" {
+		return exerciseSeed{}, 0, errors.New("free exercise prompt is empty")
 	}
 	answers := append([]string{}, out.Answers...)
 	answers = append(answers, out.Alternatives...)
 	if out.Difficulty <= 0 {
-		out.Difficulty = c.SessionCenter
+		out.Difficulty = center
 	}
-	return exerciseSeed{Prompt: out.Prompt, Answers: answers}, "provider", out.Difficulty
+	return exerciseSeed{Prompt: strings.TrimSpace(out.Prompt), Answers: answers}, out.Difficulty, nil
+}
+
+func hasDistinctFreeExpressionAnswers(answers []string) bool {
+	seen := map[string]bool{}
+	for _, answer := range answers {
+		normalized := strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(answer)), " "))
+		normalized = strings.TrimRight(normalized, ".!?;,")
+		if normalized == "" || seen[normalized] {
+			continue
+		}
+		seen[normalized] = true
+	}
+	return len(seen) >= 2
 }
 
 func (s *Server) generateFreeExerciseForScene(ctx context.Context, c adaptiveCandidate, scene string, subscene string, prefs PracticePreferences) (map[string]any, error) {
@@ -337,7 +410,7 @@ func (s *Server) generateFreeExerciseForScene(ctx context.Context, c adaptiveCan
 		}
 		_ = rows.Close()
 	}
-	seed, generatedBy, realized := s.generateFreeAIExercise(ctx, c, scene, recent)
+	seed, generatedBy, realized, generatorDiagnostics := s.generateFreeAIExercise(ctx, c, scene, recent)
 	if seed.Prompt == "" {
 		seed = exerciseSeed{Prompt: freeExpressionPrompt(c.Intent, scene, len(recent)), Answers: nil}
 		generatedBy = "fallback"
@@ -356,7 +429,7 @@ func (s *Server) generateFreeExerciseForScene(ctx context.Context, c adaptiveCan
 		"difficulty_validation_status": "validated", "difficulty_validation_reason": "within_configured_difficulty_band",
 		"difficulty_policy_version": difficultyConfig(s.adaptiveConfig()).DifficultyPolicyVersion, "normalized_chinese_hash": hash,
 		"scene_id": scene, "subscene_id": subscene, "intent_id": c.Intent, "decision_trace_version": 4,
-		"decision_trace": map[string]any{"difficulty_mode": prefs.DifficultyMode, "fixed_difficulty": prefs.FixedDifficulty, "training_focus": TrainingFocusFree, "target_pattern_present": false, "session_center": c.SessionCenter, "fixed_band_lower": c.DecisionTrace["fixed_band_lower"], "fixed_band_upper": c.DecisionTrace["fixed_band_upper"]},
+		"decision_trace": map[string]any{"difficulty_mode": prefs.DifficultyMode, "fixed_difficulty": prefs.FixedDifficulty, "training_focus": TrainingFocusFree, "target_pattern_present": false, "session_center": c.SessionCenter, "fixed_band_lower": c.DecisionTrace["fixed_band_lower"], "fixed_band_upper": c.DecisionTrace["fixed_band_upper"], "generator_diagnostics": generatorDiagnostics},
 	}
 	meta, _ := json.Marshal(metaMap)
 	trace, _ := json.Marshal(metaMap["decision_trace"])

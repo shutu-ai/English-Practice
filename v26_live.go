@@ -281,15 +281,11 @@ func v26LiveScenarioRun(ctx context.Context, s *Server, name, difficultyMode, fo
 					}
 					out.GeneratorFailureKinds[diag.FailureCode]++
 				}
-			} else if focus == TrainingFocusFree {
-				if ex["generated_by"] == "provider" {
-					out.GeneratorInitialSuccesses++
-				}
 			}
-		} else if focus == TrainingFocusFree {
-			if ex["generated_by"] == "provider" {
-				out.GeneratorInitialSuccesses++
-			}
+		}
+		_, hasGeneratorDiagnostics := traceGeneratorDiagnostics(ex["decision_trace"])
+		if focus == TrainingFocusFree && !hasGeneratorDiagnostics && ex["generated_by"] == "provider" {
+			out.GeneratorInitialSuccesses++
 		}
 		present, _ := ex["target_pattern_present"].(bool)
 		if present {
@@ -401,6 +397,15 @@ func v26AllowedProviderCalls(s *Server) int {
 	}
 	allowed, _ := s.llm.callLimiter.counts()
 	return allowed
+}
+
+func traceGeneratorDiagnostics(value any) (ProductionGeneratorDiagnostics, bool) {
+	trace, ok := value.(map[string]any)
+	if !ok {
+		return ProductionGeneratorDiagnostics{}, false
+	}
+	diagnostics, ok := trace["generator_diagnostics"].(ProductionGeneratorDiagnostics)
+	return diagnostics, ok
 }
 
 func sameDatabaseSnapshot(a, b *V241DatabaseSnapshot) bool {
